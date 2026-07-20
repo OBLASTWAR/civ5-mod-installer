@@ -59,68 +59,12 @@ namespace KekModInstaller
     {
         public bool WantBeta;
         public bool WantDev;
-        // Exact release tag to install (e.g. "v1.4"), from the VERSION
-        // dropdown. null/empty = automatic: newest per WantBeta.
-        public string TagName;
     }
 
     internal class InstallResult
     {
         public string FolderName;
         public string TargetDir;
-    }
-
-    // Persists the settings-page opt-ins across launches. Both off by
-    // default: regular players shouldn't see beta as an option at all
-    // unless they've deliberately dug into Settings for it, and a dev build
-    // that accidentally starts pulling from the LAN test server is the kind
-    // of surprise nobody wants -- see MainForm.UpdateAutoVersionLabel and
-    // SettingsForm.
-    internal static class SettingsManager
-    {
-        private const string RegistryKey = @"HKEY_CURRENT_USER\Software\KekModInstaller";
-        private const string ShowBetaValueName = "ShowBetaBuilds";
-        private const string UseDevValueName = "UseDevBuild";
-        private const string MutedValueName = "Muted";
-
-        public static bool GetShowBeta()
-        {
-            object value = Registry.GetValue(RegistryKey, ShowBetaValueName, 0);
-            return value is int && (int)value != 0;
-        }
-
-        public static void SetShowBeta(bool show)
-        {
-            Registry.SetValue(RegistryKey, ShowBetaValueName, show ? 1 : 0, RegistryValueKind.DWord);
-        }
-
-        // INTERNAL_BUILD-only in practice (SettingsForm only shows the
-        // Prod/Dev radios there), but the getter/setter pair is harmless to
-        // keep unconditional -- simpler than threading #if into this class.
-        public static bool GetUseDev()
-        {
-            object value = Registry.GetValue(RegistryKey, UseDevValueName, 0);
-            return value is int && (int)value != 0;
-        }
-
-        public static void SetUseDev(bool useDev)
-        {
-            Registry.SetValue(RegistryKey, UseDevValueName, useDev ? 1 : 0, RegistryValueKind.DWord);
-        }
-
-        // Unmuted by default -- the mute button only needs to remember an
-        // explicit "turn it off", not force music on for someone who never
-        // touched the button.
-        public static bool GetMuted()
-        {
-            object value = Registry.GetValue(RegistryKey, MutedValueName, 0);
-            return value is int && (int)value != 0;
-        }
-
-        public static void SetMuted(bool muted)
-        {
-            Registry.SetValue(RegistryKey, MutedValueName, muted ? 1 : 0, RegistryValueKind.DWord);
-        }
     }
 
     // Core install logic, UI-agnostic: reports progress through a plain
@@ -148,9 +92,9 @@ namespace KekModInstaller
 
         // Branch the scrolling greetz ticker is read from at startup, so the
         // message can be edited on GitHub without shipping a new installer
-        // build. release/2.x is the canonical release line (one merge per
-        // feature); its installer/ticker.txt is the live copy to edit.
-        private const string TickerBranch = "release/2.x";
+        // build. Points at kek-1.5 for now since that's not merged into
+        // master yet -- switch this to "master" once it is.
+        private const string TickerBranch = "kek-1.5";
 
         // Never throws -- a missing/offline/renamed file just means the
         // caller keeps whatever default ticker text it already has.
@@ -177,11 +121,8 @@ namespace KekModInstaller
         public static InstallResult Run(InstallOptions options, Action<string> log, Action<int> progress)
         {
             progress(0);
-            GhRelease release = string.IsNullOrEmpty(options.TagName)
-                ? FetchTargetRelease(options.WantBeta)
-                : FetchReleaseByTag(options.TagName);
-            log("Release: " + release.TagName + (release.Prerelease ? " (prerelease)" : "")
-                + (string.IsNullOrEmpty(options.TagName) ? "" : " [selected version]"));
+            GhRelease release = FetchTargetRelease(options.WantBeta);
+            log("Release: " + release.TagName + (release.Prerelease ? " (prerelease)" : ""));
 
             GhAsset asset = PickAsset(release, options.WantDev);
             log("Asset: " + asset.Name);
@@ -314,27 +255,6 @@ namespace KekModInstaller
             return chosen;
         }
 
-        // VERSION-dropdown support: every published release, newest first.
-        // Same fetch the auto path uses; the UI shows tags and hands the
-        // chosen one back via InstallOptions.TagName.
-        public static List<GhRelease> ListAvailableReleases()
-        {
-            return FetchReleases(RepoOwner, RepoName);
-        }
-
-        private static GhRelease FetchReleaseByTag(string tagName)
-        {
-            List<GhRelease> releases = FetchReleases(RepoOwner, RepoName);
-            GhRelease chosen = releases.FirstOrDefault(
-                r => string.Equals(r.TagName, tagName, StringComparison.OrdinalIgnoreCase));
-            if (chosen == null)
-            {
-                throw new InvalidOperationException(
-                    "Release " + tagName + " no longer exists on GitHub. Pick another version.");
-            }
-            return chosen;
-        }
-
         private static List<GhRelease> FetchReleases(string owner, string repo)
         {
             string url = "https://api.github.com/repos/" + owner + "/" + repo + "/releases?per_page=50";
@@ -400,16 +320,6 @@ namespace KekModInstaller
             {
                 log(MapScriptFolderName + ": couldn't install (" + ex.Message + ")");
             }
-        }
-
-        public static string DescribeLatestAvailable(bool wantBeta)
-        {
-            GhRelease release = FetchTargetRelease(wantBeta);
-            // "KEK Mod " prefix matches DetectInstalledVersions' folder-name
-            // format (e.g. "KEK Mod v1.4") so [INSTALLED] and [LATEST] read
-            // as directly comparable at a glance instead of two different
-            // formats for the same version.
-            return "KEK Mod " + release.TagName + (release.Prerelease ? " (beta)" : "");
         }
 
         private static GhAsset PickAsset(GhRelease release, bool wantDev)
@@ -534,6 +444,21 @@ namespace KekModInstaller
             }
             found.Sort();
             return found;
+        }
+
+        public static string DescribeLatestAvailable()
+        {
+            // Newest release of any kind, any channel -- both builds can now
+            // pull a beta via the CHANNEL box's "Include beta versions", so
+            // this line should show whatever's actually newest, not just the
+            // default (stable) that Install would fetch with the box unchecked.
+            bool wantBeta = true;
+            GhRelease release = FetchTargetRelease(wantBeta);
+            // "KEK Mod " prefix matches DetectInstalledVersions' folder-name
+            // format (e.g. "KEK Mod v1.4") so [INSTALLED] and [LATEST] read
+            // as directly comparable at a glance instead of two different
+            // formats for the same version.
+            return "KEK Mod " + release.TagName + (release.Prerelease ? " (beta)" : "");
         }
 
         // Runs on the background thread; must not touch the main form. A small
@@ -726,27 +651,25 @@ namespace KekModInstaller
 
     internal class MainForm : Form
     {
-        // Beta opt-in (both builds) and Prod/Dev (INTERNAL_BUILD only) both
-        // live in Settings now, not as boxes on the main form -- see
-        // SettingsForm. Keeps the two builds' main windows identical.
-        // VERSION dropdown: index 0 = automatic (newest per the Settings
-        // beta opt-in); the rest mirror _versionTags (offset by one) as
-        // populated by the startup status check.
-        private ComboBox _cmbVersion;
-        private readonly List<string> _versionTags = new List<string>();
+        // Stable/beta channel picking is available in both builds now --
+        // players can opt into beta releases from the public installer too.
+        // The Prod/Dev BUILD box stays INTERNAL_BUILD-only, since "Dev" points
+        // at the LAN test server and has no meaning for a regular player.
+        private RadioButton _rbStable;
+        private RadioButton _rbBeta;
+#if INTERNAL_BUILD
+        private RadioButton _rbProd;
+        private RadioButton _rbDev;
+#endif
         // TopShift reserves room for the title banner; BottomStrip reserves
         // room for the greetz ticker + mute button. Late-90s/early-2000s
         // "cracktro" theme: black background, neon green terminal text,
         // magenta box-art borders -- see MakeRetroBox/RetroButton.
         private const int TopShift = 74;
         private const int BottomStrip = 30;
-        // Internal, not private: SettingsForm reuses the same palette and
-        // chrome (MakeRetroBox, RetroButton) so the settings page reads as
-        // part of the same "cracktro" theme instead of a bolted-on stock
-        // WinForms dialog.
-        internal static readonly Color ThemeGreen = Color.FromArgb(0, 255, 65);
-        internal static readonly Color ThemeMagenta = Color.FromArgb(255, 0, 190);
-        internal static readonly Color ThemeRed = Color.FromArgb(255, 60, 60);
+        private static readonly Color ThemeGreen = Color.FromArgb(0, 255, 65);
+        private static readonly Color ThemeMagenta = Color.FromArgb(255, 0, 190);
+        private static readonly Color ThemeRed = Color.FromArgb(255, 60, 60);
 
         private Label _lblTitle;
         private Label _lblSubtitle;
@@ -757,7 +680,6 @@ namespace KekModInstaller
         private RetroButton _btnUninstall;
         private RetroButton _btnOpenFolder;
         private RetroButton _btnMute;
-        private RetroButton _btnSettings;
         private Panel _tickerViewport;
         private Label _lblTicker;
         private RetroTextBox _txtLog;
@@ -813,7 +735,7 @@ namespace KekModInstaller
             // ClientSize, not Width/Height: the latter includes the title bar
             // and borders, which shrinks the usable area every control below
             // is positioned against and clips the bottom row.
-            ClientSize = new Size(560, 572 + TopShift + BottomStrip);
+            ClientSize = new Size(560, 520 + TopShift + BottomStrip);
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
@@ -852,18 +774,6 @@ namespace KekModInstaller
             _dividerLine.SetBounds(0, 60, 560, 2);
             _dividerLine.BackColor = ThemeMagenta;
 
-            // Gear icon, top-right of the title bar -- the only way into
-            // Settings (beta opt-in; also Prod/Dev on INTERNAL_BUILD -- see
-            // SettingsForm). Deliberately not labelled "BETA" or anything
-            // that would advertise the option to players who haven't gone
-            // looking for it.
-            _btnSettings = new RetroButton();
-            _btnSettings.SetBounds(522, 6, 26, 22);
-            _btnSettings.Text = "⚙"; // gear
-            _btnSettings.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
-            _btnSettings.TextOffsetY = -2; // see RetroButton.TextOffsetY
-            _btnSettings.Click += BtnSettings_Click;
-
             _lblInstalled = new Label();
             _lblInstalled.SetBounds(12, 10 + TopShift, 532, 18);
             _lblInstalled.Text = "[INSTALLED] checking...";
@@ -878,31 +788,48 @@ namespace KekModInstaller
             _lblLatest.ForeColor = ThemeGreen;
             _lblLatest.BackColor = Color.Black;
 
-            // Full-width VERSION row -- Prod/Dev (internal builds) and the
-            // beta opt-in both live in Settings now, so this row has no box
-            // above it in either build; lets players install any published
-            // release, not just the newest.
-            var pnlVersion = MakeRetroBox("VERSION", 12, 132 + TopShift, 532, 48);
+            var pnlChannel = MakeRetroBox("CHANNEL", 12, 56 + TopShift, 260, 70);
 
-            _cmbVersion = new ComboBox();
-            _cmbVersion.SetBounds(12, 18, 320, 22);
-            _cmbVersion.DropDownStyle = ComboBoxStyle.DropDownList;
-            _cmbVersion.FlatStyle = FlatStyle.Flat;
-            _cmbVersion.BackColor = Color.Black;
-            _cmbVersion.ForeColor = ThemeGreen;
-            _cmbVersion.Font = new Font("Consolas", 9F, FontStyle.Bold);
-            _cmbVersion.Items.Add("Latest (auto)"); // real text set by UpdateAutoVersionLabel below
-            _cmbVersion.SelectedIndex = 0;
-            pnlVersion.Controls.Add(_cmbVersion);
+            _rbStable = new RadioButton();
+            _rbStable.Text = "Stable (recommended)";
+            _rbStable.SetBounds(12, 22, 220, 20);
+            _rbStable.Checked = true;
+            StyleRetroRadio(_rbStable);
+
+            _rbBeta = new RadioButton();
+            _rbBeta.Text = "Include beta versions";
+            _rbBeta.SetBounds(12, 44, 220, 20);
+            StyleRetroRadio(_rbBeta);
+
+            pnlChannel.Controls.Add(_rbStable);
+            pnlChannel.Controls.Add(_rbBeta);
+
+#if INTERNAL_BUILD
+            var pnlBuild = MakeRetroBox("BUILD", 284, 56 + TopShift, 260, 70);
+
+            _rbProd = new RadioButton();
+            _rbProd.Text = "Prod (recommended)";
+            _rbProd.SetBounds(12, 22, 220, 20);
+            _rbProd.Checked = true;
+            StyleRetroRadio(_rbProd);
+
+            _rbDev = new RadioButton();
+            _rbDev.Text = "Dev (internal test server)";
+            _rbDev.SetBounds(12, 44, 220, 20);
+            StyleRetroRadio(_rbDev);
+
+            pnlBuild.Controls.Add(_rbProd);
+            pnlBuild.Controls.Add(_rbDev);
+#endif
 
             _btnInstall = new RetroButton();
             _btnInstall.Text = "INSTALL";
-            _btnInstall.SetBounds(12, 188 + TopShift, 110, 32);
+            _btnInstall.SetBounds(12, 136 + TopShift, 110, 32);
             _btnInstall.Click += BtnInstall_Click;
 
             _btnUninstall = new RetroButton();
             _btnUninstall.Text = "UNINSTALL";
-            _btnUninstall.SetBounds(130, 188 + TopShift, 110, 32);
+            _btnUninstall.SetBounds(130, 136 + TopShift, 110, 32);
             _btnUninstall.Enabled = false; // enabled once the status check finds something
             _btnUninstall.Click += BtnUninstall_Click;
 
@@ -911,7 +838,7 @@ namespace KekModInstaller
             // on a black form is otherwise invisible at 0%, before any fill
             // color would show.
             var progressBorder = new Panel();
-            progressBorder.SetBounds(12, 228 + TopShift, 532, 20);
+            progressBorder.SetBounds(12, 176 + TopShift, 532, 20);
             progressBorder.BackColor = ThemeMagenta;
 
             _progress.SetBounds(1, 1, 530, 18);
@@ -926,7 +853,7 @@ namespace KekModInstaller
             progressBorder.Controls.Add(_progress);
 
             _lblStatus = new Label();
-            _lblStatus.SetBounds(12, 256 + TopShift, 532, 20);
+            _lblStatus.SetBounds(12, 204 + TopShift, 532, 20);
             _lblStatus.Font = new Font("Consolas", 9F, FontStyle.Bold);
             _lblStatus.ForeColor = ThemeGreen;
             _lblStatus.BackColor = Color.Black;
@@ -937,7 +864,7 @@ namespace KekModInstaller
             int bottomStripY = ClientSize.Height - BottomStrip;
             int openFolderHeight = 28;
             int openFolderY = bottomStripY - 8 - openFolderHeight;
-            int logTop = 280 + TopShift;
+            int logTop = 228 + TopShift;
             int logHeight = openFolderY - 8 - logTop;
 
             _txtLog = new RetroTextBox();
@@ -985,16 +912,10 @@ namespace KekModInstaller
             _lblTicker.Location = new Point(_tickerViewport.Width, 1);
             _tickerViewport.Controls.Add(_lblTicker);
 
-            // Restore last session's mute state up front -- _muted drives
-            // both this button's look and RetroAudio.SetMuted below, once
-            // the track actually starts playing at the end of the ctor.
-            _muted = SettingsManager.GetMuted();
-
             _btnMute = new RetroButton();
             _btnMute.SetBounds(522, bottomStripY, 26, 22);
             _btnMute.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
-            _btnMute.Text = _muted ? "✕" : "♪"; // X : eighth note
-            _btnMute.ForeColor = _muted ? ThemeRed : ThemeGreen;
+            _btnMute.Text = "♪"; // eighth note
             _btnMute.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
             _btnMute.Click += BtnMute_Click;
 
@@ -1003,7 +924,10 @@ namespace KekModInstaller
             Controls.Add(_dividerLine);
             Controls.Add(_lblInstalled);
             Controls.Add(_lblLatest);
-            Controls.Add(pnlVersion);
+            Controls.Add(pnlChannel);
+#if INTERNAL_BUILD
+            Controls.Add(pnlBuild);
+#endif
             Controls.Add(_btnInstall);
             Controls.Add(_btnUninstall);
             Controls.Add(progressBorder);
@@ -1012,9 +936,6 @@ namespace KekModInstaller
             Controls.Add(_btnOpenFolder);
             Controls.Add(_tickerViewport);
             Controls.Add(_btnMute);
-            Controls.Add(_btnSettings);
-
-            UpdateAutoVersionLabel();
 
             _worker = new BackgroundWorker();
             _worker.WorkerReportsProgress = true;
@@ -1047,18 +968,13 @@ namespace KekModInstaller
             FormClosing += MainForm_FormClosing;
 
             RetroAudio.PlayEmbeddedLooped();
-            if (_muted)
-            {
-                RetroAudio.SetMuted(true); // restore last session's mute state
-            }
         }
 
         // Draws a magenta box with the title "cut into" the top border, e.g.
         // +--[ CHANNEL ]---------+   -- the classic scene-intro/keygen box
         // art look, hand-painted since GroupBox's native border ignores
-        // theme colors even with visual styles off. Static (doesn't touch
-        // instance state) so SettingsForm can reuse it too.
-        internal static Panel MakeRetroBox(string title, int x, int y, int w, int h)
+        // theme colors even with visual styles off.
+        private Panel MakeRetroBox(string title, int x, int y, int w, int h)
         {
             var panel = new Panel();
             panel.SetBounds(x, y, w, h);
@@ -1087,9 +1003,7 @@ namespace KekModInstaller
         // label went fully invisible while disabled). Owner-drawing sidesteps
         // that entirely and keeps enabled/disabled/hover all under our
         // control, matching the hand-painted box borders elsewhere.
-        // Internal, not private: SettingsForm builds its OK/Cancel buttons
-        // from this too, for the same hand-drawn look as the rest of the app.
-        internal class RetroButton : Button
+        private class RetroButton : Button
         {
             public RetroButton()
             {
@@ -1104,14 +1018,6 @@ namespace KekModInstaller
                 // down to buttons too, instead of every clickable control
                 // fighting the theme with a generic Windows hand icon.
             }
-
-            // Nonzero only for glyphs whose visible ink isn't centered
-            // within its own font's ascent+descent box -- TextFormatFlags.
-            // VerticalCenter centers that whole box, not the ink, so a glyph
-            // like the settings gear (measured live: 5px clear above the
-            // ink, 2px below, in a 21px-tall button) still reads as
-            // off-center even with NoPadding. Positive shifts the glyph down.
-            internal int TextOffsetY;
 
             private bool _hover;
 
@@ -1130,19 +1036,8 @@ namespace KekModInstaller
                 {
                     pe.Graphics.DrawRectangle(pen, 0, 0, Width - 1, Height - 1);
                 }
-                // NoPadding matters here: without it, DrawText pads the
-                // layout rect by a few pixels on the left/top before
-                // centering inside it, which reads as fine on wide text
-                // (INSTALL, UNINSTALL) but visibly off-center on the square
-                // single-glyph buttons (gear, mute) -- confirmed live, the
-                // gear sat noticeably high-left of its box without this flag.
-                Rectangle textRect = ClientRectangle;
-                if (TextOffsetY != 0)
-                {
-                    textRect.Offset(0, TextOffsetY);
-                }
-                TextRenderer.DrawText(pe.Graphics, Text, Font, textRect, text,
-                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
+                TextRenderer.DrawText(pe.Graphics, Text, Font, ClientRectangle, text,
+                    TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter);
             }
         }
 
@@ -1177,9 +1072,7 @@ namespace KekModInstaller
             }
         }
 
-        // Internal, not private: SettingsForm's Prod/Dev radios (internal
-        // builds only) use this too, for the same look as everything else.
-        internal static void StyleRetroRadio(RadioButton r)
+        private void StyleRetroRadio(RadioButton r)
         {
             r.ForeColor = ThemeGreen;
             r.BackColor = Color.Black;
@@ -1216,46 +1109,6 @@ namespace KekModInstaller
             RetroAudio.SetMuted(_muted);
             _btnMute.Text = _muted ? "✕" : "♪"; // X : eighth note
             _btnMute.ForeColor = _muted ? ThemeRed : ThemeGreen;
-            SettingsManager.SetMuted(_muted);
-        }
-
-        // Beta builds are opt-in and hidden from the main UI until the
-        // player has gone into Settings and turned them on -- there's no
-        // separate CHANNEL selector any more, so the Settings checkbox is
-        // the single source of truth for "does this install want beta
-        // releases" (BtnInstall_Click reads it directly). The VERSION
-        // dropdown and [LATEST] line are filtered the same way in
-        // StatusWorker_DoWork/RunWorkerCompleted so a hidden beta tag can't
-        // leak through there either.
-        //
-        // Index 0's wording is the only thing here that depends on the
-        // setting -- reassigning by index (not Add/Remove) keeps
-        // SelectedIndex, and thus whatever the user already picked, intact.
-        private void UpdateAutoVersionLabel()
-        {
-            bool showBeta = SettingsManager.GetShowBeta();
-            _cmbVersion.Items[0] = showBeta
-                ? "Latest (auto -- newest, incl. beta)"
-                : "Latest (auto -- newest stable)";
-        }
-
-        private void BtnSettings_Click(object sender, EventArgs e)
-        {
-            using (var dlg = new SettingsForm())
-            {
-                if (dlg.ShowDialog(this) == DialogResult.OK)
-                {
-                    UpdateAutoVersionLabel();
-                    // Re-run the startup check so the VERSION dropdown and
-                    // [LATEST] line immediately reflect the new setting
-                    // instead of waiting for the next launch.
-                    if (!_statusWorker.IsBusy && !_worker.IsBusy && !_uninstallWorker.IsBusy)
-                    {
-                        _lblLatest.Text = "[LATEST]    checking...";
-                        _statusWorker.RunWorkerAsync();
-                    }
-                }
-            }
         }
 
         private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
@@ -1285,12 +1138,10 @@ namespace KekModInstaller
                 installedText = "[INSTALLED] couldn't check (" + ex.Message + ")";
             }
 
-            bool showBeta = SettingsManager.GetShowBeta();
-
             string latestText;
             try
             {
-                latestText = "[LATEST]    " + InstallerCore.DescribeLatestAvailable(showBeta);
+                latestText = "[LATEST]    " + InstallerCore.DescribeLatestAvailable();
             }
             catch (Exception ex)
             {
@@ -1302,27 +1153,7 @@ namespace KekModInstaller
             // default text already on screen alone.
             string tickerText = InstallerCore.TryFetchTickerText();
 
-            // Version list for the VERSION dropdown -- best-effort too: null
-            // leaves the dropdown with just its "Latest (auto)" entry.
-            // Prerelease tags are stripped out entirely when beta builds
-            // aren't enabled in Settings, so a hidden beta can't be picked
-            // by tag even though it's technically published.
-            List<GhRelease> releases = null;
-            try
-            {
-                releases = InstallerCore.ListAvailableReleases();
-                if (!showBeta)
-                {
-                    releases = releases.Where(r => !r.Prerelease).ToList();
-                }
-            }
-            catch (Exception)
-            {
-                // offline / rate-limited -- auto mode still works at install
-                // time (Run() does its own fetch and reports its own error).
-            }
-
-            e.Result = new object[] { installedText, latestText, anyInstalled, tickerText, releases };
+            e.Result = new object[] { installedText, latestText, anyInstalled, tickerText };
         }
 
         private void StatusWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
@@ -1336,27 +1167,6 @@ namespace KekModInstaller
             _lblLatest.Text = (string)result[1];
             _hasInstalledVersions = (bool)result[2];
             string tickerText = (string)result[3];
-
-            // Fill the VERSION dropdown, preserving whatever the user already
-            // picked (by tag) if this ever re-runs.
-            var releases = (List<GhRelease>)result[4];
-            if (releases != null && releases.Count > 0)
-            {
-                string keepTag = _cmbVersion.SelectedIndex > 0
-                    ? _versionTags[_cmbVersion.SelectedIndex - 1] : null;
-                while (_cmbVersion.Items.Count > 1)
-                {
-                    _cmbVersion.Items.RemoveAt(1);
-                }
-                _versionTags.Clear();
-                foreach (GhRelease rel in releases)
-                {
-                    _versionTags.Add(rel.TagName);
-                    _cmbVersion.Items.Add(rel.TagName + (rel.Prerelease ? "  [beta]" : "  [stable]"));
-                }
-                int keepIdx = keepTag == null ? -1 : _versionTags.IndexOf(keepTag);
-                _cmbVersion.SelectedIndex = keepIdx >= 0 ? keepIdx + 1 : 0;
-            }
             if (tickerText != null)
             {
                 _lblTicker.Text = tickerText;
@@ -1378,11 +1188,9 @@ namespace KekModInstaller
             SetStatus("INSTALLING MOD FILES...");
 
             var options = new InstallOptions();
-            options.WantBeta = SettingsManager.GetShowBeta();
-            options.TagName = _cmbVersion.SelectedIndex > 0
-                ? _versionTags[_cmbVersion.SelectedIndex - 1] : null;
+            options.WantBeta = _rbBeta.Checked;
 #if INTERNAL_BUILD
-            options.WantDev = SettingsManager.GetUseDev();
+            options.WantDev = _rbDev.Checked;
 #else
             options.WantDev = false;
 #endif
@@ -1501,119 +1309,14 @@ namespace KekModInstaller
 
         private void SetControlsEnabled(bool enabled)
         {
-            _cmbVersion.Enabled = enabled;
+            _rbStable.Enabled = enabled;
+            _rbBeta.Enabled = enabled;
+#if INTERNAL_BUILD
+            _rbProd.Enabled = enabled;
+            _rbDev.Enabled = enabled;
+#endif
             _btnInstall.Enabled = enabled;
             _btnUninstall.Enabled = enabled && _hasInstalledVersions;
-        }
-    }
-
-    // Small modal dialog reached only via MainForm's gear button. "Enable
-    // beta builds" is the sole way to surface beta tags in the VERSION
-    // dropdown and have Install/[LATEST] consider them (see
-    // MainForm.UpdateAutoVersionLabel and BtnInstall_Click). INTERNAL_BUILD
-    // adds a second, Prod/Dev, section below it -- moved here from a BUILD
-    // box that used to sit on the main form, so the two builds' main
-    // windows now look identical and only this dialog differs between them.
-    internal class SettingsForm : Form
-    {
-        private CheckBox _chkShowBeta;
-#if INTERNAL_BUILD
-        private RadioButton _rbProd;
-        private RadioButton _rbDev;
-#endif
-
-        public SettingsForm()
-        {
-            Text = "KEK-MOD // SETTINGS";
-#if INTERNAL_BUILD
-            ClientSize = new Size(320, 230);
-#else
-            ClientSize = new Size(320, 150);
-#endif
-            StartPosition = FormStartPosition.CenterParent;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            MaximizeBox = false;
-            MinimizeBox = false;
-            BackColor = Color.Black;
-
-            Panel pnlBeta = MainForm.MakeRetroBox("BETA", 12, 12, 296, 60);
-
-            _chkShowBeta = new CheckBox();
-            _chkShowBeta.Text = "Enable beta builds";
-            _chkShowBeta.SetBounds(12, 22, 260, 20);
-            _chkShowBeta.ForeColor = MainForm.ThemeGreen;
-            _chkShowBeta.BackColor = Color.Black;
-            _chkShowBeta.Font = new Font("Consolas", 8.5F);
-            _chkShowBeta.Checked = SettingsManager.GetShowBeta();
-            pnlBeta.Controls.Add(_chkShowBeta);
-
-#if INTERNAL_BUILD
-            Panel pnlBuild = MainForm.MakeRetroBox("BUILD", 12, 80, 296, 70);
-
-            _rbProd = new RadioButton();
-            _rbProd.Text = "Prod (recommended)";
-            _rbProd.SetBounds(12, 22, 260, 20);
-            _rbProd.Checked = !SettingsManager.GetUseDev();
-            MainForm.StyleRetroRadio(_rbProd);
-
-            _rbDev = new RadioButton();
-            _rbDev.Text = "Dev (internal test server)";
-            _rbDev.SetBounds(12, 44, 260, 20);
-            _rbDev.Checked = SettingsManager.GetUseDev();
-            MainForm.StyleRetroRadio(_rbDev);
-
-            pnlBuild.Controls.Add(_rbProd);
-            pnlBuild.Controls.Add(_rbDev);
-#endif
-
-            var lblHint = new Label();
-#if INTERNAL_BUILD
-            lblHint.SetBounds(12, 158, 296, 32);
-#else
-            lblHint.SetBounds(12, 80, 296, 32);
-#endif
-            lblHint.Text = "Shows beta tags in VERSION and includes\r\nthem in Install/[LATEST]. Off by default.";
-            lblHint.Font = new Font("Consolas", 7.5F);
-            lblHint.ForeColor = MainForm.ThemeMagenta;
-            lblHint.BackColor = Color.Black;
-
-            var btnOk = new MainForm.RetroButton();
-            btnOk.Text = "OK";
-#if INTERNAL_BUILD
-            btnOk.SetBounds(126, 194, 90, 26);
-#else
-            btnOk.SetBounds(126, 116, 90, 26);
-#endif
-            btnOk.Click += BtnOk_Click;
-
-            var btnCancel = new MainForm.RetroButton();
-            btnCancel.Text = "CANCEL";
-#if INTERNAL_BUILD
-            btnCancel.SetBounds(220, 194, 88, 26);
-#else
-            btnCancel.SetBounds(220, 116, 88, 26);
-#endif
-            btnCancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
-
-            Controls.Add(pnlBeta);
-#if INTERNAL_BUILD
-            Controls.Add(pnlBuild);
-#endif
-            Controls.Add(lblHint);
-            Controls.Add(btnOk);
-            Controls.Add(btnCancel);
-
-            AcceptButton = btnOk;
-        }
-
-        private void BtnOk_Click(object sender, EventArgs e)
-        {
-            SettingsManager.SetShowBeta(_chkShowBeta.Checked);
-#if INTERNAL_BUILD
-            SettingsManager.SetUseDev(_rbDev.Checked);
-#endif
-            DialogResult = DialogResult.OK;
-            Close();
         }
     }
 
