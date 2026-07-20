@@ -176,6 +176,112 @@ namespace KekModInstaller
             }
         }
 
+        // This build's own version -- bump alongside installer/installer_version.txt
+        // (main branch) whenever KekModInstaller.exe is rebuilt for a release, so
+        // running copies out in the wild notice the newer one via
+        // TryFetchLatestInstallerVersion below. Unrelated to the mod's own
+        // version (release tags like "v1.5-beta8") -- this is the installer
+        // program's own version.
+        private const string InstallerVersion = "1.0";
+
+        public static string GetInstallerVersion()
+        {
+            return InstallerVersion;
+        }
+
+        // Same fetch pattern as TryFetchTickerText -- never throws, null just
+        // means the caller can't tell whether a newer installer exists and
+        // should leave the UPDATE button hidden.
+        public static string TryFetchLatestInstallerVersion()
+        {
+            string url = "https://raw.githubusercontent.com/" + RepoOwner + "/" + RepoName
+                + "/" + TickerBranch + "/installer/installer_version.txt";
+            try
+            {
+                using (var client = new HttpClient())
+                {
+                    client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
+                    string text = client.GetStringAsync(url).GetAwaiter().GetResult();
+                    text = text.Trim();
+                    return text.Length == 0 ? null : text;
+                }
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        // System.Version requires at least a major.minor pair -- "1" alone
+        // fails to parse where "1.0" doesn't, so pad single-component
+        // versions before comparing. Falls back to a plain string-inequality
+        // check if either side isn't a well-formed dotted-number version, so
+        // a hand-typed installer_version.txt typo still surfaces as "some
+        // update is available" rather than silently hiding the button.
+        public static bool IsNewerVersion(string remote, string local)
+        {
+            Version remoteVersion, localVersion;
+            if (Version.TryParse(PadVersion(remote), out remoteVersion)
+                && Version.TryParse(PadVersion(local), out localVersion))
+            {
+                return remoteVersion > localVersion;
+            }
+            return !string.Equals(remote, local, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string PadVersion(string v)
+        {
+            return v.IndexOf('.') < 0 ? v + ".0" : v;
+        }
+
+        // Downloads this build's own exe (same repo path the running copy was
+        // itself published from -- "installer/KekModInstaller.exe" or
+        // "installer/KekModInstaller.Internal.exe", whichever this process
+        // is) and replaces it in place, then relaunches. A running Windows
+        // exe can't overwrite its own file (still locked/mapped), so the
+        // swap happens via a short-lived helper batch script: this process
+        // downloads the new exe to %TEMP%, writes a .bat that waits a couple
+        // seconds for this process to exit, copies the new exe over the old
+        // one, relaunches it, then deletes itself. Caller must exit the app
+        // (Application.Exit) right after this returns.
+        public static void DownloadAndApplySelfUpdate()
+        {
+            string exePath = Assembly.GetExecutingAssembly().Location;
+            string exeName = Path.GetFileName(exePath);
+            string url = "https://raw.githubusercontent.com/" + RepoOwner + "/" + RepoName
+                + "/" + TickerBranch + "/installer/" + exeName;
+
+            string newExePath = Path.Combine(Path.GetTempPath(), "kekmod_installer_update_" + Guid.NewGuid().ToString("N") + ".exe");
+            using (var client = new HttpClient())
+            {
+                client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
+                byte[] data = client.GetByteArrayAsync(url).GetAwaiter().GetResult();
+                File.WriteAllBytes(newExePath, data);
+            }
+
+            // "ping -n 3" instead of "timeout" -- timeout needs an attached
+            // console to read from and fails ("INPUT redirection is not
+            // supported") when launched hidden/redirected the way this batch
+            // is; the old ping-as-sleep trick works unconditionally.
+            string batPath = Path.Combine(Path.GetTempPath(), "kekmod_installer_update_" + Guid.NewGuid().ToString("N") + ".bat");
+            string batContent =
+                "@echo off\r\n" +
+                "ping 127.0.0.1 -n 3 >nul\r\n" +
+                "copy /y \"" + newExePath + "\" \"" + exePath + "\" >nul\r\n" +
+                "del \"" + newExePath + "\"\r\n" +
+                "start \"\" \"" + exePath + "\"\r\n" +
+                "del \"%~f0\"\r\n";
+            File.WriteAllText(batPath, batContent);
+
+            var psi = new ProcessStartInfo();
+            psi.FileName = "cmd.exe";
+            psi.Arguments = "/c \"" + batPath + "\"";
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.WindowStyle = ProcessWindowStyle.Hidden;
+            Process.Start(psi);
+        }
+
         public static InstallResult Run(InstallOptions options, Action<string> log, Action<int> progress)
         {
             progress(0);
@@ -760,6 +866,8 @@ namespace KekModInstaller
         private RetroButton _btnOpenFolder;
         private RetroButton _btnMute;
         private RetroButton _btnSettings;
+        private RetroButton _btnUpdate;
+        private string _latestInstallerVersion;
         private Panel _tickerViewport;
         private Label _lblTicker;
         private RetroTextBox _txtLog;
@@ -845,7 +953,7 @@ namespace KekModInstaller
 
             _lblSubtitle = new Label();
             _lblSubtitle.SetBounds(12, 40, 500, 16);
-            _lblSubtitle.Text = "-=[ INSTALLER ]=-  RELEASED BY DEMOCRACIV";
+            _lblSubtitle.Text = "-=[ INSTALLER v" + InstallerCore.GetInstallerVersion() + " ]=-  RELEASED BY DEMOCRACIV";
             _lblSubtitle.Font = new Font("Consolas", 8.5F, FontStyle.Italic | FontStyle.Bold);
             _lblSubtitle.ForeColor = ThemeMagenta;
             _lblSubtitle.BackColor = Color.Black;
@@ -865,6 +973,18 @@ namespace KekModInstaller
             _btnSettings.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
             _btnSettings.TextOffsetY = -2; // see RetroButton.TextOffsetY
             _btnSettings.Click += BtnSettings_Click;
+
+            // Hidden until the startup status check finds a newer
+            // installer_version.txt on GitHub than InstallerCore.InstallerVersion
+            // -- see StatusWorker_DoWork/RunWorkerCompleted. Sits just left of
+            // the gear so it doesn't need its own row.
+            _btnUpdate = new RetroButton();
+            _btnUpdate.SetBounds(452, 6, 66, 22);
+            _btnUpdate.Text = "UPDATE";
+            _btnUpdate.Font = new Font("Consolas", 7.5F, FontStyle.Bold);
+            _btnUpdate.ForeColor = ThemeMagenta;
+            _btnUpdate.Visible = false;
+            _btnUpdate.Click += BtnUpdate_Click;
 
             _lblInstalled = new Label();
             _lblInstalled.SetBounds(12, 10 + TopShift, 532, 18);
@@ -1015,6 +1135,7 @@ namespace KekModInstaller
             Controls.Add(_tickerViewport);
             Controls.Add(_btnMute);
             Controls.Add(_btnSettings);
+            Controls.Add(_btnUpdate);
 
             UpdateAutoVersionLabel();
 
@@ -1260,6 +1381,47 @@ namespace KekModInstaller
             }
         }
 
+        // Downloads the new installer exe and relaunches -- see
+        // InstallerCore.DownloadAndApplySelfUpdate for how a running exe
+        // manages to replace itself. Blocked mid-install/uninstall so the
+        // helper batch script's file swap can't race a Worker still reading
+        // from disk.
+        private void BtnUpdate_Click(object sender, EventArgs e)
+        {
+            if (_worker.IsBusy || _uninstallWorker.IsBusy)
+            {
+                return;
+            }
+
+            DialogResult confirm = MessageBox.Show(
+                this,
+                "A new installer version (" + _latestInstallerVersion + ") is available. Download it now? "
+                    + "KEK-MOD Loader will close and restart automatically.",
+                "Update available",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Information);
+            if (confirm != DialogResult.Yes)
+            {
+                return;
+            }
+
+            string previousStatus = _statusBase;
+            try
+            {
+                _btnUpdate.Enabled = false;
+                SetStatus("DOWNLOADING UPDATE...");
+                InstallerCore.DownloadAndApplySelfUpdate();
+                Application.Exit();
+            }
+            catch (Exception ex)
+            {
+                _btnUpdate.Enabled = true;
+                SetStatus(previousStatus);
+                MessageBox.Show(this, "Update failed: " + ex.Message, "Update available",
+                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
         private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
         {
             _tickerTimer.Stop();
@@ -1304,6 +1466,10 @@ namespace KekModInstaller
             // default text already on screen alone.
             string tickerText = InstallerCore.TryFetchTickerText();
 
+            // Best-effort self-update check; a null here just means
+            // StatusWorker_RunWorkerCompleted leaves the UPDATE button hidden.
+            string latestInstallerVersion = InstallerCore.TryFetchLatestInstallerVersion();
+
             // Version list for the VERSION dropdown -- best-effort too: null
             // leaves the dropdown with just its "Latest (auto)" entry.
             // Prerelease tags are stripped out entirely when beta builds
@@ -1324,7 +1490,7 @@ namespace KekModInstaller
                 // time (Run() does its own fetch and reports its own error).
             }
 
-            e.Result = new object[] { installedText, latestText, anyInstalled, tickerText, releases };
+            e.Result = new object[] { installedText, latestText, anyInstalled, tickerText, releases, latestInstallerVersion };
         }
 
         private void StatusWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
@@ -1364,6 +1530,27 @@ namespace KekModInstaller
                 _lblTicker.Text = tickerText;
                 _lblTicker.Location = new Point(_tickerViewport.Width, 1); // restart the scroll cleanly
             }
+
+            string latestInstallerVersion = (string)result[5];
+#if INTERNAL_BUILD
+            // KekModInstaller.Internal.exe is gitignored (dev-machine only,
+            // never published to GitHub) -- DownloadAndApplySelfUpdate would
+            // just 404, so don't offer it here regardless of what
+            // installer_version.txt says.
+            _btnUpdate.Visible = false;
+#else
+            if (latestInstallerVersion != null
+                && InstallerCore.IsNewerVersion(latestInstallerVersion, InstallerCore.GetInstallerVersion()))
+            {
+                _latestInstallerVersion = latestInstallerVersion;
+                _btnUpdate.Visible = true;
+            }
+            else
+            {
+                _btnUpdate.Visible = false;
+            }
+#endif
+
             // Only touch the button if nothing else is currently running --
             // don't re-enable it mid-install/uninstall.
             if (!_worker.IsBusy && !_uninstallWorker.IsBusy)

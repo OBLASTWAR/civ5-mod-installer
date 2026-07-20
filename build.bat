@@ -11,6 +11,12 @@ setlocal
 ::                                  available, no BUILD (prod/dev) box
 ::   KekModInstaller.Internal.exe  dev-machine build -- adds the BUILD
 ::                                  (prod/dev) radio buttons on top
+::
+:: Self-update: whenever Installer.cs changes and you rebuild+publish a new
+:: KekModInstaller.exe to main, bump InstallerCore.InstallerVersion in
+:: Installer.cs AND installer/installer_version.txt to the same new value.
+:: Running copies compare their own baked-in InstallerVersion against
+:: installer_version.txt on main and show an UPDATE button when they differ.
 :: ============================================================
 
 set CSC=%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
