@@ -1,10 +1,21 @@
-// KekModInstaller -- pulls the latest published kek-mod build from GitHub
-// Releases and drops it into the local Civ V DLC folder. Small WinForms GUI:
-// pick a channel/build, click Install.
+// KekModInstaller -- pulls the latest published mod build from GitHub or
+// Google Drive and drops it into the local Civ V DLC folder. Small WinForms
+// GUI: pick a mod/channel/build, click Install.
+//
+// Split across a few files: this one (Installer.cs) is the installer PROGRAM
+// itself -- UI (MainForm/SettingsForm), retro theme/audio, and the
+// installer's own self-update + greetz-ticker fetch (both pinned to
+// OBLASTWAR/kek-mod's main branch regardless of which mod is selected, since
+// that's just where this installer program is hosted). Everything about the
+// MODS it can install -- the ModDefinition/IModSource abstraction, and where
+// Civ5 itself lives on disk -- is in ModCore.cs, GitHubModSource.cs, and
+// MapScriptExtra.cs. InstallerCore is declared `partial` and split across
+// Installer.cs and ModCore.cs for that reason.
 //
 // Mirrors, on the client side, what stage.sh/deploy.sh already do on the dev
-// machine: same "KEK Mod v<version>" folder naming, same "replace only this
-// version's own folder, leave others alone" rule, same ui_check.bat-last step.
+// machine for kek-mod: same "KEK Mod v<version>" folder naming, same
+// "replace only this version's own folder, leave others alone" rule, same
+// ui_check.bat-last step.
 //
 // Deliberately written against C# 5 syntax (no string interpolation, no
 // null-conditional operators, no pattern-matching `is` declarations): the
@@ -17,65 +28,22 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
-using System.IO.Compression;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
 using System.Runtime.InteropServices;
-using System.Runtime.Serialization;
-using System.Runtime.Serialization.Json;
 using System.Text;
-using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
 namespace KekModInstaller
 {
-    [DataContract]
-    internal class GhAsset
-    {
-        [DataMember(Name = "name")]
-        public string Name { get; set; }
-
-        [DataMember(Name = "browser_download_url")]
-        public string BrowserDownloadUrl { get; set; }
-    }
-
-    [DataContract]
-    internal class GhRelease
-    {
-        [DataMember(Name = "tag_name")]
-        public string TagName { get; set; }
-
-        [DataMember(Name = "prerelease")]
-        public bool Prerelease { get; set; }
-
-        [DataMember(Name = "assets")]
-        public List<GhAsset> Assets { get; set; }
-    }
-
-    internal class InstallOptions
-    {
-        public bool WantBeta;
-        public bool WantDev;
-        // Exact release tag to install (e.g. "v1.4"), from the VERSION
-        // dropdown. null/empty = automatic: newest per WantBeta.
-        public string TagName;
-    }
-
-    internal class InstallResult
-    {
-        public string FolderName;
-        public string TargetDir;
-    }
-
     // Persists the settings-page opt-ins across launches. Both off by
     // default: regular players shouldn't see beta as an option at all
     // unless they've deliberately dug into Settings for it, and a dev build
     // that accidentally starts pulling from the LAN test server is the kind
-    // of surprise nobody wants -- see MainForm.UpdateAutoVersionLabel and
-    // SettingsForm.
+    // of surprise nobody wants -- see SettingsForm.
     internal static class SettingsManager
     {
         private const string RegistryKey = @"HKEY_CURRENT_USER\Software\KekModInstaller";
@@ -123,28 +91,20 @@ namespace KekModInstaller
         }
     }
 
-    // Core install logic, UI-agnostic: reports progress through a plain
-    // Action<string> so both the WinForms log box and (if ever needed again)
-    // a console could drive it the same way.
-    internal static class InstallerCore
+    // Core logic for the installer PROGRAM itself: self-update and the
+    // greetz ticker. Declared `partial` -- the other half of this class
+    // (ModCore.cs) holds everything mod-agnostic: install/uninstall/detect,
+    // driven entirely by a ModDefinition, plus where Civ5 lives on disk.
+    // Reports progress through a plain Action<string> so both the WinForms
+    // log box and (if ever needed again) a console could drive it the same
+    // way.
+    internal static partial class InstallerCore
     {
+        // Repo this installer program itself is published from -- used only
+        // for the self-update and ticker fetches below, NOT for fetching any
+        // mod's own releases (see GitHubModSource for that).
         private const string RepoOwner = "OBLASTWAR";
         private const string RepoName = "kek-mod";
-
-        // Bonus map script, pulled in alongside kek-mod if the player
-        // doesn't already have it -- separate repo, separate release cadence
-        // (no dev/prod, no beta channel, just "latest"). Uninstall removes
-        // it too, since the installer is the one that put it there and
-        // players expect "uninstall" to clean up everything it added.
-        //
-        // FolderName is deliberately "Fish Map Script" -- the exact name
-        // already used by existing community installs -- NOT the
-        // "pangea-stratbal" repo's own label. Renaming it would make players
-        // who already have it look like they're missing a "different" map
-        // and get a redundant second copy installed alongside their real one.
-        private const string MapScriptRepoOwner = "OBLASTWAR";
-        private const string MapScriptRepoName = "pangea-stratbal";
-        private const string MapScriptFolderName = "Fish Map Script";
 
         // Branch the scrolling greetz ticker is read from at startup, so the
         // message can be edited on GitHub without shipping a new installer
@@ -281,480 +241,6 @@ namespace KekModInstaller
             psi.WindowStyle = ProcessWindowStyle.Hidden;
             Process.Start(psi);
         }
-
-        public static InstallResult Run(InstallOptions options, Action<string> log, Action<int> progress)
-        {
-            progress(0);
-            GhRelease release = string.IsNullOrEmpty(options.TagName)
-                ? FetchTargetRelease(options.WantBeta)
-                : FetchReleaseByTag(options.TagName);
-            log("Release: " + release.TagName + (release.Prerelease ? " (prerelease)" : "")
-                + (string.IsNullOrEmpty(options.TagName) ? "" : " [selected version]"));
-
-            GhAsset asset = PickAsset(release, options.WantDev);
-            log("Asset: " + asset.Name);
-            progress(10);
-
-            log("Downloading...");
-            string zipPath = DownloadAsset(asset);
-            progress(50);
-
-            string dlcRoot = LocateCiv5DlcFolder(log);
-            log("Civ V DLC folder: " + dlcRoot);
-            progress(55);
-
-            string folderName = "KEK Mod " + release.TagName; // tag "v1.5-beta8" -> "KEK Mod v1.5-beta8"
-            string targetDir = Path.Combine(dlcRoot, folderName);
-
-            if (Directory.Exists(targetDir))
-            {
-                log("Removing existing " + folderName + "...");
-                Directory.Delete(targetDir, true);
-            }
-            progress(60);
-
-            log("Extracting...");
-            ZipFile.ExtractToDirectory(zipPath, dlcRoot);
-            File.Delete(zipPath);
-            progress(75);
-
-            RunUiCheck(targetDir, log);
-            progress(90);
-
-            // Clean up other versions only after the new one is confirmed in
-            // place -- if anything above failed, whatever was already working
-            // stays untouched instead of leaving the user with nothing.
-            RemoveOtherVersions(dlcRoot, folderName, log);
-            progress(97);
-
-            EnsureMapScriptInstalled(dlcRoot, log);
-            progress(100);
-
-            log("Done: " + folderName);
-
-            var result = new InstallResult();
-            result.FolderName = folderName;
-            result.TargetDir = targetDir;
-            return result;
-        }
-
-        // Deletes every "KEK Mod v*" folder under dlcRoot except keepFolderName.
-        private static void RemoveOtherVersions(string dlcRoot, string keepFolderName, Action<string> log)
-        {
-            foreach (string dir in Directory.GetDirectories(dlcRoot, "KEK Mod v*"))
-            {
-                string name = Path.GetFileName(dir);
-                if (!string.Equals(name, keepFolderName, StringComparison.OrdinalIgnoreCase))
-                {
-                    log("Removing old version " + name + "...");
-                    Directory.Delete(dir, true);
-                }
-            }
-        }
-
-        // Removes every installed "KEK Mod v*" folder plus the Fish Map
-        // Script folder installed alongside it. Used by the Uninstall
-        // button -- unlike Run(), there's no "new version" to keep.
-        public static void Uninstall(Action<string> log, Action<int> progress)
-        {
-            progress(0);
-            string dlcRoot = TryAutoLocateCiv5DlcFolder();
-            if (dlcRoot == null || !Directory.Exists(dlcRoot))
-            {
-                throw new InvalidOperationException("Couldn't locate the Civilization V DLC folder.");
-            }
-
-            string[] dirs = Directory.GetDirectories(dlcRoot, "KEK Mod v*");
-            if (dirs.Length == 0)
-            {
-                log("Nothing to uninstall.");
-            }
-            else
-            {
-                for (int i = 0; i < dirs.Length; i++)
-                {
-                    log("Removing " + Path.GetFileName(dirs[i]) + "...");
-                    Directory.Delete(dirs[i], true);
-                    progress(10 + (80 * (i + 1) / dirs.Length));
-                }
-            }
-
-            RemoveMapScript(dlcRoot, log);
-
-            log("Uninstall complete.");
-            progress(100);
-        }
-
-        // Removes the Fish Map Script folder from Assets/Maps if present.
-        // Mirrors the path derivation in EnsureMapScriptInstalled. Never
-        // throws -- a missing folder or locked file shouldn't fail the
-        // overall uninstall.
-        private static void RemoveMapScript(string dlcRoot, Action<string> log)
-        {
-            try
-            {
-                string assetsFolder = Path.GetDirectoryName(dlcRoot); // DLC's parent
-                string mapsFolder = Path.Combine(assetsFolder, "Maps");
-                string targetDir = Path.Combine(mapsFolder, MapScriptFolderName);
-                if (Directory.Exists(targetDir))
-                {
-                    log("Removing " + MapScriptFolderName + "...");
-                    Directory.Delete(targetDir, true);
-                }
-            }
-            catch (Exception ex)
-            {
-                log(MapScriptFolderName + ": couldn't remove (" + ex.Message + ")");
-            }
-        }
-
-        // GitHub returns releases newest-first. WantBeta takes the newest release
-        // of any kind; otherwise the newest one that isn't a prerelease.
-        private static GhRelease FetchTargetRelease(bool wantBeta)
-        {
-            List<GhRelease> releases = FetchReleases(RepoOwner, RepoName);
-            GhRelease chosen = wantBeta ? releases[0] : releases.FirstOrDefault(r => !r.Prerelease);
-            if (chosen == null)
-            {
-                throw new InvalidOperationException(
-                    "No stable (non-prerelease) release found. Check \"Include beta versions\" to install the latest beta instead.");
-            }
-            return chosen;
-        }
-
-        // VERSION-dropdown support: every published release, newest first.
-        // Same fetch the auto path uses; the UI shows tags and hands the
-        // chosen one back via InstallOptions.TagName.
-        public static List<GhRelease> ListAvailableReleases()
-        {
-            return FetchReleases(RepoOwner, RepoName);
-        }
-
-        private static GhRelease FetchReleaseByTag(string tagName)
-        {
-            List<GhRelease> releases = FetchReleases(RepoOwner, RepoName);
-            GhRelease chosen = releases.FirstOrDefault(
-                r => string.Equals(r.TagName, tagName, StringComparison.OrdinalIgnoreCase));
-            if (chosen == null)
-            {
-                throw new InvalidOperationException(
-                    "Release " + tagName + " no longer exists on GitHub. Pick another version.");
-            }
-            return chosen;
-        }
-
-        private static List<GhRelease> FetchReleases(string owner, string repo)
-        {
-            string url = "https://api.github.com/repos/" + owner + "/" + repo + "/releases?per_page=50";
-            using (var client = new HttpClient())
-            {
-                client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                client.DefaultRequestHeaders.Add("Accept", "application/vnd.github+json");
-
-                byte[] body = client.GetByteArrayAsync(url).GetAwaiter().GetResult();
-                var serializer = new DataContractJsonSerializer(typeof(List<GhRelease>));
-                using (var stream = new MemoryStream(body))
-                {
-                    var releases = (List<GhRelease>)serializer.ReadObject(stream);
-                    if (releases == null || releases.Count == 0)
-                    {
-                        throw new InvalidOperationException(
-                            "No releases found for " + owner + "/" + repo + ". Has anything been published yet?");
-                    }
-                    return releases;
-                }
-            }
-        }
-
-        // Downloads and drops MapScriptFolderName into Assets/Maps if it
-        // isn't already there. Deliberately swallows every failure (offline,
-        // repo/release missing, extraction hiccup): this is a bonus, not
-        // part of kek-mod itself, so it should never fail the main install.
-        // Takes dlcRoot (already resolved by Run(), possibly via the manual
-        // FolderBrowserDialog fallback) rather than re-deriving it via the
-        // auto-only TryAutoLocateCiv5DlcFolder -- otherwise this would
-        // silently skip for anyone who had to browse to a non-Steam-standard
-        // Civ5 install.
-        private static void EnsureMapScriptInstalled(string dlcRoot, Action<string> log)
-        {
-            try
-            {
-                string assetsFolder = Path.GetDirectoryName(dlcRoot); // DLC's parent
-
-                string mapsFolder = Path.Combine(assetsFolder, "Maps");
-                string targetDir = Path.Combine(mapsFolder, MapScriptFolderName);
-                if (Directory.Exists(targetDir))
-                {
-                    log(MapScriptFolderName + " already installed, skipping.");
-                    return;
-                }
-
-                log("Installing " + MapScriptFolderName + "...");
-                GhRelease release = FetchReleases(MapScriptRepoOwner, MapScriptRepoName)[0]; // newest
-                GhAsset asset = release.Assets != null ? release.Assets.FirstOrDefault() : null;
-                if (asset == null)
-                {
-                    log(MapScriptFolderName + ": release " + release.TagName + " has no assets, skipping.");
-                    return;
-                }
-
-                string zipPath = DownloadAsset(asset);
-                Directory.CreateDirectory(mapsFolder);
-                ZipFile.ExtractToDirectory(zipPath, mapsFolder);
-                File.Delete(zipPath);
-                log(MapScriptFolderName + " " + release.TagName + " installed.");
-            }
-            catch (Exception ex)
-            {
-                log(MapScriptFolderName + ": couldn't install (" + ex.Message + ")");
-            }
-        }
-
-        public static string DescribeLatestAvailable(bool wantBeta)
-        {
-            GhRelease release = FetchTargetRelease(wantBeta);
-            // "KEK Mod " prefix matches DetectInstalledVersions' folder-name
-            // format (e.g. "KEK Mod v1.4") so [INSTALLED] and [LATEST] read
-            // as directly comparable at a glance instead of two different
-            // formats for the same version.
-            return "KEK Mod " + release.TagName + (release.Prerelease ? " (beta)" : "");
-        }
-
-        private static GhAsset PickAsset(GhRelease release, bool wantDev)
-        {
-            // gh CLI sanitizes spaces in uploaded asset filenames (observed:
-            // "kekmod prod 1.5.zip" -> "kekmod.prod.1.5.zip" on GitHub), so
-            // match "prod"/"dev" as a whole word regardless of the separator
-            // (space, dot, dash, underscore) around it.
-            string word = wantDev ? "dev" : "prod";
-            var pattern = new Regex("\\b" + word + "\\b", RegexOptions.IgnoreCase);
-            GhAsset asset = null;
-            if (release.Assets != null)
-            {
-                asset = release.Assets.FirstOrDefault(a => pattern.IsMatch(a.Name));
-            }
-            if (asset == null)
-            {
-                string found = release.Assets == null
-                    ? ""
-                    : string.Join(", ", release.Assets.Select(a => a.Name).ToArray());
-                throw new InvalidOperationException(
-                    "Release " + release.TagName + " has no asset matching \"" + word + "\". Assets found: " + found);
-            }
-            return asset;
-        }
-
-        private static string DownloadAsset(GhAsset asset)
-        {
-            string tempPath = Path.Combine(Path.GetTempPath(), "kekmod_" + Guid.NewGuid().ToString("N") + ".zip");
-            using (var client = new HttpClient())
-            {
-                client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                byte[] data = client.GetByteArrayAsync(asset.BrowserDownloadUrl).GetAwaiter().GetResult();
-                File.WriteAllBytes(tempPath, data);
-            }
-            return tempPath;
-        }
-
-        // Finds the Steam library that actually contains Civ5 -- it may not be
-        // the main Steam install (external drives, multiple libraries).
-        private const string Civ5RelPath = "steamapps\\common\\Sid Meier's Civilization V";
-
-        // Silent variant for the startup status check: no dialog, just null if
-        // nothing was found. The interactive prompt is reserved for Install,
-        // where failing to locate Civ5 should actually stop the user.
-        // Public wrapper for the "Open install folder" button, which should
-        // always point somewhere useful regardless of whether an
-        // install/uninstall has run yet this session.
-        public static string TryGetDlcFolder()
-        {
-            return TryAutoLocateCiv5DlcFolder();
-        }
-
-        // Points at one of the player's OWN already-installed Civ5 cursors
-        // under Assets/UI/Cursors (e.g. "Pointer.ani", "Edit.ani"), never
-        // bundled/redistributed by us -- same principle as running
-        // ui_check.bat from their own extracted mod folder rather than
-        // shipping a copy of it.
-        public static string TryGetCivCursorPath(string fileName)
-        {
-            string assetsFolder = TryGetAssetsFolder();
-            if (assetsFolder == null)
-            {
-                return null;
-            }
-            string cursorPath = Path.Combine(assetsFolder, "UI", "Cursors", fileName);
-            return File.Exists(cursorPath) ? cursorPath : null;
-        }
-
-        // Civ5's Assets/ folder (DLC's parent) -- shared by anything that
-        // needs to reach outside Assets/DLC, e.g. Assets/UI/Cursors or
-        // Assets/Maps.
-        private static string TryGetAssetsFolder()
-        {
-            string dlcFolder = TryAutoLocateCiv5DlcFolder();
-            return dlcFolder == null ? null : Path.GetDirectoryName(dlcFolder);
-        }
-
-        private static string TryAutoLocateCiv5DlcFolder()
-        {
-            foreach (string libraryPath in EnumerateSteamLibraries())
-            {
-                string candidate = Path.Combine(libraryPath, Civ5RelPath);
-                if (Directory.Exists(candidate))
-                {
-                    return Path.Combine(candidate, "Assets", "DLC");
-                }
-            }
-            return null;
-        }
-
-        private static string LocateCiv5DlcFolder(Action<string> log)
-        {
-            string auto = TryAutoLocateCiv5DlcFolder();
-            if (auto != null)
-            {
-                return auto;
-            }
-
-            log("Couldn't auto-detect a Steam library containing Civilization V.");
-            string manual = PromptForCiv5Path();
-            if (string.IsNullOrEmpty(manual) || !Directory.Exists(manual))
-            {
-                throw new InvalidOperationException("No valid Civilization V folder given.");
-            }
-            return Path.Combine(manual, "Assets", "DLC");
-        }
-
-        // Startup status check: what's already on disk, and what's the newest
-        // thing published (whichever channel). Never throws -- the caller
-        // shows "couldn't check" rather than blocking the form on failure.
-        public static List<string> DetectInstalledVersions()
-        {
-            var found = new List<string>();
-            string dlcRoot = TryAutoLocateCiv5DlcFolder();
-            if (dlcRoot != null && Directory.Exists(dlcRoot))
-            {
-                foreach (string dir in Directory.GetDirectories(dlcRoot, "KEK Mod v*"))
-                {
-                    found.Add(Path.GetFileName(dir));
-                }
-            }
-            found.Sort();
-            return found;
-        }
-
-        // Runs on the background thread; must not touch the main form. A small
-        // modal FolderBrowserDialog is safe to show from any STA thread.
-        private static string PromptForCiv5Path()
-        {
-            string result = null;
-            using (var dialog = new FolderBrowserDialog())
-            {
-                dialog.Description = "Select your Sid Meier's Civilization V install folder";
-                if (dialog.ShowDialog() == DialogResult.OK)
-                {
-                    result = dialog.SelectedPath;
-                }
-            }
-            return result;
-        }
-
-        private static IEnumerable<string> EnumerateSteamLibraries()
-        {
-            string steamPath = GetSteamInstallPath();
-            if (steamPath == null)
-            {
-                yield break;
-            }
-
-            // The main Steam install is always an implicit library.
-            yield return steamPath;
-
-            string vdfPath = Path.Combine(steamPath, "steamapps", "libraryfolders.vdf");
-            if (!File.Exists(vdfPath))
-            {
-                yield break;
-            }
-
-            string vdf = File.ReadAllText(vdfPath);
-            MatchCollection matches = Regex.Matches(vdf, "\"path\"\\s*\"([^\"]+)\"");
-            foreach (Match m in matches)
-            {
-                yield return m.Groups[1].Value.Replace("\\\\", "\\");
-            }
-        }
-
-        private static string GetSteamInstallPath()
-        {
-            string[] keys =
-            {
-                @"HKEY_CURRENT_USER\Software\Valve\Steam",
-                @"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Valve\Steam",
-                @"HKEY_LOCAL_MACHINE\SOFTWARE\Valve\Steam",
-            };
-            string[] valueNames = { "SteamPath", "InstallPath" };
-
-            for (int i = 0; i < keys.Length; i++)
-            {
-                for (int j = 0; j < valueNames.Length; j++)
-                {
-                    object value = Registry.GetValue(keys[i], valueNames[j], null);
-                    string s = value as string;
-                    if (s != null && Directory.Exists(s))
-                    {
-                        return s.Replace('/', '\\');
-                    }
-                }
-            }
-            return null;
-        }
-
-        private static void RunUiCheck(string extractedDir, Action<string> log)
-        {
-            string batPath = Path.Combine(extractedDir, "ui_check.bat");
-            if (!File.Exists(batPath))
-            {
-                log("ui_check.bat not found in the extracted folder, skipping");
-                return;
-            }
-
-            log("Running ui_check.bat...");
-            var psi = new ProcessStartInfo();
-            psi.FileName = batPath;
-            psi.WorkingDirectory = extractedDir;
-            psi.UseShellExecute = false;
-            psi.CreateNoWindow = true;
-            psi.RedirectStandardOutput = true;
-            psi.RedirectStandardError = true;
-
-            // ui_check.bat's xcopy/FINDSTR chain is extremely verbose and
-            // none of it is useful to a player watching the installer, so
-            // it's captured (draining it is required to avoid deadlocking
-            // WaitForExit() once the OS pipe buffer fills) but only surfaced
-            // if the script actually fails.
-            var output = new StringBuilder();
-            using (var proc = new Process())
-            {
-                proc.StartInfo = psi;
-                proc.OutputDataReceived += (s, e) => { if (e.Data != null) output.AppendLine(e.Data); };
-                proc.ErrorDataReceived += (s, e) => { if (e.Data != null) output.AppendLine(e.Data); };
-                proc.Start();
-                proc.BeginOutputReadLine();
-                proc.BeginErrorReadLine();
-                proc.WaitForExit();
-
-                if (proc.ExitCode == 0)
-                {
-                    log("ui_check.bat finished successfully.");
-                }
-                else
-                {
-                    log("ui_check.bat failed with exit code " + proc.ExitCode + ":");
-                    log(output.ToString());
-                }
-            }
-        }
     }
 
     // Looping background track via the classic MCI trick (winmm.dll,
@@ -837,11 +323,81 @@ namespace KekModInstaller
         // Beta opt-in (both builds) and Prod/Dev (INTERNAL_BUILD only) both
         // live in Settings now, not as boxes on the main form -- see
         // SettingsForm. Keeps the two builds' main windows identical.
-        // VERSION dropdown: index 0 = automatic (newest per the Settings
-        // beta opt-in); the rest mirror _versionTags (offset by one) as
-        // populated by the startup status check.
-        private ComboBox _cmbVersion;
-        private readonly List<string> _versionTags = new List<string>();
+
+        // One bordered box per ModRegistry.All entry, each titled with that
+        // mod's own name -- leaves room for a sub-row per mod (its bonus
+        // component, e.g. kek-mod's Fish Map Script) inside the same box,
+        // which a single shared "MOD" box with plain rows couldn't express.
+        // Install state is shown via a small dot indicator + name-text color
+        // (UpdateModRowStyles) and via the box's own border color; each box
+        // carries its own INSTALL/UNINSTALL/VERSION buttons on the right --
+        // there's no separate "select a mod first" step.
+        private class ModRowControls
+        {
+            public Panel Box;
+            public Label Indicator;
+            public Label NameLabel;
+            public Label UpdateIcon; // shown only when an update is available -- see UpdateModRowStyles
+            public Label ExtraIndicator; // null if this mod has no bonus component
+            public Label ExtraNameLabel; // null if this mod has no bonus component
+            public RetroButton InstallButton;
+            public RetroButton UninstallButton;
+            public RetroButton VersionButton;
+        }
+        private readonly List<ModRowControls> _modRows = new List<ModRowControls>();
+        // True while an Install/Uninstall/EUI-change worker is running --
+        // every per-box button is force-disabled during that window instead
+        // of relying solely on Control.Enabled bookkeeping scattered
+        // elsewhere.
+        private bool _actionInProgress;
+        private readonly HashSet<string> _installedModIds = new HashSet<string>();
+        // Version currently on disk for whichever mods are installed (e.g.
+        // "v1.4", "12.2a") -- shown next to the mod's name in its box. Keyed
+        // by mod id; a mod missing from here just isn't installed.
+        private readonly Dictionary<string, string> _installedVersionByModId = new Dictionary<string, string>();
+        // Same idea for a mod's bonus component (e.g. Fish Map Script,
+        // Better Pangaea) -- keyed by ModDefinition.ExtraModId. Only
+        // populated when the detector could actually determine a version
+        // (see DetectedModInstall.VersionLabel); a mod's extra missing from
+        // here just shows its name with no version suffix.
+        private readonly Dictionary<string, string> _installedExtraVersionByModId = new Dictionary<string, string>();
+        // Mods where what's installed isn't what auto-install would pick
+        // right now (see IsUpdateAvailable) -- shown as a small badge next
+        // to the mod's name.
+        private readonly HashSet<string> _updateAvailableModIds = new HashSet<string>();
+
+        // EUI section: same per-box-buttons treatment as the mod boxes --
+        // each EuiVariant gets its own box with INSTALL/REMOVE buttons (no
+        // VERSION button: this is a single bundled copy we ship ourselves,
+        // not something with published releases to choose between).
+        private class EuiRowControls
+        {
+            public Panel Box;
+            public Label Indicator;
+            public Label NameLabel;
+            public RetroButton InstallButton;
+            public RetroButton RemoveButton;
+        }
+        private readonly List<EuiRowControls> _euiRows = new List<EuiRowControls>();
+        private string _installedEuiVariantId; // null if no EUI installed
+        // True if _installedEuiVariantId is set but EuiExtra.IsExactBundledMatch
+        // says what's actually on disk isn't byte-identical to what this
+        // build bundles for that variant -- e.g. the player manually
+        // installed a newer/older/modified EUI themselves. Every mod we ship
+        // is only tested against our exact bundled copy, so this matters.
+        private bool _installedEuiVersionMismatch;
+        private BackgroundWorker _euiWorker;
+        // Per-mod version choice from that mod's own VERSION button/popup --
+        // absent (or not in the dictionary) means "Latest (auto)".
+        private readonly Dictionary<string, string> _selectedVersionTagByModId = new Dictionary<string, string>();
+        // Set only while an install-triggered uninstall (see
+        // OnModInstallClick) of a conflicting mod is running, so
+        // UninstallWorker_RunWorkerCompleted knows to proceed straight into
+        // installing this mod with these options afterward, instead of just
+        // refreshing the status display.
+        private ModDefinition _pendingInstallMod;
+        private InstallOptions _pendingInstallOptions;
+        private const int ModRowHeight = 24;
         // TopShift reserves room for the title banner; BottomStrip reserves
         // room for the greetz ticker + mute button. Late-90s/early-2000s
         // "cracktro" theme: black background, neon green terminal text,
@@ -855,14 +411,23 @@ namespace KekModInstaller
         internal static readonly Color ThemeGreen = Color.FromArgb(0, 255, 65);
         internal static readonly Color ThemeMagenta = Color.FromArgb(255, 0, 190);
         internal static readonly Color ThemeRed = Color.FromArgb(255, 60, 60);
+        // Dim/"off" indicator color -- matches RetroButton's disabled-text
+        // color so "not installed" reads consistently across the UI.
+        internal static readonly Color ThemeDim = Color.FromArgb(0, 100, 40);
 
         private Label _lblTitle;
         private Label _lblSubtitle;
         private Panel _dividerLine;
-        private Label _lblInstalled;
-        private Label _lblLatest;
-        private RetroButton _btnInstall;
-        private RetroButton _btnUninstall;
+        // Every mod's release list, fetched once at startup (see
+        // StatusWorker_DoWork) and reused for every VERSION-dropdown
+        // refresh afterward -- switching mods, toggling the beta setting,
+        // or finishing an install/uninstall/EUI change never re-fetches,
+        // so casual clicking around can't run into GitHub's unauthenticated
+        // 60-requests/hour rate limit. A mod missing from this dictionary
+        // means its startup fetch failed (offline/rate-limited/etc.); that
+        // mod's VERSION popup just shows "Latest (auto)" alone and Install
+        // still works via its own live fetch at install time regardless.
+        private Dictionary<string, List<ModRelease>> _releasesByModId = new Dictionary<string, List<ModRelease>>();
         private RetroButton _btnOpenFolder;
         private RetroButton _btnMute;
         private RetroButton _btnSettings;
@@ -878,7 +443,6 @@ namespace KekModInstaller
         private BackgroundWorker _uninstallWorker;
         private Timer _tickerTimer;
         private Timer _cursorTimer;
-        private bool _hasInstalledVersions;
         private bool _muted;
         private string _statusBase = "SYSTEM READY";
         private bool _cursorOn;
@@ -919,11 +483,7 @@ namespace KekModInstaller
 
         public MainForm()
         {
-            Text = "KEK-MOD // LOADER";
-            // ClientSize, not Width/Height: the latter includes the title bar
-            // and borders, which shrinks the usable area every control below
-            // is positioned against and clips the bottom row.
-            ClientSize = new Size(560, 572 + TopShift + BottomStrip);
+            Text = "CIV V MOD INSTALLER";
             StartPosition = FormStartPosition.CenterScreen;
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
@@ -945,15 +505,15 @@ namespace KekModInstaller
             }
 
             _lblTitle = new Label();
-            _lblTitle.SetBounds(10, 4, 400, 34);
-            _lblTitle.Text = "KEK MOD";
-            _lblTitle.Font = new Font("Consolas", 20F, FontStyle.Bold);
+            _lblTitle.SetBounds(10, 4, 430, 34);
+            _lblTitle.Text = "CIV V MOD INSTALLER";
+            _lblTitle.Font = new Font("Consolas", 14F, FontStyle.Bold);
             _lblTitle.ForeColor = ThemeGreen;
             _lblTitle.BackColor = Color.Black;
 
             _lblSubtitle = new Label();
             _lblSubtitle.SetBounds(12, 40, 500, 16);
-            _lblSubtitle.Text = "-=[ INSTALLER v" + InstallerCore.GetInstallerVersion() + " ]=-  RELEASED BY DEMOCRACIV";
+            _lblSubtitle.Text = "-=[ INSTALLER v" + InstallerCore.GetInstallerVersion() + " ]=-  RELEASED BY OBLAST";
             _lblSubtitle.Font = new Font("Consolas", 8.5F, FontStyle.Italic | FontStyle.Bold);
             _lblSubtitle.ForeColor = ThemeMagenta;
             _lblSubtitle.BackColor = Color.Black;
@@ -986,54 +546,88 @@ namespace KekModInstaller
             _btnUpdate.Visible = false;
             _btnUpdate.Click += BtnUpdate_Click;
 
-            _lblInstalled = new Label();
-            _lblInstalled.SetBounds(12, 10 + TopShift, 532, 18);
-            _lblInstalled.Text = "[INSTALLED] checking...";
-            _lblInstalled.Font = new Font("Consolas", 9F, FontStyle.Bold);
-            _lblInstalled.ForeColor = ThemeGreen;
-            _lblInstalled.BackColor = Color.Black;
+            // One bordered box per supported mod (ModRegistry.All), each
+            // titled with that mod's own name, containing a status indicator
+            // + name plus its own INSTALL/UNINSTALL/VERSION buttons (see
+            // BuildModBox) -- no separate "select a mod first" step, and a
+            // sub-row for its bonus component (if any -- e.g. kek-mod's Fish
+            // Map Script) with its own indicator. Separate boxes (rather than
+            // one shared "MOD" box with plain rows) so a mod's sub-items
+            // visually belong to it. Boxes stack starting where the old MOD
+            // dropdown used to sit; modShift (how far everything below it
+            // gets pushed down) is however much vertical space this stack
+            // ends up needing, computed as a side effect of building it.
+            //
+            // A fast local detection pass (no network) seeds _installedModIds
+            // / _installedVersionByModId / _installedEuiVariantId (and
+            // _updateAvailableModIds, once the async status check below has
+            // populated _releasesByModId to compare against) so the indicator
+            // dots and per-box button states painted below reflect real state
+            // immediately instead of starting blank.
+            DetectInstalledState();
 
-            _lblLatest = new Label();
-            _lblLatest.SetBounds(12, 30 + TopShift, 532, 18);
-            _lblLatest.Text = "[LATEST]    checking...";
-            _lblLatest.Font = new Font("Consolas", 9F, FontStyle.Bold);
-            _lblLatest.ForeColor = ThemeGreen;
-            _lblLatest.BackColor = Color.Black;
+            const int outerPadTop = 18;    // room for the outer box's own title cutout
+            const int outerPadSide = 8;
+            const int outerPadBottom = 8;
+            const int innerWidth = 532 - outerPadSide * 2;
 
-            // Full-width VERSION row -- Prod/Dev (internal builds) and the
-            // beta opt-in both live in Settings now, so this row has no box
-            // above it in either build; lets players install any published
-            // release, not just the newest.
-            var pnlVersion = MakeRetroBox("VERSION", 12, 132 + TopShift, 532, 48);
+            // GAME MODS -- one bordered box per ModRegistry.All entry,
+            // nested inside a single outer "GAME MODS" box so kek-mod and
+            // Tournament Mod read as one group rather than two unrelated
+            // top-level boxes.
+            int gameModsY = 10 + TopShift; // now the first content row -- [INSTALLED] used to sit here before it was removed
+            int innerY = outerPadTop;
+            var modBoxes = new List<Panel>();
+            for (int i = 0; i < ModRegistry.All.Count; i++)
+            {
+                Panel box = BuildModBox(ModRegistry.All[i], outerPadSide, innerY, innerWidth);
+                modBoxes.Add(box);
+                innerY += box.Height + 8;
+            }
+            int gameModsHeight = innerY - 8 + outerPadBottom;
+            var gameModsBox = MakeRetroBox("GAME MODS", 12, gameModsY, 532, gameModsHeight);
+            foreach (Panel box in modBoxes) { gameModsBox.Controls.Add(box); }
+            Controls.Add(gameModsBox);
+            UpdateModRowStyles();
 
-            _cmbVersion = new ComboBox();
-            _cmbVersion.SetBounds(12, 18, 320, 22);
-            _cmbVersion.DropDownStyle = ComboBoxStyle.DropDownList;
-            _cmbVersion.FlatStyle = FlatStyle.Flat;
-            _cmbVersion.BackColor = Color.Black;
-            _cmbVersion.ForeColor = ThemeGreen;
-            _cmbVersion.Font = new Font("Consolas", 9F, FontStyle.Bold);
-            _cmbVersion.Items.Add("Latest (auto)"); // real text set by UpdateAutoVersionLabel below
-            _cmbVersion.SelectedIndex = 0;
-            pnlVersion.Controls.Add(_cmbVersion);
+            // INTERFACE MODS -- same nested-box treatment for EUI/EUI XITS.
+            // Clicking a variant's box installs it (replacing the other, if
+            // present -- both share Assets/DLC/UI_bc1) or removes EUI
+            // entirely if that box is already the active one.
+            int interfaceModsY = gameModsY + gameModsHeight + 8;
+            innerY = outerPadTop;
+            var euiBoxes = new List<Panel>();
+            for (int i = 0; i < EuiExtra.Variants.Count; i++)
+            {
+                Panel box = BuildEuiVariantBox(EuiExtra.Variants[i], outerPadSide, innerY, innerWidth);
+                euiBoxes.Add(box);
+                innerY += box.Height + 8;
+            }
+            int interfaceModsHeight = innerY - 8 + outerPadBottom;
+            var interfaceModsBox = MakeRetroBox("INTERFACE MODS", 12, interfaceModsY, 532, interfaceModsHeight);
+            foreach (Panel box in euiBoxes) { interfaceModsBox.Controls.Add(box); }
+            Controls.Add(interfaceModsBox);
+            UpdateEuiRowStyles();
 
-            _btnInstall = new RetroButton();
-            _btnInstall.Text = "INSTALL";
-            _btnInstall.SetBounds(12, 188 + TopShift, 110, 32);
-            _btnInstall.Click += BtnInstall_Click;
+            int modShift = (interfaceModsY + interfaceModsHeight + 8) - (132 + TopShift);
 
-            _btnUninstall = new RetroButton();
-            _btnUninstall.Text = "UNINSTALL";
-            _btnUninstall.SetBounds(130, 188 + TopShift, 110, 32);
-            _btnUninstall.Enabled = false; // enabled once the status check finds something
-            _btnUninstall.Click += BtnUninstall_Click;
+            // ClientSize, not Width/Height: the latter includes the title bar
+            // and borders, which shrinks the usable area every control below
+            // is positioned against and clips the bottom row. Set here, not
+            // at the top of the constructor, since it depends on modShift.
+            // "476" (was "572") accounts for the shared VERSION box + shared
+            // INSTALL/UNINSTALL row no longer existing -- every mod/EUI
+            // variant now carries its own action buttons directly on its box
+            // instead, so progress/status/log start right after INTERFACE
+            // MODS with no extra shared row in between.
+            ClientSize = new Size(560, 476 + TopShift + BottomStrip + modShift);
 
             _progress = new ProgressBar();
             // Inset 1px inside a magenta-bordered panel -- a plain black bar
             // on a black form is otherwise invisible at 0%, before any fill
             // color would show.
             var progressBorder = new Panel();
-            progressBorder.SetBounds(12, 228 + TopShift, 532, 20);
+            progressBorder.SetBounds(12, 132 + TopShift + modShift, 532, 20);
             progressBorder.BackColor = ThemeMagenta;
 
             _progress.SetBounds(1, 1, 530, 18);
@@ -1048,7 +642,7 @@ namespace KekModInstaller
             progressBorder.Controls.Add(_progress);
 
             _lblStatus = new Label();
-            _lblStatus.SetBounds(12, 256 + TopShift, 532, 20);
+            _lblStatus.SetBounds(12, 160 + TopShift + modShift, 532, 20);
             _lblStatus.Font = new Font("Consolas", 9F, FontStyle.Bold);
             _lblStatus.ForeColor = ThemeGreen;
             _lblStatus.BackColor = Color.Black;
@@ -1059,7 +653,7 @@ namespace KekModInstaller
             int bottomStripY = ClientSize.Height - BottomStrip;
             int openFolderHeight = 28;
             int openFolderY = bottomStripY - 8 - openFolderHeight;
-            int logTop = 280 + TopShift;
+            int logTop = 184 + TopShift + modShift;
             int logHeight = openFolderY - 8 - logTop;
 
             _txtLog = new RetroTextBox();
@@ -1103,7 +697,7 @@ namespace KekModInstaller
             _lblTicker.Font = new Font("Consolas", 8.5F, FontStyle.Bold);
             _lblTicker.ForeColor = ThemeGreen;
             _lblTicker.BackColor = Color.Black;
-            _lblTicker.Text = "*** GREETZ TO ALL KEK-MOD PLAYERS OUT THERE ***  FUCK ALL THE HATING ASSES, RESYNCS, QUITTERS, UNSTABALIZERS ***  -=[ DEMOCRACIV ]=- ***    ";
+            _lblTicker.Text = "*** GREETINGS FELLOW CIV ADDICTS ***  FUCK ALL THE HATING ASSES, RESYNCS, QUITTERS, UNSTABALIZERS ***  -=[ OBLAST ]=- ***    ";
             _lblTicker.Location = new Point(_tickerViewport.Width, 1);
             _tickerViewport.Controls.Add(_lblTicker);
 
@@ -1123,11 +717,10 @@ namespace KekModInstaller
             Controls.Add(_lblTitle);
             Controls.Add(_lblSubtitle);
             Controls.Add(_dividerLine);
-            Controls.Add(_lblInstalled);
-            Controls.Add(_lblLatest);
-            Controls.Add(pnlVersion);
-            Controls.Add(_btnInstall);
-            Controls.Add(_btnUninstall);
+            // GAME MODS/INTERFACE MODS (and everything nested inside them)
+            // were already added to Controls above -- each is a
+            // locally-scoped variable, unlike the controls below which stay
+            // in scope for this batch.
             Controls.Add(progressBorder);
             Controls.Add(_lblStatus);
             Controls.Add(_txtLog);
@@ -1136,8 +729,6 @@ namespace KekModInstaller
             Controls.Add(_btnMute);
             Controls.Add(_btnSettings);
             Controls.Add(_btnUpdate);
-
-            UpdateAutoVersionLabel();
 
             _worker = new BackgroundWorker();
             _worker.WorkerReportsProgress = true;
@@ -1151,10 +742,16 @@ namespace KekModInstaller
             _uninstallWorker.ProgressChanged += Worker_ProgressChanged;
             _uninstallWorker.RunWorkerCompleted += UninstallWorker_RunWorkerCompleted;
 
+            _euiWorker = new BackgroundWorker();
+            _euiWorker.WorkerReportsProgress = true;
+            _euiWorker.DoWork += EuiWorker_DoWork;
+            _euiWorker.ProgressChanged += Worker_ProgressChanged;
+            _euiWorker.RunWorkerCompleted += EuiWorker_RunWorkerCompleted;
+
             _statusWorker = new BackgroundWorker();
             _statusWorker.DoWork += StatusWorker_DoWork;
             _statusWorker.RunWorkerCompleted += StatusWorker_RunWorkerCompleted;
-            _statusWorker.RunWorkerAsync();
+            _statusWorker.RunWorkerAsync(); // fetches every mod's release list once -- see StatusWorker_DoWork
 
             _tickerTimer = new Timer();
             _tickerTimer.Interval = 30;
@@ -1176,6 +773,178 @@ namespace KekModInstaller
             }
         }
 
+        // Builds one mod's box (status indicator + name on the left,
+        // INSTALL/UNINSTALL/VERSION buttons on the right, plus an optional
+        // sub-item row underneath for its bonus component), and appends to
+        // _modRows. Returns the box unattached to any parent -- the caller
+        // (constructor) adds it wherever it belongs, nested inside the GAME
+        // MODS container. Each button acts on this specific mod directly --
+        // there's no separate "select a mod first" step.
+        private Panel BuildModBox(ModDefinition mod, int x, int y, int width)
+        {
+            bool hasExtra = mod.ExtraDisplayName != null;
+            int boxHeight = 18 + (hasExtra ? 2 : 1) * ModRowHeight + 6;
+
+            var box = MakeRetroBox(mod.DisplayName.ToUpperInvariant(), x, y, width, boxHeight,
+                () => _installedModIds.Contains(mod.Id) ? ThemeGreen : ThemeMagenta);
+
+            var row = new ModRowControls();
+            row.Box = box;
+
+            var indicator = new Label();
+            indicator.SetBounds(12, 16, 20, 22);
+            indicator.Font = new Font("Consolas", 11F, FontStyle.Bold);
+            indicator.TextAlign = ContentAlignment.MiddleCenter;
+            indicator.BackColor = Color.Black;
+            box.Controls.Add(indicator);
+            row.Indicator = indicator;
+
+            // Three small buttons, right-aligned: INSTALL, UNINSTALL, VERSION.
+            const int btnW = 68;
+            const int btnH = 22;
+            const int btnGap = 6;
+            int btnsX = width - 12 - (btnW * 3 + btnGap * 2);
+
+            var installBtn = new RetroButton();
+            installBtn.Text = "INSTALL";
+            installBtn.Font = new Font("Consolas", 7F, FontStyle.Bold);
+            installBtn.SetBounds(btnsX, 16, btnW, btnH);
+            installBtn.Click += (s, e) => OnModInstallClick(mod);
+            box.Controls.Add(installBtn);
+            row.InstallButton = installBtn;
+
+            var uninstallBtn = new RetroButton();
+            uninstallBtn.Text = "UNINSTALL";
+            uninstallBtn.Font = new Font("Consolas", 7F, FontStyle.Bold);
+            uninstallBtn.SetBounds(btnsX + (btnW + btnGap), 16, btnW, btnH);
+            uninstallBtn.Enabled = false; // enabled once install-state detection finds this mod on disk
+            uninstallBtn.Click += (s, e) => OnModUninstallClick(mod);
+            box.Controls.Add(uninstallBtn);
+            row.UninstallButton = uninstallBtn;
+
+            var versionBtn = new RetroButton();
+            versionBtn.Text = "VERSION";
+            versionBtn.Font = new Font("Consolas", 7F, FontStyle.Bold);
+            versionBtn.SetBounds(btnsX + (btnW + btnGap) * 2, 16, btnW, btnH);
+            versionBtn.Click += (s, e) => OnModVersionClick(mod);
+            box.Controls.Add(versionBtn);
+            row.VersionButton = versionBtn;
+
+            // Small badge shown only when IsUpdateAvailable finds a newer
+            // release than what's installed -- see UpdateModRowStyles.
+            const int updateIconW = 20;
+            int updateIconX = btnsX - 8 - updateIconW;
+
+            var updateIcon = new Label();
+            updateIcon.SetBounds(updateIconX, 16, updateIconW, 22);
+            updateIcon.Font = new Font("Consolas", 11F, FontStyle.Bold);
+            updateIcon.TextAlign = ContentAlignment.MiddleCenter;
+            updateIcon.ForeColor = ThemeRed;
+            updateIcon.BackColor = Color.Black;
+            box.Controls.Add(updateIcon);
+            row.UpdateIcon = updateIcon;
+
+            var nameLabel = new Label();
+            nameLabel.SetBounds(34, 18, updateIconX - 4 - 34, 20);
+            nameLabel.Text = mod.DisplayName;
+            nameLabel.Font = new Font("Consolas", 9F, FontStyle.Bold);
+            nameLabel.ForeColor = ThemeGreen;
+            nameLabel.BackColor = Color.Black;
+            box.Controls.Add(nameLabel);
+            row.NameLabel = nameLabel;
+
+            if (hasExtra)
+            {
+                // Same x-indentation as the main row above (not indented
+                // further) -- just a second line, not a nested tree.
+                var extraIndicator = new Label();
+                extraIndicator.SetBounds(12, 16 + ModRowHeight, 20, 22);
+                extraIndicator.Font = new Font("Consolas", 9F, FontStyle.Bold);
+                extraIndicator.TextAlign = ContentAlignment.MiddleCenter;
+                extraIndicator.BackColor = Color.Black;
+                box.Controls.Add(extraIndicator);
+                row.ExtraIndicator = extraIndicator;
+
+                var extraLabel = new Label();
+                extraLabel.SetBounds(34, 18 + ModRowHeight, width - 34 - 12, 20);
+                extraLabel.Text = mod.ExtraDisplayName;
+                extraLabel.Font = new Font("Consolas", 8.5F);
+                extraLabel.ForeColor = ThemeGreen;
+                extraLabel.BackColor = Color.Black;
+                box.Controls.Add(extraLabel);
+                row.ExtraNameLabel = extraLabel;
+            }
+
+            _modRows.Add(row);
+            return box;
+        }
+
+        // Same idea as BuildModBox, one EUI variant per box (status
+        // indicator + name, INSTALL/REMOVE buttons -- no VERSION button:
+        // this is a single bundled copy we ship ourselves, not something
+        // with published releases to choose between). Appends to _euiRows.
+        private Panel BuildEuiVariantBox(EuiVariant variant, int x, int y, int width)
+        {
+            int boxHeight = 18 + ModRowHeight + 6;
+            var box = MakeRetroBox(variant.DisplayName.ToUpperInvariant(), x, y, width, boxHeight,
+                () =>
+                {
+                    if (variant.Id != _installedEuiVariantId) { return ThemeMagenta; }
+                    return _installedEuiVersionMismatch ? ThemeRed : ThemeGreen;
+                });
+
+            var indicator = new Label();
+            indicator.SetBounds(12, 16, 20, 22);
+            indicator.Font = new Font("Consolas", 11F, FontStyle.Bold);
+            indicator.TextAlign = ContentAlignment.MiddleCenter;
+            indicator.BackColor = Color.Black;
+            box.Controls.Add(indicator);
+
+            const int btnW = 68;
+            const int btnH = 22;
+            const int btnGap = 6;
+            int btnsX = width - 12 - (btnW * 2 + btnGap);
+
+            var row = new EuiRowControls();
+            row.Box = box;
+            row.Indicator = indicator;
+
+            var installBtn = new RetroButton();
+            installBtn.Text = "INSTALL";
+            installBtn.Font = new Font("Consolas", 7F, FontStyle.Bold);
+            installBtn.SetBounds(btnsX, 16, btnW, btnH);
+            installBtn.Click += (s, e) => OnEuiInstallClick(variant);
+            box.Controls.Add(installBtn);
+            row.InstallButton = installBtn;
+
+            var removeBtn = new RetroButton();
+            removeBtn.Text = "REMOVE";
+            removeBtn.Font = new Font("Consolas", 7F, FontStyle.Bold);
+            removeBtn.SetBounds(btnsX + (btnW + btnGap), 16, btnW, btnH);
+            removeBtn.Enabled = false; // enabled once install-state detection finds this variant active
+            removeBtn.Click += (s, e) => OnEuiRemoveClick(variant);
+            box.Controls.Add(removeBtn);
+            row.RemoveButton = removeBtn;
+
+            var nameLabel = new Label();
+            nameLabel.SetBounds(34, 18, btnsX - 8 - 34, 20);
+            // Hand-set version (see EuiVariant.DisplayVersion), not tied to
+            // install state the way mods' version display is -- this
+            // describes what's bundled, so it shows regardless of whether
+            // this particular variant is currently installed. UpdateEuiRowStyles
+            // appends a mismatch warning to this base text when applicable.
+            nameLabel.Text = EuiBaseLabel(variant);
+            nameLabel.Font = new Font("Consolas", 9F, FontStyle.Bold);
+            nameLabel.ForeColor = ThemeGreen;
+            nameLabel.BackColor = Color.Black;
+            box.Controls.Add(nameLabel);
+            row.NameLabel = nameLabel;
+
+            _euiRows.Add(row);
+
+            return box;
+        }
+
         // Draws a magenta box with the title "cut into" the top border, e.g.
         // +--[ CHANNEL ]---------+   -- the classic scene-intro/keygen box
         // art look, hand-painted since GroupBox's native border ignores
@@ -1183,20 +952,32 @@ namespace KekModInstaller
         // instance state) so SettingsForm can reuse it too.
         internal static Panel MakeRetroBox(string title, int x, int y, int w, int h)
         {
+            return MakeRetroBox(title, x, y, w, h, null);
+        }
+
+        // Overload used by the per-mod boxes: borderColor is re-queried on
+        // every repaint (not just once at creation) so a box's border can
+        // change color live -- e.g. bright green while that mod is the
+        // active one -- just by calling Invalidate() on it, no need to
+        // recreate the box. Null keeps the plain always-magenta look above.
+        internal static Panel MakeRetroBox(string title, int x, int y, int w, int h, Func<Color> borderColor)
+        {
             var panel = new Panel();
             panel.SetBounds(x, y, w, h);
             panel.BackColor = Color.Black;
             var titleFont = new Font("Consolas", 8F, FontStyle.Bold);
+            Func<Color> colorFn = borderColor ?? (() => ThemeMagenta);
             panel.Paint += (s, e) =>
             {
-                using (var pen = new Pen(ThemeMagenta))
+                Color color = colorFn();
+                using (var pen = new Pen(color))
                 {
                     e.Graphics.DrawRectangle(pen, 0, 0, panel.Width - 1, panel.Height - 1);
                 }
                 string label = " " + title + " ";
                 SizeF sz = e.Graphics.MeasureString(label, titleFont);
                 e.Graphics.FillRectangle(Brushes.Black, 8, 0, sz.Width, sz.Height);
-                using (var brush = new SolidBrush(ThemeMagenta))
+                using (var brush = new SolidBrush(color))
                 {
                     e.Graphics.DrawString(label, titleFont, brush, 8, -1);
                 }
@@ -1342,42 +1123,113 @@ namespace KekModInstaller
             SettingsManager.SetMuted(_muted);
         }
 
-        // Beta builds are opt-in and hidden from the main UI until the
-        // player has gone into Settings and turned them on -- there's no
-        // separate CHANNEL selector any more, so the Settings checkbox is
-        // the single source of truth for "does this install want beta
-        // releases" (BtnInstall_Click reads it directly). The VERSION
-        // dropdown and [LATEST] line are filtered the same way in
-        // StatusWorker_DoWork/RunWorkerCompleted so a hidden beta tag can't
-        // leak through there either.
-        //
-        // Index 0's wording is the only thing here that depends on the
-        // setting -- reassigning by index (not Add/Remove) keeps
-        // SelectedIndex, and thus whatever the user already picked, intact.
-        private void UpdateAutoVersionLabel()
+        // Refreshes each mod box's indicator dot + name-text color (bright
+        // green if _installedModIds says that mod -- or its bonus component
+        // -- is on disk, pink/magenta otherwise), the box's own border color
+        // (same install-state signal), and each button's enabled state
+        // (UNINSTALL only makes sense once something's actually installed).
+        // Called after construction and after every status refresh.
+        private void UpdateModRowStyles()
         {
-            bool showBeta = SettingsManager.GetShowBeta();
-            _cmbVersion.Items[0] = showBeta
-                ? "Latest (auto -- newest, incl. beta)"
-                : "Latest (auto -- newest stable)";
+            const string filled = "●"; // ●
+            const string hollow = "○"; // ○
+
+            for (int i = 0; i < ModRegistry.All.Count; i++)
+            {
+                ModDefinition mod = ModRegistry.All[i];
+                ModRowControls row = _modRows[i];
+
+                bool installed = _installedModIds.Contains(mod.Id);
+                row.Indicator.Text = installed ? filled : hollow;
+                row.Indicator.ForeColor = installed ? ThemeGreen : ThemeDim;
+                row.NameLabel.ForeColor = installed ? ThemeGreen : ThemeMagenta;
+
+                string installedVersion;
+                row.NameLabel.Text = (installed && _installedVersionByModId.TryGetValue(mod.Id, out installedVersion))
+                    ? mod.DisplayName + " (" + installedVersion + ")"
+                    : mod.DisplayName;
+
+                bool updateAvailable = _updateAvailableModIds.Contains(mod.Id);
+                row.UpdateIcon.Text = updateAvailable ? "▲" : "";
+                row.UpdateIcon.Visible = updateAvailable;
+
+                if (!_actionInProgress)
+                {
+                    row.InstallButton.Enabled = true;
+                    row.UninstallButton.Enabled = installed;
+                    row.VersionButton.Enabled = true;
+                }
+
+                if (row.ExtraIndicator != null)
+                {
+                    bool extraInstalled = mod.ExtraModId != null && _installedModIds.Contains(mod.ExtraModId);
+                    row.ExtraIndicator.Text = extraInstalled ? filled : hollow;
+                    row.ExtraIndicator.ForeColor = extraInstalled ? ThemeGreen : ThemeDim;
+                    row.ExtraNameLabel.ForeColor = extraInstalled ? ThemeGreen : ThemeMagenta;
+
+                    string extraVersion;
+                    row.ExtraNameLabel.Text = (extraInstalled && mod.ExtraModId != null
+                        && _installedExtraVersionByModId.TryGetValue(mod.ExtraModId, out extraVersion))
+                        ? mod.ExtraDisplayName + " (" + extraVersion + ")"
+                        : mod.ExtraDisplayName;
+                }
+
+                row.Box.Invalidate(); // re-runs the box's borderColor delegate against the (possibly new) install state
+            }
+        }
+
+        // Same idea as UpdateModRowStyles for the EUI boxes: INSTALL is only
+        // enabled for the variant that ISN'T currently active, REMOVE only
+        // for the one that is.
+        private void UpdateEuiRowStyles()
+        {
+            for (int i = 0; i < EuiExtra.Variants.Count; i++)
+            {
+                EuiVariant variant = EuiExtra.Variants[i];
+                bool active = variant.Id == _installedEuiVariantId;
+                // Present but NOT byte-identical to what this build bundles
+                // (see EuiExtra.IsExactBundledMatch) -- e.g. the player
+                // manually installed a different EUI version. Every mod we
+                // ship is only tested against our exact bundled copy, so
+                // this gets its own warning treatment, not just "installed".
+                bool mismatch = active && _installedEuiVersionMismatch;
+
+                _euiRows[i].Indicator.Text = !active ? "○" : (mismatch ? "⚠" : "●");
+                _euiRows[i].Indicator.ForeColor = !active ? ThemeDim : (mismatch ? ThemeRed : ThemeGreen);
+                _euiRows[i].NameLabel.ForeColor = !active ? ThemeMagenta : (mismatch ? ThemeRed : ThemeGreen);
+                // Mismatch means the installed copy is NOT confirmed to be
+                // DisplayVersion -- showing that version number alongside
+                // "MISMATCH" would misleadingly imply we know what's on disk.
+                _euiRows[i].NameLabel.Text = mismatch
+                    ? variant.DisplayName + " -- VERSION MISMATCH"
+                    : EuiBaseLabel(variant);
+
+                if (!_actionInProgress)
+                {
+                    // A mismatched variant can still be "fixed" by
+                    // re-installing our bundled copy over it.
+                    _euiRows[i].InstallButton.Enabled = !active || mismatch;
+                    _euiRows[i].RemoveButton.Enabled = active;
+                }
+                _euiRows[i].Box.Invalidate(); // re-runs the box's borderColor delegate against the (possibly new) installed variant
+            }
+        }
+
+        private static string EuiBaseLabel(EuiVariant variant)
+        {
+            return variant.DisplayVersion != null
+                ? variant.DisplayName + " (" + variant.DisplayVersion + ")"
+                : variant.DisplayName;
         }
 
         private void BtnSettings_Click(object sender, EventArgs e)
         {
+            // Beta on/off is read live by each mod's own VERSION popup
+            // (OnModVersionClick) every time it's opened, so there's nothing
+            // to refresh here -- no shared dropdown left to keep in sync.
             using (var dlg = new SettingsForm())
             {
-                if (dlg.ShowDialog(this) == DialogResult.OK)
-                {
-                    UpdateAutoVersionLabel();
-                    // Re-run the startup check so the VERSION dropdown and
-                    // [LATEST] line immediately reflect the new setting
-                    // instead of waiting for the next launch.
-                    if (!_statusWorker.IsBusy && !_worker.IsBusy && !_uninstallWorker.IsBusy)
-                    {
-                        _lblLatest.Text = "[LATEST]    checking...";
-                        _statusWorker.RunWorkerAsync();
-                    }
-                }
+                dlg.ShowDialog(this);
             }
         }
 
@@ -1396,7 +1248,7 @@ namespace KekModInstaller
             DialogResult confirm = MessageBox.Show(
                 this,
                 "A new installer version (" + _latestInstallerVersion + ") is available. Download it now? "
-                    + "KEK-MOD Loader will close and restart automatically.",
+                    + "The installer will close and restart automatically.",
                 "Update available",
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Information);
@@ -1429,36 +1281,27 @@ namespace KekModInstaller
             RetroAudio.Stop();
         }
 
-        // Startup check: what's installed already, what's newest on GitHub.
-        // Both can fail independently (no Civ5 found; offline) -- neither
-        // should block the form, so failures just show as "couldn't check".
+        // Runs ONCE at startup: every mod's release list (the only
+        // GitHub-API-rate-limited part of this), plus the ticker and
+        // self-update check. Nothing else ever re-triggers this -- see
+        // RefreshLocalState for what runs instead when the player switches
+        // mods, toggles beta, or finishes an install/uninstall/EUI change.
         private void StatusWorker_DoWork(object sender, DoWorkEventArgs e)
         {
-            string installedText;
-            bool anyInstalled = false;
-            try
+            var releasesByModId = new Dictionary<string, List<ModRelease>>();
+            foreach (ModDefinition mod in ModRegistry.All)
             {
-                List<string> installed = InstallerCore.DetectInstalledVersions();
-                anyInstalled = installed.Count > 0;
-                installedText = installed.Count == 0
-                    ? "[INSTALLED] none detected"
-                    : "[INSTALLED] " + string.Join(", ", installed.ToArray());
-            }
-            catch (Exception ex)
-            {
-                installedText = "[INSTALLED] couldn't check (" + ex.Message + ")";
-            }
-
-            bool showBeta = SettingsManager.GetShowBeta();
-
-            string latestText;
-            try
-            {
-                latestText = "[LATEST]    " + InstallerCore.DescribeLatestAvailable(showBeta);
-            }
-            catch (Exception ex)
-            {
-                latestText = "[LATEST]    couldn't check (" + ex.Message + ")";
+                try
+                {
+                    releasesByModId[mod.Id] = mod.Source.ListReleases();
+                }
+                catch (Exception)
+                {
+                    // offline/rate-limited/etc -- that mod's VERSION dropdown
+                    // just stays on "Latest (auto)"; Install still works via
+                    // its own live fetch and reports its own error if this
+                    // was a real outage rather than a one-off hiccup.
+                }
             }
 
             // Best-effort refresh of the greetz ticker from GitHub; a null
@@ -1470,68 +1313,26 @@ namespace KekModInstaller
             // StatusWorker_RunWorkerCompleted leaves the UPDATE button hidden.
             string latestInstallerVersion = InstallerCore.TryFetchLatestInstallerVersion();
 
-            // Version list for the VERSION dropdown -- best-effort too: null
-            // leaves the dropdown with just its "Latest (auto)" entry.
-            // Prerelease tags are stripped out entirely when beta builds
-            // aren't enabled in Settings, so a hidden beta can't be picked
-            // by tag even though it's technically published.
-            List<GhRelease> releases = null;
-            try
-            {
-                releases = InstallerCore.ListAvailableReleases();
-                if (!showBeta)
-                {
-                    releases = releases.Where(r => !r.Prerelease).ToList();
-                }
-            }
-            catch (Exception)
-            {
-                // offline / rate-limited -- auto mode still works at install
-                // time (Run() does its own fetch and reports its own error).
-            }
-
-            e.Result = new object[] { installedText, latestText, anyInstalled, tickerText, releases, latestInstallerVersion };
+            e.Result = new object[] { releasesByModId, tickerText, latestInstallerVersion };
         }
 
         private void StatusWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
         {
             if (e.Error != null)
             {
-                return; // leave the "checking..." placeholders rather than alarm the user
+                return; // leave the "checking..." placeholder rather than alarm the user
             }
             var result = (object[])e.Result;
-            _lblInstalled.Text = (string)result[0];
-            _lblLatest.Text = (string)result[1];
-            _hasInstalledVersions = (bool)result[2];
-            string tickerText = (string)result[3];
+            _releasesByModId = (Dictionary<string, List<ModRelease>>)result[0];
 
-            // Fill the VERSION dropdown, preserving whatever the user already
-            // picked (by tag) if this ever re-runs.
-            var releases = (List<GhRelease>)result[4];
-            if (releases != null && releases.Count > 0)
-            {
-                string keepTag = _cmbVersion.SelectedIndex > 0
-                    ? _versionTags[_cmbVersion.SelectedIndex - 1] : null;
-                while (_cmbVersion.Items.Count > 1)
-                {
-                    _cmbVersion.Items.RemoveAt(1);
-                }
-                _versionTags.Clear();
-                foreach (GhRelease rel in releases)
-                {
-                    _versionTags.Add(rel.TagName);
-                    _cmbVersion.Items.Add(rel.TagName + (rel.Prerelease ? "  [beta]" : "  [stable]"));
-                }
-                int keepIdx = keepTag == null ? -1 : _versionTags.IndexOf(keepTag);
-                _cmbVersion.SelectedIndex = keepIdx >= 0 ? keepIdx + 1 : 0;
-            }
+            string tickerText = (string)result[1];
             if (tickerText != null)
             {
                 _lblTicker.Text = tickerText;
                 _lblTicker.Location = new Point(_tickerViewport.Width, 1); // restart the scroll cleanly
             }
 
-            string latestInstallerVersion = (string)result[5];
+            string latestInstallerVersion = (string)result[2];
 #if INTERNAL_BUILD
             // KekModInstaller.Internal.exe is gitignored (dev-machine only,
             // never published to GitHub) -- DownloadAndApplySelfUpdate would
@@ -1551,41 +1352,291 @@ namespace KekModInstaller
             }
 #endif
 
-            // Only touch the button if nothing else is currently running --
-            // don't re-enable it mid-install/uninstall.
-            if (!_worker.IsBusy && !_uninstallWorker.IsBusy)
+            RefreshLocalState();
+        }
+
+        // Refreshes everything that can be derived from already-cached data
+        // or a fast local disk scan: the per-mod-box/EUI-box indicators,
+        // text colors, border colors, update-available badges, and button
+        // enabled-states. Never touches the network -- called after
+        // finishing an install/uninstall/EUI change, none of which need a
+        // fresh GitHub fetch since installing/uninstalling doesn't change
+        // what releases exist upstream.
+        private void RefreshLocalState()
+        {
+            DetectInstalledState();
+            UpdateModRowStyles();
+            UpdateEuiRowStyles();
+        }
+
+        // Fast local disk scan (no network): populates _installedModIds,
+        // _installedVersionByModId, and _installedEuiVariantId, and returns
+        // the [INSTALLED] line text (or an error message) as a side effect
+        // of the same DetectAllInstalled() call. Callable before the mod/EUI
+        // boxes exist (the constructor's initial detection pass) since it
+        // doesn't touch them itself -- callers that need the boxes repainted
+        // call UpdateModRowStyles/UpdateEuiRowStyles afterward.
+        private void DetectInstalledState()
+        {
+            try
             {
-                _btnUninstall.Enabled = _hasInstalledVersions;
+                List<DetectedModInstall> detected = InstallerCore.DetectAllInstalled();
+
+                _installedModIds.Clear();
+                _installedVersionByModId.Clear();
+                _installedExtraVersionByModId.Clear();
+                _updateAvailableModIds.Clear();
+                foreach (DetectedModInstall d in detected)
+                {
+                    _installedModIds.Add(d.ModId);
+                    ModDefinition mod = ModRegistry.ById(d.ModId);
+                    if (mod != null && d.FolderNames.Count > 0)
+                    {
+                        string installedFolderName = d.FolderNames[0];
+                        _installedVersionByModId[d.ModId] = ExtractVersionSuffix(mod, installedFolderName);
+                        if (IsUpdateAvailable(mod, installedFolderName))
+                        {
+                            _updateAvailableModIds.Add(mod.Id);
+                        }
+                    }
+                    else if (d.VersionLabel != null)
+                    {
+                        // A bonus component (e.g. "fishmapscript",
+                        // "betterpangaea") rather than a real ModRegistry
+                        // entry -- ExtraModId on whichever mod owns it
+                        // matches d.ModId, see UpdateModRowStyles.
+                        _installedExtraVersionByModId[d.ModId] = d.VersionLabel;
+                    }
+                }
+
+                string dlcRoot = InstallerCore.TryGetDlcFolder();
+                _installedEuiVariantId = dlcRoot == null ? null : EuiExtra.DetectInstalledVariantId(dlcRoot);
+                _installedEuiVersionMismatch = false;
+                if (dlcRoot != null && _installedEuiVariantId != null)
+                {
+                    EuiVariant installedVariant = EuiExtra.Variants.First(v => v.Id == _installedEuiVariantId);
+                    _installedEuiVersionMismatch = !EuiExtra.IsExactBundledMatch(dlcRoot, installedVariant);
+                }
+            }
+            catch (Exception)
+            {
+                // best-effort -- next status refresh (or the next time
+                // something changes) tries again
             }
         }
 
-        private void BtnInstall_Click(object sender, EventArgs e)
+        // Whether mod's auto-install pick (respecting the current beta
+        // setting, same rule InstallerCore.Run would use) resolves to a
+        // different folder name than what's actually installed. Compares
+        // folder names directly rather than parsing/comparing version
+        // strings -- e.g. stripping "KEK Mod v" from "KEK Mod v1.4" loses
+        // the "v", so re-deriving a tag from that stripped text to compare
+        // against a release's raw tag ("v1.4") would be fragile. Requires
+        // _releasesByModId to already have that mod's release list cached
+        // (the one-time startup fetch) -- returns false if it doesn't, so
+        // this never claims an update is available it can't actually back up.
+        private bool IsUpdateAvailable(ModDefinition mod, string installedFolderName)
         {
-            _txtLog.Clear();
-            SetControlsEnabled(false);
-            _progress.Value = 0;
-            SetStatus("INSTALLING MOD FILES...");
+            List<ModRelease> releases;
+            if (!_releasesByModId.TryGetValue(mod.Id, out releases) || releases.Count == 0)
+            {
+                return false;
+            }
+
+            bool showBeta = SettingsManager.GetShowBeta();
+            ModRelease latest = (mod.Beta == BetaPolicy.OptIn && !showBeta)
+                ? releases.FirstOrDefault(r => !r.Prerelease)
+                : releases.FirstOrDefault();
+            if (latest == null)
+            {
+                return false;
+            }
+
+            string latestFolderName = mod.MakeFolderName(latest.Tag);
+            return !string.Equals(installedFolderName, latestFolderName, StringComparison.OrdinalIgnoreCase);
+        }
+
+        // Strips a mod's InstalledFolderGlob prefix (everything before the
+        // "*", e.g. "KEK Mod v" out of "KEK Mod v*") from an actual folder
+        // name to get just the version part -- "KEK Mod v1.4" -> "1.4",
+        // "Tournament Mod V12.2a" -> "12.2a". Falls back to the whole folder
+        // name if it doesn't start with the expected prefix (shouldn't
+        // happen since DetectAllInstalled found it via that same glob, but
+        // cheap insurance against ever showing an empty string).
+        private static string ExtractVersionSuffix(ModDefinition mod, string folderName)
+        {
+            string prefix = mod.InstalledFolderGlob.Substring(0, mod.InstalledFolderGlob.Length - 1);
+            if (folderName.Length > prefix.Length
+                && folderName.StartsWith(prefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return folderName.Substring(prefix.Length);
+            }
+            return folderName;
+        }
+
+        // Opens a small themed popup listing mod's releases (from the cache
+        // fetched once at startup -- no network here) and stores whichever
+        // tag the player picks for the next time they click that mod's own
+        // INSTALL button. Null/"Latest (auto)" clears the override.
+        private void OnModVersionClick(ModDefinition mod)
+        {
+            if (_actionInProgress)
+            {
+                return;
+            }
+
+            List<ModRelease> releases;
+            _releasesByModId.TryGetValue(mod.Id, out releases);
+            string currentTag;
+            _selectedVersionTagByModId.TryGetValue(mod.Id, out currentTag);
+
+            using (var dlg = new VersionPickerForm(mod, releases, SettingsManager.GetShowBeta(), currentTag))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK)
+                {
+                    return;
+                }
+                string tag = dlg.GetSelectedTag();
+                if (tag == null)
+                {
+                    _selectedVersionTagByModId.Remove(mod.Id);
+                }
+                else
+                {
+                    _selectedVersionTagByModId[mod.Id] = tag;
+                }
+                SetStatus(mod.DisplayName + " version set to " + (tag ?? "auto"));
+            }
+        }
+
+        // These mods are all total-conversion-style DLC packages (own DLL,
+        // own Override set) -- running two at once in Assets/DLC isn't a
+        // supported combination, so installing one while a DIFFERENT one is
+        // already on disk must uninstall the old one first rather than
+        // leaving both in place.
+        private void OnModInstallClick(ModDefinition mod)
+        {
+            if (_actionInProgress)
+            {
+                return;
+            }
 
             var options = new InstallOptions();
             options.WantBeta = SettingsManager.GetShowBeta();
-            options.TagName = _cmbVersion.SelectedIndex > 0
-                ? _versionTags[_cmbVersion.SelectedIndex - 1] : null;
+            string tag;
+            options.TagName = _selectedVersionTagByModId.TryGetValue(mod.Id, out tag) ? tag : null;
 #if INTERNAL_BUILD
             options.WantDev = SettingsManager.GetUseDev();
 #else
             options.WantDev = false;
 #endif
-            _worker.RunWorkerAsync(options);
+
+            List<ModDefinition> conflicting = ModRegistry.All
+                .Where(m => m.Id != mod.Id && _installedModIds.Contains(m.Id))
+                .ToList();
+
+            if (conflicting.Count > 0)
+            {
+                string names = string.Join(", ", conflicting.Select(m => m.DisplayName).ToArray());
+                DialogResult confirm = MessageBox.Show(
+                    this,
+                    "Installing " + mod.DisplayName + " will uninstall " + names
+                        + " first -- these mods can't run side by side in Civilization V. Continue?",
+                    "Install " + mod.DisplayName,
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning);
+                if (confirm != DialogResult.Yes)
+                {
+                    return;
+                }
+
+                _pendingInstallMod = mod;
+                _pendingInstallOptions = options;
+                _txtLog.Clear();
+                SetControlsEnabled(false);
+                _progress.Value = 0;
+                SetStatus("REMOVING " + names.ToUpperInvariant() + "...");
+                _uninstallWorker.RunWorkerAsync(conflicting);
+                return;
+            }
+
+            StartInstall(mod, options);
+        }
+
+        private void OnModUninstallClick(ModDefinition mod)
+        {
+            if (_actionInProgress)
+            {
+                return;
+            }
+
+            // Fish Map Script is only ever installed alongside kek-mod, so
+            // only kek-mod's confirm dialog mentions removing it too.
+            string mapScriptNote = mod.Id == ModRegistry.KekMod.Id ? " and the Fish Map Script" : "";
+            DialogResult confirm = MessageBox.Show(
+                this,
+                "Remove all installed " + mod.DisplayName + " versions" + mapScriptNote + " from your Civilization V install?",
+                "Uninstall " + mod.DisplayName,
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+            if (confirm != DialogResult.Yes)
+            {
+                return;
+            }
+
+            _txtLog.Clear();
+            SetControlsEnabled(false);
+            _progress.Value = 0;
+            SetStatus("REMOVING " + mod.DisplayName.ToUpperInvariant() + " FILES...");
+
+            _uninstallWorker.RunWorkerAsync(new List<ModDefinition> { mod });
+        }
+
+        private void OnEuiInstallClick(EuiVariant variant)
+        {
+            if (_actionInProgress)
+            {
+                return;
+            }
+            _txtLog.Clear();
+            SetControlsEnabled(false);
+            _progress.Value = 0;
+            SetStatus("INSTALLING " + variant.DisplayName.ToUpperInvariant() + "...");
+            _euiWorker.RunWorkerAsync(variant);
+        }
+
+        private void OnEuiRemoveClick(EuiVariant variant)
+        {
+            if (_actionInProgress)
+            {
+                return;
+            }
+            _txtLog.Clear();
+            SetControlsEnabled(false);
+            _progress.Value = 0;
+            SetStatus("REMOVING " + variant.DisplayName.ToUpperInvariant() + "...");
+            _euiWorker.RunWorkerAsync(null);
+        }
+
+        private void StartInstall(ModDefinition mod, InstallOptions options)
+        {
+            _txtLog.Clear();
+            SetControlsEnabled(false);
+            _progress.Value = 0;
+            SetStatus("INSTALLING " + mod.DisplayName.ToUpperInvariant() + "...");
+            _worker.RunWorkerAsync(new object[] { mod, options });
         }
 
         private void Worker_DoWork(object sender, DoWorkEventArgs e)
         {
-            var options = (InstallOptions)e.Argument;
+            var args = (object[])e.Argument;
+            var mod = (ModDefinition)args[0];
+            var options = (InstallOptions)args[1];
             var worker = (BackgroundWorker)sender;
             int lastPercent = 0;
             Action<string> log = msg => worker.ReportProgress(lastPercent, msg);
             Action<int> progress = pct => { lastPercent = pct; worker.ReportProgress(pct, null); };
-            e.Result = InstallerCore.Run(options, log, progress);
+            e.Result = InstallerCore.Run(mod, options, log, progress);
         }
 
         private void Worker_ProgressChanged(object sender, ProgressChangedEventArgs e)
@@ -1612,12 +1663,10 @@ namespace KekModInstaller
             SetStatus("[INSTALLED] " + result.FolderName);
 
             // Refresh the "Installed" line so it reflects what's actually on
-            // disk now, without needing a restart.
-            if (!_statusWorker.IsBusy)
-            {
-                _lblInstalled.Text = "[INSTALLED] checking...";
-                _statusWorker.RunWorkerAsync();
-            }
+            // disk now, without needing a restart. Local-only -- installing
+            // doesn't change what releases exist upstream, so no need to
+            // re-fetch the VERSION dropdown's data.
+            RefreshLocalState();
         }
 
         private void BtnOpenFolder_Click(object sender, EventArgs e)
@@ -1638,34 +1687,20 @@ namespace KekModInstaller
             }
         }
 
-        private void BtnUninstall_Click(object sender, EventArgs e)
-        {
-            DialogResult confirm = MessageBox.Show(
-                this,
-                "Remove all installed KEK Mod versions and the Fish Map Script from your Civilization V install?",
-                "Uninstall KEK Mod",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning);
-            if (confirm != DialogResult.Yes)
-            {
-                return;
-            }
-
-            _txtLog.Clear();
-            SetControlsEnabled(false);
-            _progress.Value = 0;
-            SetStatus("REMOVING KEK-MOD FILES...");
-
-            _uninstallWorker.RunWorkerAsync();
-        }
-
+        // Takes a list, not a single mod -- OnModInstallClick can hand this
+        // multiple mods to remove at once when installing over one that's
+        // currently installed.
         private void UninstallWorker_DoWork(object sender, DoWorkEventArgs e)
         {
+            var mods = (List<ModDefinition>)e.Argument;
             var worker = (BackgroundWorker)sender;
             int lastPercent = 0;
             Action<string> log = msg => worker.ReportProgress(lastPercent, msg);
             Action<int> progress = pct => { lastPercent = pct; worker.ReportProgress(pct, null); };
-            InstallerCore.Uninstall(log, progress);
+            foreach (ModDefinition mod in mods)
+            {
+                InstallerCore.Uninstall(mod, log, progress);
+            }
         }
 
         private void UninstallWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
@@ -1676,32 +1711,195 @@ namespace KekModInstaller
             {
                 SetStatus("FAILED: " + e.Error.Message);
                 _txtLog.AppendText(Environment.NewLine + "ERROR: " + e.Error.Message + Environment.NewLine);
+                _pendingInstallMod = null;
+                _pendingInstallOptions = null;
                 return;
             }
 
             SetStatus("UNINSTALLED.");
 
-            if (!_statusWorker.IsBusy)
+            // An install-triggered uninstall of a conflicting mod (see
+            // OnModInstallClick) needs to proceed straight into installing
+            // afterward, instead of just refreshing the status display.
+            if (_pendingInstallOptions != null)
             {
-                _lblInstalled.Text = "[INSTALLED] checking...";
-                _statusWorker.RunWorkerAsync();
+                ModDefinition mod = _pendingInstallMod;
+                InstallOptions options = _pendingInstallOptions;
+                _pendingInstallMod = null;
+                _pendingInstallOptions = null;
+                StartInstall(mod, options);
+                return;
+            }
+
+            RefreshLocalState(); // local-only, see Worker_RunWorkerCompleted
+        }
+
+        // Installs/removes the chosen EUI variant, then re-runs the active
+        // mod's own ui_check.bat (a no-op if that mod isn't installed) so
+        // its UI-file selection catches up with the new EUI state.
+        private void EuiWorker_DoWork(object sender, DoWorkEventArgs e)
+        {
+            var variant = (EuiVariant)e.Argument; // null means "remove whatever's there"
+            var worker = (BackgroundWorker)sender;
+            Action<string> log = msg => worker.ReportProgress(0, msg);
+
+            string dlcRoot = InstallerCore.TryGetDlcFolder();
+            if (dlcRoot == null)
+            {
+                throw new InvalidOperationException("Couldn't locate the Civilization V DLC folder.");
+            }
+
+            if (variant == null)
+            {
+                EuiExtra.Remove(dlcRoot, log);
+            }
+            else
+            {
+                EuiExtra.Install(dlcRoot, variant, log);
+            }
+
+            // EUI is shared across Assets/DLC, not tied to one specific mod
+            // -- re-run every mod's own ui_check.bat so whichever one(s) are
+            // actually installed pick up the new UI files (each line below
+            // is prefixed with that mod's name -- see RunUiCheck).
+            // RerunUiCheck is already a no-op for a mod that isn't installed.
+            foreach (ModDefinition mod in ModRegistry.All)
+            {
+                InstallerCore.RerunUiCheck(mod, log);
             }
         }
 
+        private void EuiWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
+        {
+            SetControlsEnabled(true);
+
+            if (e.Error != null)
+            {
+                SetStatus("FAILED: " + e.Error.Message);
+                _txtLog.AppendText(Environment.NewLine + "ERROR: " + e.Error.Message + Environment.NewLine);
+                return;
+            }
+
+            SetStatus("DONE.");
+            RefreshLocalState(); // local-only, see Worker_RunWorkerCompleted
+        }
+
+        // Locks (or restores) every per-box button while an
+        // install/uninstall/EUI-change worker is running. Restoring defers
+        // to UpdateModRowStyles/UpdateEuiRowStyles rather than a flat
+        // "enabled = true", since which buttons make sense (e.g. UNINSTALL
+        // only once something's installed) depends on current state.
         private void SetControlsEnabled(bool enabled)
         {
-            _cmbVersion.Enabled = enabled;
-            _btnInstall.Enabled = enabled;
-            _btnUninstall.Enabled = enabled && _hasInstalledVersions;
+            _actionInProgress = !enabled;
+            if (enabled)
+            {
+                UpdateModRowStyles();
+                UpdateEuiRowStyles();
+            }
+            else
+            {
+                foreach (ModRowControls row in _modRows)
+                {
+                    row.InstallButton.Enabled = false;
+                    row.UninstallButton.Enabled = false;
+                    row.VersionButton.Enabled = false;
+                }
+                foreach (EuiRowControls row in _euiRows)
+                {
+                    row.InstallButton.Enabled = false;
+                    row.RemoveButton.Enabled = false;
+                }
+            }
+        }
+    }
+
+    // Small modal dialog reached via a mod box's own VERSION button --
+    // reuses MainForm's retro chrome (MakeRetroBox/RetroButton) so it reads
+    // as part of the same theme rather than a bolted-on stock WinForms
+    // dialog, the same way SettingsForm does. Lists that one mod's releases
+    // (from the cache MainForm fetched once at startup -- no network here)
+    // filtered by the current beta setting; picking one just records the
+    // tag for the next time that mod's own INSTALL button is clicked.
+    internal class VersionPickerForm : Form
+    {
+        private ComboBox _cmbVersion;
+        private readonly List<string> _tags = new List<string>();
+
+        public VersionPickerForm(ModDefinition mod, List<ModRelease> releases, bool showBeta, string currentTag)
+        {
+            Text = "CIV V MOD INSTALLER";
+            ClientSize = new Size(320, 110);
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            BackColor = Color.Black;
+
+            Panel pnl = MainForm.MakeRetroBox(mod.DisplayName.ToUpperInvariant() + " VERSION", 12, 12, 296, 50);
+
+            _cmbVersion = new ComboBox();
+            _cmbVersion.SetBounds(12, 18, 272, 22);
+            _cmbVersion.DropDownStyle = ComboBoxStyle.DropDownList;
+            _cmbVersion.FlatStyle = FlatStyle.Flat;
+            _cmbVersion.BackColor = Color.Black;
+            _cmbVersion.ForeColor = MainForm.ThemeGreen;
+            _cmbVersion.Font = new Font("Consolas", 9F, FontStyle.Bold);
+            _cmbVersion.Items.Add((mod.Beta == BetaPolicy.OptIn && showBeta)
+                ? "Latest (auto -- newest, incl. beta)"
+                : "Latest (auto)");
+
+            if (releases != null)
+            {
+                // Prerelease tags are stripped out entirely when beta builds
+                // aren't enabled in Settings, so a hidden beta can't be
+                // picked by tag even though it's technically published.
+                IEnumerable<ModRelease> shown = showBeta ? releases : releases.Where(r => !r.Prerelease);
+                foreach (ModRelease rel in shown)
+                {
+                    _tags.Add(rel.Tag);
+                    string suffix = mod.Beta == BetaPolicy.OptIn ? (rel.Prerelease ? "  [beta]" : "  [stable]") : "";
+                    if (!string.IsNullOrEmpty(rel.DisplayExtra))
+                    {
+                        suffix = "  - " + rel.DisplayExtra + suffix;
+                    }
+                    _cmbVersion.Items.Add(rel.Tag + suffix);
+                }
+            }
+            int currentIdx = currentTag == null ? -1 : _tags.IndexOf(currentTag);
+            _cmbVersion.SelectedIndex = currentIdx >= 0 ? currentIdx + 1 : 0;
+            pnl.Controls.Add(_cmbVersion);
+
+            var btnOk = new MainForm.RetroButton();
+            btnOk.Text = "OK";
+            btnOk.SetBounds(126, 72, 90, 26);
+            btnOk.Click += (s, e) => { DialogResult = DialogResult.OK; Close(); };
+
+            var btnCancel = new MainForm.RetroButton();
+            btnCancel.Text = "CANCEL";
+            btnCancel.SetBounds(220, 72, 88, 26);
+            btnCancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
+
+            Controls.Add(pnl);
+            Controls.Add(btnOk);
+            Controls.Add(btnCancel);
+            AcceptButton = btnOk;
+        }
+
+        // Null means "Latest (auto)".
+        public string GetSelectedTag()
+        {
+            int i = _cmbVersion.SelectedIndex;
+            return i > 0 ? _tags[i - 1] : null;
         }
     }
 
     // Small modal dialog reached only via MainForm's gear button. "Enable
-    // beta builds" is the sole way to surface beta tags in the VERSION
-    // dropdown and have Install/[LATEST] consider them (see
-    // MainForm.UpdateAutoVersionLabel and BtnInstall_Click). INTERNAL_BUILD
-    // adds a second, Prod/Dev, section below it -- moved here from a BUILD
-    // box that used to sit on the main form, so the two builds' main
+    // beta builds" is the sole way to surface beta tags in each mod's own
+    // VERSION popup (see VersionPickerForm) and have Install consider them
+    // (see OnModInstallClick). INTERNAL_BUILD adds a second, Prod/Dev,
+    // section below it -- moved here from a BUILD box that used to sit on
+    // the main form, so the two builds' main
     // windows now look identical and only this dialog differs between them.
     internal class SettingsForm : Form
     {
@@ -1713,7 +1911,7 @@ namespace KekModInstaller
 
         public SettingsForm()
         {
-            Text = "KEK-MOD // SETTINGS";
+            Text = "CIV V MOD INSTALLER // SETTINGS";
 #if INTERNAL_BUILD
             ClientSize = new Size(320, 230);
 #else
@@ -1761,7 +1959,7 @@ namespace KekModInstaller
 #else
             lblHint.SetBounds(12, 80, 296, 32);
 #endif
-            lblHint.Text = "Shows beta tags in VERSION and includes\r\nthem in Install/[LATEST]. Off by default.";
+            lblHint.Text = "Shows beta tags in VERSION and includes\r\nthem in auto-install. Off by default.";
             lblHint.Font = new Font("Consolas", 7.5F);
             lblHint.ForeColor = MainForm.ThemeMagenta;
             lblHint.BackColor = Color.Black;
@@ -1818,6 +2016,20 @@ namespace KekModInstaller
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
+
+            while (InstallerCore.IsCiv5Running())
+            {
+                DialogResult result = MessageBox.Show(
+                    "Civilization V is currently running.\n\nPlease close the game before installing or uninstalling mods, then click Retry.",
+                    "Civilization V is running",
+                    MessageBoxButtons.RetryCancel,
+                    MessageBoxIcon.Warning);
+                if (result == DialogResult.Cancel)
+                {
+                    return;
+                }
+            }
+
             Application.Run(new MainForm());
         }
     }

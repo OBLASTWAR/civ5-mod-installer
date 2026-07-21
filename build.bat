@@ -30,22 +30,33 @@ if not exist "%CSC%" (
 
 echo Using csc: %CSC%
 
-set REFS=/r:System.dll /r:System.Core.dll /r:System.Net.Http.dll /r:System.Runtime.Serialization.dll /r:System.IO.Compression.FileSystem.dll /r:Microsoft.CSharp.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll
+set REFS=/r:System.dll /r:System.Core.dll /r:System.Net.Http.dll /r:System.Runtime.Serialization.dll /r:System.IO.Compression.dll /r:System.IO.Compression.FileSystem.dll /r:Microsoft.CSharp.dll /r:System.Windows.Forms.dll /r:System.Drawing.dll
 
-:: beat.mp3 is gitignored (large binary asset) -- embed it if this machine
-:: has a copy, otherwise build without it. RetroAudio.PlayEmbeddedLooped
-:: handles a missing resource gracefully (no music, no error), so a
-:: from-scratch clone still builds and runs fine.
+:: beat.mp3 and the two EUI zips (UI_bc1.zip, UI_bc1_xits.zip) are all
+:: gitignored (large binary assets) -- embed whichever this machine actually
+:: has, build without whatever's missing. Each is handled gracefully at
+:: runtime when absent (RetroAudio.PlayEmbeddedLooped / EuiExtra.Install),
+:: so a from-scratch clone still builds and runs fine either way.
 set RESOURCE=
 if exist "%~dp0beat.mp3" (
-    set RESOURCE=/resource:"%~dp0beat.mp3",KekModInstaller.beat.mp3
+    set RESOURCE=%RESOURCE% /resource:"%~dp0beat.mp3",KekModInstaller.beat.mp3
 ) else (
     echo WARNING: beat.mp3 not found next to build.bat -- building without embedded music.
+)
+if exist "%~dp0UI_bc1.zip" (
+    set RESOURCE=%RESOURCE% /resource:"%~dp0UI_bc1.zip",KekModInstaller.UI_bc1.zip
+) else (
+    echo WARNING: UI_bc1.zip not found next to build.bat -- building without bundled EUI.
+)
+if exist "%~dp0UI_bc1_xits.zip" (
+    set RESOURCE=%RESOURCE% /resource:"%~dp0UI_bc1_xits.zip",KekModInstaller.UI_bc1_xits.zip
+) else (
+    echo WARNING: UI_bc1_xits.zip not found next to build.bat -- building without bundled EUI XITS.
 )
 
 echo.
 echo === Building public (stable/beta channel, no dev build option) ===
-"%CSC%" /nologo /target:winexe /platform:x64 /out:"%~dp0KekModInstaller.exe" %REFS% %RESOURCE% "%~dp0Installer.cs"
+"%CSC%" /nologo /target:winexe /platform:x64 /out:"%~dp0KekModInstaller.exe" %REFS% %RESOURCE% "%~dp0*.cs"
 if %ERRORLEVEL% neq 0 (
     echo.
     echo BUILD FAILED ^(public, exit code %ERRORLEVEL%^)
@@ -54,7 +65,7 @@ if %ERRORLEVEL% neq 0 (
 
 echo.
 echo === Building internal (beta/dev channel options) ===
-"%CSC%" /nologo /target:winexe /platform:x64 /define:INTERNAL_BUILD /out:"%~dp0KekModInstaller.Internal.exe" %REFS% %RESOURCE% "%~dp0Installer.cs"
+"%CSC%" /nologo /target:winexe /platform:x64 /define:INTERNAL_BUILD /out:"%~dp0KekModInstaller.Internal.exe" %REFS% %RESOURCE% "%~dp0*.cs"
 if %ERRORLEVEL% neq 0 (
     echo.
     echo BUILD FAILED ^(internal, exit code %ERRORLEVEL%^)
