@@ -428,6 +428,7 @@ namespace KekModInstaller
         private BackgroundWorker _uninstallWorker;
         private Timer _tickerTimer;
         private Timer _cursorTimer;
+        private ToolTip _tooltip;
         private bool _muted;
         private string _statusBase = "SYSTEM READY";
         private bool _cursorOn;
@@ -473,6 +474,8 @@ namespace KekModInstaller
             FormBorderStyle = FormBorderStyle.FixedSingle;
             MaximizeBox = false;
             BackColor = Color.Black;
+
+            _tooltip = new ToolTip();
 
             // Civ5's own cursors, if we can find them -- a nice bit of
             // nostalgia. Pointer.ani cascades from the form down to every
@@ -863,15 +866,16 @@ namespace KekModInstaller
 
             // Small badge shown only when IsUpdateAvailable finds a newer
             // release than what's installed -- see UpdateModRowStyles.
-            const int updateIconW = 20;
+            const int updateIconW = 26;
             int updateIconX = btnsX - 8 - updateIconW;
 
             var updateIcon = new Label();
-            updateIcon.SetBounds(updateIconX, 16, updateIconW, 22);
-            updateIcon.Font = new Font("Consolas", 11F, FontStyle.Bold);
+            updateIcon.SetBounds(updateIconX, 13, updateIconW, 26);
+            updateIcon.Font = new Font("Consolas", 15F, FontStyle.Bold);
             updateIcon.TextAlign = ContentAlignment.MiddleCenter;
             updateIcon.ForeColor = ThemeRed;
             updateIcon.BackColor = Color.Black;
+            _tooltip.SetToolTip(updateIcon, "New version available");
             box.Controls.Add(updateIcon);
             row.UpdateIcon = updateIcon;
 
@@ -1638,6 +1642,65 @@ namespace KekModInstaller
                 MessageBoxIcon.Warning);
         }
 
+        // Backs the VERIFY MODS button (BtnScanExtras_Click) -- runs every
+        // check this installer already knows how to make, most of which
+        // otherwise only ever surface as a launch-time popup (see
+        // WarnIfCiv5RunningAtLaunch/WarnIfConflictingModsInstalled/
+        // WarnIfTournamentModXitsConflict/WarnIfMissingMapForInstalledMods
+        // above) or a small badge/border color (EUI version mismatch, the
+        // update-available triangle). Assumes RefreshLocalState() was just
+        // called, same as those callers assume.
+        private List<CheckResult> RunAllChecks()
+        {
+            var results = new List<CheckResult>();
+
+            bool civRunning = InstallerCore.IsCiv5Running();
+            results.Add(new CheckResult(!civRunning,
+                civRunning ? "Civilization V is currently running." : "Civilization V is not running."));
+
+            List<ModDefinition> installedMods = ModRegistry.All.Where(m => _installedModIds.Contains(m.Id)).ToList();
+            results.Add(installedMods.Count >= 2
+                ? new CheckResult(false, string.Join(" and ", installedMods.Select(m => m.DisplayName).ToArray())
+                    + " are both installed -- they can't run together.")
+                : new CheckResult(true, "No conflicting mods installed."));
+
+            bool xitsConflict = _installedEuiVariantId == "eui_xits" && _installedModIds.Contains(ModRegistry.TournamentMod.Id);
+            results.Add(new CheckResult(!xitsConflict, xitsConflict
+                ? "Tournament Mod and EUI XITS are installed together -- not compatible."
+                : "No Tournament Mod / EUI XITS conflict."));
+
+            List<string> missingMaps = ModRegistry.All
+                .Where(m => m.ExtraModId != null && _installedModIds.Contains(m.Id) && !_installedModIds.Contains(m.ExtraModId))
+                .Select(m => m.DisplayName + " is missing its " + m.ExtraDisplayName)
+                .ToList();
+            results.Add(missingMaps.Count > 0
+                ? new CheckResult(false, string.Join("; ", missingMaps) + ".")
+                : new CheckResult(true, "No missing bonus maps."));
+
+            if (_installedEuiVariantId == null)
+            {
+                results.Add(new CheckResult(true, "No EUI variant installed."));
+            }
+            else
+            {
+                EuiVariant installedVariant = EuiExtra.Variants.First(v => v.Id == _installedEuiVariantId);
+                string label = EuiBaseLabel(installedVariant);
+                results.Add(new CheckResult(!_installedEuiVersionMismatch, _installedEuiVersionMismatch
+                    ? label + " doesn't exactly match this installer's bundled copy."
+                    : label + " matches this installer's bundled copy exactly."));
+            }
+
+            List<string> updates = ModRegistry.All
+                .Where(m => _updateAvailableModIds.Contains(m.Id))
+                .Select(m => m.DisplayName)
+                .ToList();
+            results.Add(updates.Count > 0
+                ? new CheckResult(false, "Update available for: " + string.Join(", ", updates.ToArray()) + ".")
+                : new CheckResult(true, "All installed mods are up to date."));
+
+            return results;
+        }
+
         // Whether mod's auto-install pick (respecting the current beta
         // setting, same rule InstallerCore.Run would use) resolves to a
         // different folder name than what's actually installed. Compares
@@ -1719,6 +1782,12 @@ namespace KekModInstaller
                     _selectedVersionTagByModId[mod.Id] = tag;
                 }
                 SetStatus(mod.DisplayName + " version set to " + (tag ?? "auto"));
+
+                // Picking a version is the install action itself -- no
+                // separate INSTALL/REINSTALL click needed afterward. Reuses
+                // OnModInstallClick as-is, which already reads the tag just
+                // stored above via _selectedVersionTagByModId.
+                OnModInstallClick(mod);
             }
         }
 
@@ -1911,9 +1980,12 @@ namespace KekModInstaller
         private void BtnScanExtras_Click(object sender, EventArgs e)
         {
             Cursor = Cursors.WaitCursor;
+            List<CheckResult> checks;
             List<ExtraFolderInfo> found;
             try
             {
+                RefreshLocalState(); // local-only -- make sure checks run against current disk state
+                checks = RunAllChecks();
                 found = ExtraModScan.Scan();
             }
             finally
@@ -1921,18 +1993,7 @@ namespace KekModInstaller
                 Cursor = Cursors.Default;
             }
 
-            if (found.Count == 0)
-            {
-                MessageBox.Show(
-                    this,
-                    "No unrecognized folders found in Assets/DLC or Assets/Maps.",
-                    "Verify mods",
-                    MessageBoxButtons.OK,
-                    MessageBoxIcon.Information);
-                return;
-            }
-
-            using (var dlg = new ExtraModsForm(found))
+            using (var dlg = new ExtraModsForm(checks, found))
             {
                 dlg.ShowDialog(this);
             }
@@ -2375,7 +2436,20 @@ namespace KekModInstaller
         }
     }
 
-    // Reached via MainForm's "VERIFY MODS" button. Lists whatever
+    // One line of MainForm.RunAllChecks' output -- a plain-language result
+    // plus whether it's a pass, so ExtraModsForm can color and count them
+    // without re-deriving anything.
+    internal struct CheckResult
+    {
+        public readonly bool Ok;
+        public readonly string Message;
+        public CheckResult(bool ok, string message) { Ok = ok; Message = message; }
+    }
+
+    // Reached via MainForm's "VERIFY MODS" button. Two sections: every check
+    // this installer knows how to run (see MainForm.RunAllChecks -- Civ5
+    // running, conflicting mods, Tournament Mod/EUI XITS, missing bonus
+    // maps, EUI version match, update available), then whatever
     // ExtraModScan.Scan() found -- unrecognized folders under Assets/DLC and
     // Assets/Maps -- one row each with its own ARCHIVE/DELETE buttons on the
     // right, same layout pattern as MainForm's mod/EUI boxes: each button
@@ -2389,18 +2463,35 @@ namespace KekModInstaller
         private readonly Panel _listPanel;
         private readonly Label _lblEmpty;
 
-        public ExtraModsForm(List<ExtraFolderInfo> items)
+        public ExtraModsForm(List<CheckResult> checks, List<ExtraFolderInfo> items)
         {
-            Text = "CIV V MOD INSTALLER // EXTRA MODS FOUND";
-            ClientSize = new Size(520, 448);
+            Text = "CIV V MOD INSTALLER // VERIFY MODS";
+            ClientSize = new Size(520, 546);
             StartPosition = FormStartPosition.CenterParent;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             BackColor = Color.Black;
 
+            bool allChecksOk = checks.All(c => c.Ok);
+            Panel checksBox = MainForm.MakeRetroBox("CHECKS", 12, 10, 496, 150,
+                () => allChecksOk ? MainForm.ThemeGreen : MainForm.ThemeRed);
+            int checkY = 18;
+            foreach (CheckResult c in checks)
+            {
+                var lbl = new Label();
+                lbl.SetBounds(12, checkY, 472, 18);
+                lbl.Text = (c.Ok ? "[OK]   " : "[!!]   ") + c.Message;
+                lbl.Font = new Font("Consolas", 7.5F, FontStyle.Bold);
+                lbl.ForeColor = c.Ok ? MainForm.ThemeGreen : MainForm.ThemeRed;
+                lbl.BackColor = Color.Black;
+                lbl.AutoEllipsis = true;
+                checksBox.Controls.Add(lbl);
+                checkY += 20;
+            }
+
             var lblHint = new Label();
-            lblHint.SetBounds(12, 10, 496, 60); // 4 lines at 7.5F Consolas -- ~15px/line
+            lblHint.SetBounds(12, 170, 496, 60); // 4 lines at 7.5F Consolas -- ~15px/line
             lblHint.Text = "Folders in Assets/DLC and Assets/Maps this installer doesn't recognize:\r\n"
                 + "Leave a row alone to KEEP it.\r\n"
                 + "ARCHIVE -- zips the folder in place, then deletes the original.\r\n"
@@ -2410,7 +2501,7 @@ namespace KekModInstaller
             lblHint.BackColor = Color.Black;
 
             _listPanel = new Panel();
-            _listPanel.SetBounds(12, 76, 496, 316);
+            _listPanel.SetBounds(12, 236, 496, 250);
             _listPanel.AutoScroll = true;
             _listPanel.BackColor = Color.Black;
             _listPanel.BorderStyle = BorderStyle.FixedSingle;
@@ -2432,9 +2523,10 @@ namespace KekModInstaller
 
             var btnClose = new MainForm.RetroButton();
             btnClose.Text = "CLOSE";
-            btnClose.SetBounds(420, 404, 88, 28);
+            btnClose.SetBounds(420, 502, 88, 28);
             btnClose.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
 
+            Controls.Add(checksBox);
             Controls.Add(lblHint);
             Controls.Add(_listPanel);
             Controls.Add(btnClose);
