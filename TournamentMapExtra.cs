@@ -27,6 +27,14 @@ namespace KekModInstaller
 
         [DataMember(Name = "download_url")]
         public string DownloadUrl { get; set; }
+
+        // "file" or "dir" -- only used by LekmapExtra, which (unlike
+        // TournamentMapExtra) pulls every entry in the directory rather than
+        // picking one, so it needs to skip a subdirectory if one ever shows
+        // up. Optional: DataContractJsonSerializer leaves this null for any
+        // payload that omits it, which is fine everywhere else that ignores it.
+        [DataMember(Name = "type")]
+        public string Type { get; set; }
     }
 
     internal static class TournamentMapExtra

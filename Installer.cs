@@ -429,6 +429,8 @@ namespace KekModInstaller
         // still works via its own live fetch at install time regardless.
         private Dictionary<string, List<ModRelease>> _releasesByModId = new Dictionary<string, List<ModRelease>>();
         private RetroButton _btnOpenFolder;
+        private RetroButton _btnScanExtras;
+        private RetroButton _btnLaunchCiv;
         private RetroButton _btnMute;
         private RetroButton _btnSettings;
         private RetroButton _btnUpdate;
@@ -565,6 +567,14 @@ namespace KekModInstaller
             // dots and per-box button states painted below reflect real state
             // immediately instead of starting blank.
             DetectInstalledState();
+            // After the window itself is visible, not blocking startup.
+            Shown += (s, e) =>
+            {
+                WarnIfCiv5RunningAtLaunch();
+                WarnIfConflictingModsInstalled();
+                WarnIfMissingMapForInstalledMods();
+                WarnIfTournamentModXitsConflict();
+            };
 
             const int outerPadTop = 18;    // room for the outer box's own title cutout
             const int outerPadSide = 8;
@@ -683,6 +693,23 @@ namespace KekModInstaller
             _btnOpenFolder.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             _btnOpenFolder.Click += BtnOpenFolder_Click;
 
+            // Scans Assets/DLC and Assets/Maps for folders this installer
+            // doesn't recognize (see ExtraModScan) -- players who've picked
+            // up a pile of half-remembered manually-installed mods over the
+            // years can review and Keep/Archive/Delete each one.
+            _btnScanExtras = new RetroButton();
+            _btnScanExtras.Text = "VERIFY MODS";
+            _btnScanExtras.SetBounds(190, openFolderY, 170, openFolderHeight);
+            _btnScanExtras.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+            _btnScanExtras.Click += BtnScanExtras_Click;
+
+            _btnLaunchCiv = new RetroButton();
+            _btnLaunchCiv.Text = "LAUNCH CIV";
+            _btnLaunchCiv.SetBounds(368, openFolderY, 176, openFolderHeight);
+            _btnLaunchCiv.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+            _btnLaunchCiv.Click += BtnLaunchCiv_Click;
+            UpdateLaunchCivButton();
+
             _tickerViewport = new Panel();
             _tickerViewport.SetBounds(12, bottomStripY, 498, 20);
             _tickerViewport.BackColor = Color.Black;
@@ -725,6 +752,8 @@ namespace KekModInstaller
             Controls.Add(_lblStatus);
             Controls.Add(_txtLog);
             Controls.Add(_btnOpenFolder);
+            Controls.Add(_btnScanExtras);
+            Controls.Add(_btnLaunchCiv);
             Controls.Add(_tickerViewport);
             Controls.Add(_btnMute);
             Controls.Add(_btnSettings);
@@ -859,7 +888,7 @@ namespace KekModInstaller
                 // further) -- just a second line, not a nested tree.
                 var extraIndicator = new Label();
                 extraIndicator.SetBounds(12, 16 + ModRowHeight, 20, 22);
-                extraIndicator.Font = new Font("Consolas", 9F, FontStyle.Bold);
+                extraIndicator.Font = new Font("Consolas", 11F, FontStyle.Bold); // matches the main row's indicator (see BuildModBox/BuildEuiVariantBox) so both dots render the same size
                 extraIndicator.TextAlign = ContentAlignment.MiddleCenter;
                 extraIndicator.BackColor = Color.Black;
                 box.Controls.Add(extraIndicator);
@@ -1103,6 +1132,7 @@ namespace KekModInstaller
         {
             _cursorOn = !_cursorOn;
             _lblStatus.Text = "> " + _statusBase + (_cursorOn ? "_" : " ");
+            UpdateLaunchCivButton();
         }
 
         private void TickerTimer_Tick(object sender, EventArgs e)
@@ -1153,6 +1183,12 @@ namespace KekModInstaller
                 row.UpdateIcon.Text = updateAvailable ? "▲" : "";
                 row.UpdateIcon.Visible = updateAvailable;
 
+                // Relabeled rather than disabled once installed -- INSTALL
+                // stays a valid action against an already-installed mod (it's
+                // how a corrupted/incomplete install gets fixed, or how a
+                // different VERSION pick gets applied), just worded for what
+                // it'll actually do at that point.
+                row.InstallButton.Text = installed ? "REINSTALL" : "INSTALL";
                 if (!_actionInProgress)
                 {
                     row.InstallButton.Enabled = true;
@@ -1204,11 +1240,15 @@ namespace KekModInstaller
                     ? variant.DisplayName + " -- VERSION MISMATCH"
                     : EuiBaseLabel(variant);
 
+                // Relabeled rather than disabled once active -- re-running
+                // Install over an already-installed variant is always a
+                // valid (idempotent) action: it's how a mismatched copy gets
+                // fixed, and even a confirmed exact match can be force-
+                // reinstalled if a player suspects local corruption.
+                _euiRows[i].InstallButton.Text = active ? "REINSTALL" : "INSTALL";
                 if (!_actionInProgress)
                 {
-                    // A mismatched variant can still be "fixed" by
-                    // re-installing our bundled copy over it.
-                    _euiRows[i].InstallButton.Enabled = !active || mismatch;
+                    _euiRows[i].InstallButton.Enabled = true;
                     _euiRows[i].RemoveButton.Enabled = active;
                 }
                 _euiRows[i].Box.Invalidate(); // re-runs the box's borderColor delegate against the (possibly new) installed variant
@@ -1425,6 +1465,133 @@ namespace KekModInstaller
             }
         }
 
+        // Was previously a Program.Main gate before MainForm even existed --
+        // moved here so the window itself is visible first instead of the
+        // warning being the first thing a player sees. Cancel still closes
+        // the installer entirely (there's nothing useful to do here with
+        // Civ5 open), just after the window had a chance to appear.
+        private void WarnIfCiv5RunningAtLaunch()
+        {
+            while (InstallerCore.IsCiv5Running())
+            {
+                DialogResult result = MessageBox.Show(
+                    this,
+                    "Civilization V is currently running.\n\nPlease close the game before installing or uninstalling mods, then click Retry.",
+                    "Civilization V is running",
+                    MessageBoxButtons.RetryCancel,
+                    MessageBoxIcon.Warning);
+                if (result == DialogResult.Cancel)
+                {
+                    Close();
+                    return;
+                }
+            }
+        }
+
+        // These mods are mutually exclusive (see OnModInstallClick's own
+        // "conflicting" check) -- the installer itself never creates this
+        // state, since installing one always uninstalls any other first. So
+        // finding more than one already on disk at startup means it got here
+        // some other way (an older installer version, manual folder copies,
+        // etc.), and it's a broken install: both ship their own
+        // CvGameCore_Expansion2.dll/Override set, so having both in
+        // Assets/DLC at once can crash or desync rather than just one
+        // "winning." Surfaced as a blocking warning at launch, not just the
+        // per-box color, since that's easy to miss and the actual cause
+        // (two conflicting DLC folders) isn't obvious from in-game symptoms
+        // alone.
+        private void WarnIfConflictingModsInstalled()
+        {
+            List<ModDefinition> installed = ModRegistry.All.Where(m => _installedModIds.Contains(m.Id)).ToList();
+            if (installed.Count < 2)
+            {
+                return;
+            }
+
+            string names = string.Join(" and ", installed.Select(m => m.DisplayName).ToArray());
+            MessageBox.Show(
+                this,
+                names + " are both installed. They can't run together -- uninstall one.",
+                "Conflicting mods installed",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+
+        // Tournament Mod's own published ui_check.bat (catscatsforever/Civ5-
+        // Patch, confirmed against a real download) hardcodes every EUI
+        // check to the literal path "UI_bc1\..." -- no %euifolder% variable,
+        // no awareness that "UI_bc1_xits" exists at all. With only EUI XITS
+        // installed (no plain EUI alongside it), every one of those checks
+        // comes back "not found", so Tournament Mod silently reverts nearly
+        // its whole UI override set to vanilla while EUI XITS's own base
+        // screens stay active underneath -- a broken half-vanilla/half-EUI
+        // mashup (confirmed 2026-07-21 against a real deployed install:
+        // blank top bar, unclickable units, split production/purchase
+        // popups). This isn't something we can fix from our side (it's
+        // upstream Tournament Mod content, not our installer or kek-mod's
+        // own script), so just warn instead of silently producing a broken
+        // game. Only checks Tournament Mod -- kek-mod's own XITS-aware
+        // %euifolder% fix (see ui_check.bat) just hasn't shipped in a
+        // release yet, so it isn't a permanent incompatibility the same way.
+        private void WarnIfTournamentModXitsConflict()
+        {
+            if (_installedEuiVariantId != "eui_xits" || !_installedModIds.Contains(ModRegistry.TournamentMod.Id))
+            {
+                return;
+            }
+
+            MessageBox.Show(
+                this,
+                "Tournament Mod and EUI XITS are not compatible.",
+                "Tournament Mod isn't compatible with EUI XITS",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+
+        // Shared by OnModInstallClick (installing Tournament Mod while EUI
+        // XITS is already active) and OnEuiInstallClick (installing EUI
+        // XITS while Tournament Mod is already installed) -- same
+        // incompatibility as WarnIfTournamentModXitsConflict, just caught
+        // before the action instead of after. Defaults to blocking (Yes/No,
+        // not just OK) since this is about to actively create the broken
+        // combination rather than merely reporting one already on disk.
+        private bool ConfirmTournamentModXitsConflict()
+        {
+            DialogResult confirm = MessageBox.Show(
+                this,
+                "Tournament Mod and EUI XITS are not compatible. Install anyway?",
+                "Tournament Mod isn't compatible with EUI XITS",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+            return confirm == DialogResult.Yes;
+        }
+
+        // EnsureExtraInstalled normally adds a mod's bonus map alongside it
+        // (see InstallerCore.Run), but that's best-effort and silently
+        // swallows failures (offline at install time, upstream repo/release
+        // missing, etc. -- see MapScriptExtra/TournamentMapExtra), so a mod
+        // can end up installed without it and nothing ever surfaces that.
+        // ExtraModId's presence in _installedModIds is the same signal
+        // UpdateModRowStyles already uses for that sub-row's indicator dot.
+        private void WarnIfMissingMapForInstalledMods()
+        {
+            List<string> missing = ModRegistry.All
+                .Where(m => m.ExtraModId != null && _installedModIds.Contains(m.Id) && !_installedModIds.Contains(m.ExtraModId))
+                .Select(m => m.DisplayName + " is missing its " + m.ExtraDisplayName)
+                .ToList();
+            if (missing.Count == 0)
+            {
+                return;
+            }
+
+            MessageBox.Show(
+                this,
+                string.Join("\n", missing) + ".\n\nReinstall to add it.",
+                "Missing bonus map",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Warning);
+        }
+
         // Whether mod's auto-install pick (respecting the current beta
         // setting, same rule InstallerCore.Run would use) resolves to a
         // different folder name than what's actually installed. Compares
@@ -1531,6 +1698,12 @@ namespace KekModInstaller
             options.WantDev = false;
 #endif
 
+            if (mod.Id == ModRegistry.TournamentMod.Id && _installedEuiVariantId == "eui_xits"
+                && !ConfirmTournamentModXitsConflict())
+            {
+                return;
+            }
+
             List<ModDefinition> conflicting = ModRegistry.All
                 .Where(m => m.Id != mod.Id && _installedModIds.Contains(m.Id))
                 .ToList();
@@ -1570,12 +1743,14 @@ namespace KekModInstaller
                 return;
             }
 
-            // Fish Map Script is only ever installed alongside kek-mod, so
-            // only kek-mod's confirm dialog mentions removing it too.
-            string mapScriptNote = mod.Id == ModRegistry.KekMod.Id ? " and the Fish Map Script" : "";
+            // InstallerCore.Uninstall calls mod.RemoveExtra unconditionally
+            // for any mod that has one (Fish Map Script, Better Pangaea,
+            // Lekmap), so the confirm dialog should mention it for whichever
+            // mod this is, not just kek-mod specifically.
+            string extraNote = mod.ExtraDisplayName != null ? " and the " + mod.ExtraDisplayName : "";
             DialogResult confirm = MessageBox.Show(
                 this,
-                "Remove all installed " + mod.DisplayName + " versions" + mapScriptNote + " from your Civilization V install?",
+                "Remove all installed " + mod.DisplayName + " versions" + extraNote + " from your Civilization V install?",
                 "Uninstall " + mod.DisplayName,
                 MessageBoxButtons.YesNo,
                 MessageBoxIcon.Warning);
@@ -1595,6 +1770,11 @@ namespace KekModInstaller
         private void OnEuiInstallClick(EuiVariant variant)
         {
             if (_actionInProgress)
+            {
+                return;
+            }
+            if (variant.Id == "eui_xits" && _installedModIds.Contains(ModRegistry.TournamentMod.Id)
+                && !ConfirmTournamentModXitsConflict())
             {
                 return;
             }
@@ -1684,6 +1864,93 @@ namespace KekModInstaller
                     "Open install folder",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
+            }
+        }
+
+        private void BtnScanExtras_Click(object sender, EventArgs e)
+        {
+            Cursor = Cursors.WaitCursor;
+            List<ExtraFolderInfo> found;
+            try
+            {
+                found = ExtraModScan.Scan();
+            }
+            finally
+            {
+                Cursor = Cursors.Default;
+            }
+
+            if (found.Count == 0)
+            {
+                MessageBox.Show(
+                    this,
+                    "No unrecognized folders found in Assets/DLC or Assets/Maps.",
+                    "Verify mods",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            using (var dlg = new ExtraModsForm(found))
+            {
+                dlg.ShowDialog(this);
+            }
+        }
+
+        // Steam AppID for Sid Meier's Civilization V -- going through Steam
+        // (rather than launching the exe directly) means Steam applies the
+        // player's own launch options/DLC selection exactly like clicking
+        // Play in the library, and handles the case where Steam itself isn't
+        // running yet.
+        private const string Civ5SteamAppId = "8930";
+
+        // Same button doubles as LAUNCH CIV / FORCE CLOSE CIV depending on
+        // whether the game is currently running -- CursorTimer_Tick (already
+        // polling every 500ms for the status-bar blink) keeps the label
+        // synced, including if the game exits or crashes on its own.
+        private void UpdateLaunchCivButton()
+        {
+            bool running = InstallerCore.IsCiv5Running();
+            string text = running ? "FORCE CLOSE CIV" : "LAUNCH CIV";
+            if (_btnLaunchCiv.Text != text)
+            {
+                _btnLaunchCiv.Text = text;
+                _btnLaunchCiv.ForeColor = running ? ThemeRed : ThemeGreen;
+            }
+        }
+
+        private void BtnLaunchCiv_Click(object sender, EventArgs e)
+        {
+            if (InstallerCore.IsCiv5Running())
+            {
+                DialogResult confirm = MessageBox.Show(
+                    this,
+                    "Civilization V is currently running.\n\nForce-closing it ends the process immediately -- any unsaved game progress will be lost. Continue?",
+                    "Force close Civilization V",
+                    MessageBoxButtons.YesNo,
+                    MessageBoxIcon.Warning);
+                if (confirm != DialogResult.Yes)
+                {
+                    return;
+                }
+
+                InstallerCore.ForceCloseCiv5();
+                UpdateLaunchCivButton();
+                return;
+            }
+
+            try
+            {
+                Process.Start(new ProcessStartInfo("steam://rungameid/" + Civ5SteamAppId) { UseShellExecute = true });
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(
+                    this,
+                    "Couldn't launch Civilization V via Steam: " + ex.Message,
+                    "Launch Civilization V",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
             }
         }
 
@@ -2004,6 +2271,189 @@ namespace KekModInstaller
         }
     }
 
+    // Reached via MainForm's "VERIFY MODS" button. Lists whatever
+    // ExtraModScan.Scan() found -- unrecognized folders under Assets/DLC and
+    // Assets/Maps -- one row each with its own ARCHIVE/DELETE buttons on the
+    // right, same layout pattern as MainForm's mod/EUI boxes: each button
+    // acts on that row immediately rather than staging a choice for a shared
+    // Apply step. Not clicking anything on a row IS "keep" -- there's no
+    // separate Keep button, matching how the rest of the app never has an
+    // explicit "leave it alone" control either. DELETE gets its own
+    // confirmation, since (unlike Archive) it can't be undone.
+    internal class ExtraModsForm : Form
+    {
+        private readonly Panel _listPanel;
+        private readonly Label _lblEmpty;
+
+        public ExtraModsForm(List<ExtraFolderInfo> items)
+        {
+            Text = "CIV V MOD INSTALLER // EXTRA MODS FOUND";
+            ClientSize = new Size(520, 448);
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            BackColor = Color.Black;
+
+            var lblHint = new Label();
+            lblHint.SetBounds(12, 10, 496, 60); // 4 lines at 7.5F Consolas -- ~15px/line
+            lblHint.Text = "Folders in Assets/DLC and Assets/Maps this installer doesn't recognize:\r\n"
+                + "Leave a row alone to KEEP it.\r\n"
+                + "ARCHIVE -- zips the folder in place, then deletes the original.\r\n"
+                + "DELETE -- permanently removes the folder. No undo.";
+            lblHint.Font = new Font("Consolas", 7.5F);
+            lblHint.ForeColor = MainForm.ThemeMagenta;
+            lblHint.BackColor = Color.Black;
+
+            _listPanel = new Panel();
+            _listPanel.SetBounds(12, 76, 496, 316);
+            _listPanel.AutoScroll = true;
+            _listPanel.BackColor = Color.Black;
+            _listPanel.BorderStyle = BorderStyle.FixedSingle;
+
+            _lblEmpty = new Label();
+            _lblEmpty.SetBounds(8, 8, 400, 20);
+            _lblEmpty.Text = "Nothing left -- everything's been kept, archived, or deleted.";
+            _lblEmpty.Font = new Font("Consolas", 8.5F);
+            _lblEmpty.ForeColor = MainForm.ThemeDim;
+            _lblEmpty.BackColor = Color.Black;
+            _lblEmpty.Visible = items.Count == 0;
+            _listPanel.Controls.Add(_lblEmpty);
+
+            foreach (ExtraFolderInfo info in items)
+            {
+                _listPanel.Controls.Add(BuildRow(info));
+            }
+            RelayoutRows();
+
+            var btnClose = new MainForm.RetroButton();
+            btnClose.Text = "CLOSE";
+            btnClose.SetBounds(420, 404, 88, 28);
+            btnClose.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
+
+            Controls.Add(lblHint);
+            Controls.Add(_listPanel);
+            Controls.Add(btnClose);
+        }
+
+        private Panel BuildRow(ExtraFolderInfo info)
+        {
+            var row = new Panel();
+            row.SetBounds(4, 0, 468, 26);
+            row.BackColor = Color.Black;
+
+            var lblName = new Label();
+            lblName.SetBounds(0, 4, 200, 18);
+            lblName.Text = "[" + (info.Location == ExtraFolderLocation.Dlc ? "DLC" : "Maps") + "] " + info.Name;
+            lblName.Font = new Font("Consolas", 8.5F, FontStyle.Bold);
+            lblName.ForeColor = MainForm.ThemeGreen;
+            lblName.BackColor = Color.Black;
+            lblName.AutoEllipsis = true;
+
+            var lblSize = new Label();
+            lblSize.SetBounds(204, 4, 70, 18);
+            lblSize.Text = FormatSize(info.SizeBytes);
+            lblSize.Font = new Font("Consolas", 8F);
+            lblSize.ForeColor = MainForm.ThemeDim;
+            lblSize.BackColor = Color.Black;
+
+            var btnArchive = new MainForm.RetroButton();
+            btnArchive.Text = "ARCHIVE";
+            btnArchive.Font = new Font("Consolas", 7F, FontStyle.Bold);
+            btnArchive.SetBounds(280, 1, 90, 24);
+            btnArchive.Click += (s, e) => OnArchiveClick(info, row);
+
+            var btnDelete = new MainForm.RetroButton();
+            btnDelete.Text = "DELETE";
+            btnDelete.Font = new Font("Consolas", 7F, FontStyle.Bold);
+            btnDelete.SetBounds(376, 1, 90, 24);
+            btnDelete.Click += (s, e) => OnDeleteClick(info, row);
+
+            row.Controls.Add(lblName);
+            row.Controls.Add(lblSize);
+            row.Controls.Add(btnArchive);
+            row.Controls.Add(btnDelete);
+
+            return row;
+        }
+
+        private void OnArchiveClick(ExtraFolderInfo info, Panel row)
+        {
+            try
+            {
+                Cursor = Cursors.WaitCursor;
+                ExtraModScan.Archive(info);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Couldn't archive " + info.Name + ": " + ex.Message, "Archive failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            finally
+            {
+                Cursor = Cursors.Default;
+            }
+            RemoveRow(row);
+        }
+
+        private void OnDeleteClick(ExtraFolderInfo info, Panel row)
+        {
+            DialogResult confirm = MessageBox.Show(
+                this,
+                "Permanently delete \"" + info.Name + "\"? This cannot be undone.",
+                "Confirm delete",
+                MessageBoxButtons.YesNo,
+                MessageBoxIcon.Warning);
+            if (confirm != DialogResult.Yes)
+            {
+                return;
+            }
+
+            try
+            {
+                Cursor = Cursors.WaitCursor;
+                ExtraModScan.Delete(info);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show(this, "Couldn't delete " + info.Name + ": " + ex.Message, "Delete failed", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
+            finally
+            {
+                Cursor = Cursors.Default;
+            }
+            RemoveRow(row);
+        }
+
+        private void RemoveRow(Panel row)
+        {
+            _listPanel.Controls.Remove(row);
+            _lblEmpty.Visible = _listPanel.Controls.Count == 0;
+            RelayoutRows();
+        }
+
+        private void RelayoutRows()
+        {
+            int y = 4;
+            foreach (Control c in _listPanel.Controls)
+            {
+                if (c == _lblEmpty)
+                {
+                    continue;
+                }
+                c.Top = y;
+                y += c.Height + 4;
+            }
+        }
+
+        private static string FormatSize(long bytes)
+        {
+            double mb = bytes / (1024.0 * 1024.0);
+            return mb >= 1 ? mb.ToString("0.0") + " MB" : (bytes / 1024.0).ToString("0") + " KB";
+        }
+    }
+
     internal static class Program
     {
         [STAThread]
@@ -2016,20 +2466,6 @@ namespace KekModInstaller
 
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
-
-            while (InstallerCore.IsCiv5Running())
-            {
-                DialogResult result = MessageBox.Show(
-                    "Civilization V is currently running.\n\nPlease close the game before installing or uninstalling mods, then click Retry.",
-                    "Civilization V is running",
-                    MessageBoxButtons.RetryCancel,
-                    MessageBoxIcon.Warning);
-                if (result == DialogResult.Cancel)
-                {
-                    return;
-                }
-            }
-
             Application.Run(new MainForm());
         }
     }

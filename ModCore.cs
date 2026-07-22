@@ -173,7 +173,40 @@ namespace KekModInstaller
             DetectExtraInstalled = TournamentMapExtra.DetectInstalled,
         };
 
-        public static readonly List<ModDefinition> All = new List<ModDefinition> { KekMod, TournamentMod };
+        // Lekmod. No published GitHub Releases at all -- distributed as a
+        // Google Drive file per version, tracked by a JSON manifest Lekmod
+        // publishes in its own repo (see LekmodModSource). Confirmed by
+        // downloading a real version through the reference installer: the
+        // zip's top-level directory is the fixed, unversioned name "LEKMOD"
+        // (not "LEKMOD_v34.15"), so it needs the same "find and rename"
+        // handling as Tournament Mod's own zip layout would if it weren't
+        // already versioned -- ZipTopLevelIsFinalFolderName = false here.
+        // Ships its own ui_check.bat (auto-detects EUI the same way kek-mod's
+        // and Tournament Mod's do, by checking for a sibling UI_bc1 folder),
+        // so RunsUiCheck = true. Its bonus map component -- Lekmap, Lekmod's
+        // own custom mapscript bundle -- is wired up the same way kek-mod's
+        // Fish Map Script and Tournament Mod's Better Pangaea are (see
+        // LekmapExtra).
+        public static readonly ModDefinition Lekmod = new ModDefinition
+        {
+            Id = "lekmod",
+            DisplayName = "Lekmod",
+            InstalledFolderGlob = "LEKMOD_v*",
+            Source = new LekmodModSource(),
+            MakeFolderName = tag => "LEKMOD_" + tag, // tag "v34.15" -> "LEKMOD_v34.15"
+            ZipTopLevelIsFinalFolderName = false,
+            ZipSourceDirPrefix = "LEKMOD",
+            PostExtractStep = null,
+            RunsUiCheck = true,
+            Beta = BetaPolicy.None,
+            ExtraDisplayName = "Lekmap",
+            ExtraModId = "lekmap",
+            EnsureExtraInstalled = LekmapExtra.EnsureInstalled,
+            RemoveExtra = LekmapExtra.Remove,
+            DetectExtraInstalled = LekmapExtra.DetectInstalled,
+        };
+
+        public static readonly List<ModDefinition> All = new List<ModDefinition> { KekMod, TournamentMod, Lekmod };
 
         public static ModDefinition ById(string id)
         {
@@ -520,6 +553,37 @@ namespace KekModInstaller
                 }
             }
             return false;
+        }
+
+        // Kills every running Civ5 process outright (Process.Kill, not a
+        // graceful WM_CLOSE) -- backs MainForm's LAUNCH CIV button doubling
+        // as FORCE CLOSE when the game is already running. Any unsaved game
+        // progress is lost; the caller confirms with the user before calling
+        // this.
+        public static void ForceCloseCiv5()
+        {
+            foreach (Process p in Process.GetProcesses())
+            {
+                using (p)
+                {
+                    foreach (string name in Civ5ProcessNames)
+                    {
+                        if (string.Equals(p.ProcessName, name, StringComparison.OrdinalIgnoreCase))
+                        {
+                            try
+                            {
+                                p.Kill();
+                                p.WaitForExit(5000);
+                            }
+                            catch (InvalidOperationException)
+                            {
+                                // Already exited between enumeration and Kill.
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
         }
 
         // Finds the Steam library that actually contains Civ5 -- it may not

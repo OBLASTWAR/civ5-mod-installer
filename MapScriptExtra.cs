@@ -23,7 +23,10 @@ namespace KekModInstaller
         // and get a redundant second copy installed alongside their real one.
         private const string RepoOwner = "OBLASTWAR";
         private const string RepoName = "pangea-stratbal";
-        private const string FolderName = "Fish Map Script";
+        // Internal, not private: ExtraModScan reads this directly so its
+        // "is this an extra/unrecognized folder" check never drifts out of
+        // sync with the one place this name is actually defined.
+        internal const string FolderName = "Fish Map Script";
 
         // Downloads and drops FolderName into Assets/Maps if it isn't already
         // there. Deliberately swallows every failure (offline, repo/release
