@@ -115,12 +115,11 @@ namespace KekModInstaller
 
         // gh CLI sanitizes spaces in uploaded asset filenames (observed:
         // "kekmod prod 1.5.zip" -> "kekmod.prod.1.5.zip" on GitHub), so match
-        // "prod"/"dev" as a whole word regardless of the separator (space,
-        // dot, dash, underscore) around it.
-        public static GhAsset PickAssetByProdDevRegex(GhRelease release, InstallOptions options)
+        // "prod" as a whole word regardless of the separator (space, dot,
+        // dash, underscore) around it.
+        public static GhAsset PickProdAsset(GhRelease release, InstallOptions options)
         {
-            string word = options.WantDev ? "dev" : "prod";
-            var pattern = new Regex("\\b" + word + "\\b", RegexOptions.IgnoreCase);
+            var pattern = new Regex("\\bprod\\b", RegexOptions.IgnoreCase);
             GhAsset asset = null;
             if (release.Assets != null)
             {
@@ -132,7 +131,7 @@ namespace KekModInstaller
                     ? ""
                     : string.Join(", ", release.Assets.Select(a => a.Name).ToArray());
                 throw new InvalidOperationException(
-                    "Release " + release.TagName + " has no asset matching \"" + word + "\". Assets found: " + found);
+                    "Release " + release.TagName + " has no asset matching \"prod\". Assets found: " + found);
             }
             return asset;
         }

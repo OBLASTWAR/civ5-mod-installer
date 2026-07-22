@@ -101,13 +101,16 @@ namespace KekModInstaller
         // a time -- plus any existing copy of this same variant. Logs and
         // returns without throwing if this installer build wasn't compiled
         // with that variant's zip embedded.
-        public static void Install(string dlcRoot, EuiVariant variant, Action<string> log)
+        // Returns whether the variant was actually installed -- false means
+        // the "isn't bundled" no-op case, so the caller (EuiWorker_DoWork)
+        // knows not to log a DONE line for an install that never happened.
+        public static bool Install(string dlcRoot, EuiVariant variant, Action<string> log)
         {
             string tempZip = ExtractEmbeddedResourceToTemp(variant.ResourceName);
             if (tempZip == null)
             {
                 log(variant.DisplayName + " isn't bundled with this installer build -- nothing to install.");
-                return;
+                return false;
             }
 
             foreach (string dir in Directory.GetDirectories(dlcRoot, "UI*"))
@@ -119,7 +122,7 @@ namespace KekModInstaller
             log("Installing " + variant.DisplayName + "...");
             ZipFile.ExtractToDirectory(tempZip, dlcRoot); // zip's own top level is already variant.FolderName
             File.Delete(tempZip);
-            log(variant.DisplayName + " installed.");
+            return true;
         }
 
         // Every mod we ship is only ever tested against this exact bundled

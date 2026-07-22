@@ -39,16 +39,13 @@ using Microsoft.Win32;
 
 namespace KekModInstaller
 {
-    // Persists the settings-page opt-ins across launches. Both off by
-    // default: regular players shouldn't see beta as an option at all
-    // unless they've deliberately dug into Settings for it, and a dev build
-    // that accidentally starts pulling from the LAN test server is the kind
-    // of surprise nobody wants -- see SettingsForm.
+    // Persists the settings-page opt-ins across launches. Off by default:
+    // regular players shouldn't see beta as an option at all unless they've
+    // deliberately dug into Settings for it.
     internal static class SettingsManager
     {
         private const string RegistryKey = @"HKEY_CURRENT_USER\Software\KekModInstaller";
         private const string ShowBetaValueName = "ShowBetaBuilds";
-        private const string UseDevValueName = "UseDevBuild";
         private const string MutedValueName = "Muted";
 
         public static bool GetShowBeta()
@@ -60,20 +57,6 @@ namespace KekModInstaller
         public static void SetShowBeta(bool show)
         {
             Registry.SetValue(RegistryKey, ShowBetaValueName, show ? 1 : 0, RegistryValueKind.DWord);
-        }
-
-        // INTERNAL_BUILD-only in practice (SettingsForm only shows the
-        // Prod/Dev radios there), but the getter/setter pair is harmless to
-        // keep unconditional -- simpler than threading #if into this class.
-        public static bool GetUseDev()
-        {
-            object value = Registry.GetValue(RegistryKey, UseDevValueName, 0);
-            return value is int && (int)value != 0;
-        }
-
-        public static void SetUseDev(bool useDev)
-        {
-            Registry.SetValue(RegistryKey, UseDevValueName, useDev ? 1 : 0, RegistryValueKind.DWord);
         }
 
         // Unmuted by default -- the mute button only needs to remember an
@@ -142,7 +125,7 @@ namespace KekModInstaller
         // TryFetchLatestInstallerVersion below. Unrelated to the mod's own
         // version (release tags like "v1.5-beta8") -- this is the installer
         // program's own version.
-        private const string InstallerVersion = "1.0";
+        private const string InstallerVersion = "1.1";
 
         public static string GetInstallerVersion()
         {
@@ -320,9 +303,8 @@ namespace KekModInstaller
 
     internal class MainForm : Form
     {
-        // Beta opt-in (both builds) and Prod/Dev (INTERNAL_BUILD only) both
-        // live in Settings now, not as boxes on the main form -- see
-        // SettingsForm. Keeps the two builds' main windows identical.
+        // Beta opt-in lives in Settings now, not as a box on the main form
+        // -- see SettingsForm.
 
         // One bordered box per ModRegistry.All entry, each titled with that
         // mod's own name -- leaves room for a sub-row per mod (its bonus
@@ -402,7 +384,7 @@ namespace KekModInstaller
         // room for the greetz ticker + mute button. Late-90s/early-2000s
         // "cracktro" theme: black background, neon green terminal text,
         // magenta box-art borders -- see MakeRetroBox/RetroButton.
-        private const int TopShift = 74;
+        private const int TopShift = 60;
         private const int BottomStrip = 30;
         // Internal, not private: SettingsForm reuses the same palette and
         // chrome (MakeRetroBox, RetroButton) so the settings page reads as
@@ -416,7 +398,7 @@ namespace KekModInstaller
         internal static readonly Color ThemeDim = Color.FromArgb(0, 100, 40);
 
         private Label _lblTitle;
-        private Label _lblSubtitle;
+        private Label _lblTitleTag;
         private Panel _dividerLine;
         // Every mod's release list, fetched once at startup (see
         // StatusWorker_DoWork) and reused for every VERSION-dropdown
@@ -430,6 +412,7 @@ namespace KekModInstaller
         private Dictionary<string, List<ModRelease>> _releasesByModId = new Dictionary<string, List<ModRelease>>();
         private RetroButton _btnOpenFolder;
         private RetroButton _btnScanExtras;
+        private RetroButton _btnClearGfx;
         private RetroButton _btnLaunchCiv;
         private RetroButton _btnMute;
         private RetroButton _btnSettings;
@@ -507,28 +490,34 @@ namespace KekModInstaller
             }
 
             _lblTitle = new Label();
-            _lblTitle.SetBounds(10, 4, 430, 34);
             _lblTitle.Text = "CIV V MOD INSTALLER";
             _lblTitle.Font = new Font("Consolas", 14F, FontStyle.Bold);
             _lblTitle.ForeColor = ThemeGreen;
             _lblTitle.BackColor = Color.Black;
+            _lblTitle.AutoSize = true;
+            _lblTitle.Location = new Point(10, 4);
 
-            _lblSubtitle = new Label();
-            _lblSubtitle.SetBounds(12, 40, 500, 16);
-            _lblSubtitle.Text = "-=[ INSTALLER v" + InstallerCore.GetInstallerVersion() + " ]=-  RELEASED BY OBLAST";
-            _lblSubtitle.Font = new Font("Consolas", 8.5F, FontStyle.Italic | FontStyle.Bold);
-            _lblSubtitle.ForeColor = ThemeMagenta;
-            _lblSubtitle.BackColor = Color.Black;
+            _lblTitleTag = new Label();
+            _lblTitleTag.Text = "-=[ v" + InstallerCore.GetInstallerVersion() + " @OBLAST ]=-";
+            _lblTitleTag.Font = new Font("Consolas", 8.5F, FontStyle.Italic | FontStyle.Bold);
+            _lblTitleTag.ForeColor = ThemeMagenta;
+            _lblTitleTag.BackColor = Color.Black;
+            _lblTitleTag.AutoSize = true;
+            // AutoSize on both means no fixed box to clip against; follows
+            // the title's actual rendered size/right edge, vertically
+            // centered on it, rather than a hand-guessed offset.
+            _lblTitleTag.Location = new Point(
+                _lblTitle.Right + 160,
+                _lblTitle.Top + (_lblTitle.Height - _lblTitleTag.PreferredSize.Height) / 2);
 
             _dividerLine = new Panel();
-            _dividerLine.SetBounds(0, 60, 560, 2);
+            _dividerLine.SetBounds(0, 44, 560, 2);
             _dividerLine.BackColor = ThemeMagenta;
 
             // Gear icon, top-right of the title bar -- the only way into
-            // Settings (beta opt-in; also Prod/Dev on INTERNAL_BUILD -- see
-            // SettingsForm). Deliberately not labelled "BETA" or anything
-            // that would advertise the option to players who haven't gone
-            // looking for it.
+            // Settings (beta opt-in -- see SettingsForm). Deliberately not
+            // labelled "BETA" or anything that would advertise the option
+            // to players who haven't gone looking for it.
             _btnSettings = new RetroButton();
             _btnSettings.SetBounds(522, 6, 26, 22);
             _btnSettings.Text = "⚙"; // gear
@@ -687,9 +676,12 @@ namespace KekModInstaller
                 _txtLog.Cursor = civEdit;
             }
 
+            // Four buttons share this row now (was three) -- "OPEN DLC
+            // FOLDER" is the tighter rename that made room, and it names
+            // what the button actually opens anyway.
             _btnOpenFolder = new RetroButton();
-            _btnOpenFolder.Text = "OPEN INSTALL FOLDER";
-            _btnOpenFolder.SetBounds(12, openFolderY, 170, openFolderHeight);
+            _btnOpenFolder.Text = "OPEN DLC FOLDER";
+            _btnOpenFolder.SetBounds(12, openFolderY, 128, openFolderHeight);
             _btnOpenFolder.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             _btnOpenFolder.Click += BtnOpenFolder_Click;
 
@@ -699,13 +691,22 @@ namespace KekModInstaller
             // years can review and Keep/Archive/Delete each one.
             _btnScanExtras = new RetroButton();
             _btnScanExtras.Text = "VERIFY MODS";
-            _btnScanExtras.SetBounds(190, openFolderY, 170, openFolderHeight);
+            _btnScanExtras.SetBounds(146, openFolderY, 128, openFolderHeight);
             _btnScanExtras.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             _btnScanExtras.Click += BtnScanExtras_Click;
 
+            // Wipes GPU shader caches + Civ5's cached DBs -- the fix for
+            // the "black map with smearing icons" bug (see
+            // GraphicsCacheExtra.cs for the story).
+            _btnClearGfx = new RetroButton();
+            _btnClearGfx.Text = "CLEAR GFX CACHE";
+            _btnClearGfx.SetBounds(280, openFolderY, 128, openFolderHeight);
+            _btnClearGfx.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+            _btnClearGfx.Click += BtnClearGfx_Click;
+
             _btnLaunchCiv = new RetroButton();
             _btnLaunchCiv.Text = "LAUNCH CIV";
-            _btnLaunchCiv.SetBounds(368, openFolderY, 176, openFolderHeight);
+            _btnLaunchCiv.SetBounds(414, openFolderY, 130, openFolderHeight);
             _btnLaunchCiv.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             _btnLaunchCiv.Click += BtnLaunchCiv_Click;
             UpdateLaunchCivButton();
@@ -742,7 +743,7 @@ namespace KekModInstaller
             _btnMute.Click += BtnMute_Click;
 
             Controls.Add(_lblTitle);
-            Controls.Add(_lblSubtitle);
+            Controls.Add(_lblTitleTag);
             Controls.Add(_dividerLine);
             // GAME MODS/INTERFACE MODS (and everything nested inside them)
             // were already added to Controls above -- each is a
@@ -753,6 +754,7 @@ namespace KekModInstaller
             Controls.Add(_txtLog);
             Controls.Add(_btnOpenFolder);
             Controls.Add(_btnScanExtras);
+            Controls.Add(_btnClearGfx);
             Controls.Add(_btnLaunchCiv);
             Controls.Add(_tickerViewport);
             Controls.Add(_btnMute);
@@ -1046,16 +1048,40 @@ namespace KekModInstaller
             // off-center even with NoPadding. Positive shifts the glyph down.
             internal int TextOffsetY;
 
+            // Null = default ThemeMagenta. Set by UpdateModRowStyles/
+            // UpdateEuiRowStyles to ThemeGreen once the mod/variant is
+            // installed, matching the box's own border-color state.
+            private Color? _borderColor;
+            internal Color? BorderColor
+            {
+                get { return _borderColor; }
+                set { _borderColor = value; Invalidate(); }
+            }
+
             private bool _hover;
 
             protected override void OnMouseEnter(EventArgs e) { _hover = true; Invalidate(); base.OnMouseEnter(e); }
             protected override void OnMouseLeave(EventArgs e) { _hover = false; Invalidate(); base.OnMouseLeave(e); }
             protected override void OnEnabledChanged(EventArgs e) { Invalidate(); base.OnEnabledChanged(e); }
 
+            // Dims toward the two known theme colors' pre-tuned disabled
+            // shades, so a pink-state button dims to dim pink and a
+            // green-state button dims to dim green -- previously this was a
+            // single hardcoded dim-green regardless of which color the
+            // button actually was, so disabled buttons on not-installed
+            // (pink) rows still showed green text.
+            private static Color DimForDisabled(Color c)
+            {
+                if (c == ThemeGreen) { return Color.FromArgb(0, 100, 40); }
+                if (c == ThemeMagenta) { return Color.FromArgb(90, 0, 65); }
+                return Color.FromArgb(c.R * 35 / 100, c.G * 35 / 100, c.B * 35 / 100);
+            }
+
             protected override void OnPaint(PaintEventArgs pe)
             {
-                Color border = Enabled ? ThemeMagenta : Color.FromArgb(90, 0, 65);
-                Color text = Enabled ? ForeColor : Color.FromArgb(0, 100, 40);
+                Color borderEnabled = _borderColor ?? ThemeMagenta;
+                Color border = Enabled ? borderEnabled : DimForDisabled(borderEnabled);
+                Color text = Enabled ? ForeColor : DimForDisabled(ForeColor);
                 Color bg = (_hover && Enabled) ? Color.FromArgb(25, 25, 25) : Color.Black;
 
                 pe.Graphics.Clear(bg);
@@ -1196,6 +1222,17 @@ namespace KekModInstaller
                     row.VersionButton.Enabled = true;
                 }
 
+                // Border green once installed (matches the box's own
+                // border), text pink while not -- see RetroButton.BorderColor.
+                Color? btnBorder = installed ? ThemeGreen : (Color?)null;
+                Color btnText = installed ? ThemeGreen : ThemeMagenta;
+                row.InstallButton.BorderColor = btnBorder;
+                row.InstallButton.ForeColor = btnText;
+                row.UninstallButton.BorderColor = btnBorder;
+                row.UninstallButton.ForeColor = btnText;
+                row.VersionButton.BorderColor = btnBorder;
+                row.VersionButton.ForeColor = btnText;
+
                 if (row.ExtraIndicator != null)
                 {
                     bool extraInstalled = mod.ExtraModId != null && _installedModIds.Contains(mod.ExtraModId);
@@ -1251,6 +1288,16 @@ namespace KekModInstaller
                     _euiRows[i].InstallButton.Enabled = true;
                     _euiRows[i].RemoveButton.Enabled = active;
                 }
+
+                // Same border-green/text-pink state coloring as the mod
+                // boxes -- see UpdateModRowStyles.
+                Color? euiBtnBorder = active ? ThemeGreen : (Color?)null;
+                Color euiBtnText = active ? ThemeGreen : ThemeMagenta;
+                _euiRows[i].InstallButton.BorderColor = euiBtnBorder;
+                _euiRows[i].InstallButton.ForeColor = euiBtnText;
+                _euiRows[i].RemoveButton.BorderColor = euiBtnBorder;
+                _euiRows[i].RemoveButton.ForeColor = euiBtnText;
+
                 _euiRows[i].Box.Invalidate(); // re-runs the box's borderColor delegate against the (possibly new) installed variant
             }
         }
@@ -1373,13 +1420,6 @@ namespace KekModInstaller
             }
 
             string latestInstallerVersion = (string)result[2];
-#if INTERNAL_BUILD
-            // KekModInstaller.Internal.exe is gitignored (dev-machine only,
-            // never published to GitHub) -- DownloadAndApplySelfUpdate would
-            // just 404, so don't offer it here regardless of what
-            // installer_version.txt says.
-            _btnUpdate.Visible = false;
-#else
             if (latestInstallerVersion != null
                 && InstallerCore.IsNewerVersion(latestInstallerVersion, InstallerCore.GetInstallerVersion()))
             {
@@ -1390,7 +1430,6 @@ namespace KekModInstaller
             {
                 _btnUpdate.Visible = false;
             }
-#endif
 
             RefreshLocalState();
         }
@@ -1467,24 +1506,31 @@ namespace KekModInstaller
 
         // Was previously a Program.Main gate before MainForm even existed --
         // moved here so the window itself is visible first instead of the
-        // warning being the first thing a player sees. Cancel still closes
-        // the installer entirely (there's nothing useful to do here with
-        // Civ5 open), just after the window had a chance to appear.
+        // warning being the first thing a player sees. Cancel just dismisses
+        // the warning and leaves the already-visible main window (the
+        // "loader") up rather than killing the installer entirely -- there's
+        // nothing else useful to do here, so no point tearing the whole app
+        // down over it. Force Close kills immediately, no extra confirm --
+        // Civ5RunningForm's own label is the warning.
         private void WarnIfCiv5RunningAtLaunch()
         {
             while (InstallerCore.IsCiv5Running())
             {
-                DialogResult result = MessageBox.Show(
-                    this,
-                    "Civilization V is currently running.\n\nPlease close the game before installing or uninstalling mods, then click Retry.",
-                    "Civilization V is running",
-                    MessageBoxButtons.RetryCancel,
-                    MessageBoxIcon.Warning);
+                DialogResult result;
+                using (var dlg = new Civ5RunningForm())
+                {
+                    result = dlg.ShowDialog(this);
+                }
                 if (result == DialogResult.Cancel)
                 {
-                    Close();
                     return;
                 }
+                if (result == DialogResult.Abort) // Force Close sentinel
+                {
+                    InstallerCore.ForceCloseCiv5();
+                }
+                // Retry (or a completed force close) falls through to the
+                // while-check above, which re-polls IsCiv5Running.
             }
         }
 
@@ -1692,11 +1738,6 @@ namespace KekModInstaller
             options.WantBeta = SettingsManager.GetShowBeta();
             string tag;
             options.TagName = _selectedVersionTagByModId.TryGetValue(mod.Id, out tag) ? tag : null;
-#if INTERNAL_BUILD
-            options.WantDev = SettingsManager.GetUseDev();
-#else
-            options.WantDev = false;
-#endif
 
             if (mod.Id == ModRegistry.TournamentMod.Id && _installedEuiVariantId == "eui_xits"
                 && !ConfirmTournamentModXitsConflict())
@@ -1897,6 +1938,53 @@ namespace KekModInstaller
             }
         }
 
+        // Wipes every known GPU shader cache (NVIDIA/AMD/Intel + Windows'
+        // D3DSCache) plus Civ5's cached gameplay DBs -- see
+        // GraphicsCacheExtra.cs for why this fixes the black-map bug and
+        // why each wipe is safe. Blocked while the game runs: the driver
+        // holds cache files open and half of them would just be skipped.
+        private void BtnClearGfx_Click(object sender, EventArgs e)
+        {
+            if (InstallerCore.IsCiv5Running())
+            {
+                MessageBox.Show(
+                    this,
+                    "Civilization V is currently running. Close the game first, then clear the caches.",
+                    "Clear graphics caches",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            // No confirm prompt -- every target is a rebuild-on-demand
+            // cache, so the worst case is one slower launch. The log window
+            // shows the result; no summary popup needed after the fact.
+            List<GraphicsCacheResult> results;
+            Cursor = Cursors.WaitCursor;
+            try
+            {
+                results = GraphicsCacheClear.ClearAll();
+            }
+            finally
+            {
+                Cursor = Cursors.Default;
+            }
+
+            _txtLog.AppendText("=== CLEAR GFX CACHE ===" + Environment.NewLine);
+            foreach (GraphicsCacheResult r in results)
+            {
+                if (!r.Present)
+                {
+                    continue; // wrong vendor for this machine -- not worth a log line
+                }
+                _txtLog.AppendText(
+                    r.Label + ": " + r.FilesDeleted + " deleted"
+                        + (r.FilesSkipped > 0 ? ", " + r.FilesSkipped + " in use/skipped" : "")
+                        + Environment.NewLine);
+            }
+            _txtLog.AppendText("Done. Caches rebuild automatically on next launch." + Environment.NewLine);
+        }
+
         // Steam AppID for Sid Meier's Civilization V -- going through Steam
         // (rather than launching the exe directly) means Steam applies the
         // player's own launch options/DLC selection exactly like clicking
@@ -2016,13 +2104,14 @@ namespace KekModInstaller
                 throw new InvalidOperationException("Couldn't locate the Civilization V DLC folder.");
             }
 
+            bool installedSomething = true;
             if (variant == null)
             {
                 EuiExtra.Remove(dlcRoot, log);
             }
             else
             {
-                EuiExtra.Install(dlcRoot, variant, log);
+                installedSomething = EuiExtra.Install(dlcRoot, variant, log);
             }
 
             // EUI is shared across Assets/DLC, not tied to one specific mod
@@ -2033,6 +2122,14 @@ namespace KekModInstaller
             foreach (ModDefinition mod in ModRegistry.All)
             {
                 InstallerCore.RerunUiCheck(mod, log);
+            }
+
+            // Same "DONE: ..." format as ModCore.Run/Uninstall's completion
+            // lines -- skipped only for the "isn't bundled" no-op above,
+            // which already logged its own explanation.
+            if (installedSomething)
+            {
+                log(variant == null ? "DONE: EUI removed." : "DONE: " + variant.DisplayName + " installed.");
             }
         }
 
@@ -2078,6 +2175,61 @@ namespace KekModInstaller
                     row.RemoveButton.Enabled = false;
                 }
             }
+        }
+    }
+
+    // Blocking launch-time warning shown while Civ5 is running (see
+    // MainForm.WarnIfCiv5RunningAtLaunch). Three ways out: RETRY re-polls
+    // and closes this dialog to loop around; CANCEL closes the installer
+    // entirely; FORCE CLOSE returns DialogResult.Abort as a sentinel so the
+    // caller can run the same confirm-then-kill path as the main window's
+    // LAUNCH CIV/FORCE CLOSE CIV button, rather than duplicating that
+    // confirmation inside this dialog.
+    internal class Civ5RunningForm : Form
+    {
+        public Civ5RunningForm()
+        {
+            Text = "CIV V MOD INSTALLER";
+            ClientSize = new Size(380, 145);
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            BackColor = Color.Black;
+
+            Panel pnl = MainForm.MakeRetroBox("CIVILIZATION V IS RUNNING", 12, 12, 356, 70, () => MainForm.ThemeRed);
+
+            var lbl = new Label();
+            lbl.SetBounds(12, 18, 332, 46);
+            lbl.BackColor = Color.Black;
+            lbl.ForeColor = MainForm.ThemeGreen;
+            lbl.Font = new Font("Consolas", 9F);
+            lbl.Text = "Please close the game before installing or\r\n"
+                + "uninstalling mods, then click Retry.";
+            pnl.Controls.Add(lbl);
+
+            var btnRetry = new MainForm.RetroButton();
+            btnRetry.Text = "RETRY";
+            btnRetry.SetBounds(12, 94, 108, 30);
+            btnRetry.Click += (s, e) => { DialogResult = DialogResult.Retry; Close(); };
+
+            var btnForceClose = new MainForm.RetroButton();
+            btnForceClose.Text = "FORCE CLOSE";
+            btnForceClose.ForeColor = MainForm.ThemeRed;
+            btnForceClose.SetBounds(134, 94, 122, 30);
+            btnForceClose.Click += (s, e) => { DialogResult = DialogResult.Abort; Close(); };
+
+            var btnCancel = new MainForm.RetroButton();
+            btnCancel.Text = "CANCEL";
+            btnCancel.SetBounds(270, 94, 98, 30);
+            btnCancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
+
+            Controls.Add(pnl);
+            Controls.Add(btnRetry);
+            Controls.Add(btnForceClose);
+            Controls.Add(btnCancel);
+            AcceptButton = btnRetry;
+            CancelButton = btnCancel;
         }
     }
 
@@ -2164,26 +2316,15 @@ namespace KekModInstaller
     // Small modal dialog reached only via MainForm's gear button. "Enable
     // beta builds" is the sole way to surface beta tags in each mod's own
     // VERSION popup (see VersionPickerForm) and have Install consider them
-    // (see OnModInstallClick). INTERNAL_BUILD adds a second, Prod/Dev,
-    // section below it -- moved here from a BUILD box that used to sit on
-    // the main form, so the two builds' main
-    // windows now look identical and only this dialog differs between them.
+    // (see OnModInstallClick).
     internal class SettingsForm : Form
     {
         private CheckBox _chkShowBeta;
-#if INTERNAL_BUILD
-        private RadioButton _rbProd;
-        private RadioButton _rbDev;
-#endif
 
         public SettingsForm()
         {
             Text = "CIV V MOD INSTALLER // SETTINGS";
-#if INTERNAL_BUILD
-            ClientSize = new Size(320, 230);
-#else
             ClientSize = new Size(320, 150);
-#endif
             StartPosition = FormStartPosition.CenterParent;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
@@ -2201,31 +2342,8 @@ namespace KekModInstaller
             _chkShowBeta.Checked = SettingsManager.GetShowBeta();
             pnlBeta.Controls.Add(_chkShowBeta);
 
-#if INTERNAL_BUILD
-            Panel pnlBuild = MainForm.MakeRetroBox("BUILD", 12, 80, 296, 70);
-
-            _rbProd = new RadioButton();
-            _rbProd.Text = "Prod (recommended)";
-            _rbProd.SetBounds(12, 22, 260, 20);
-            _rbProd.Checked = !SettingsManager.GetUseDev();
-            MainForm.StyleRetroRadio(_rbProd);
-
-            _rbDev = new RadioButton();
-            _rbDev.Text = "Dev (internal test server)";
-            _rbDev.SetBounds(12, 44, 260, 20);
-            _rbDev.Checked = SettingsManager.GetUseDev();
-            MainForm.StyleRetroRadio(_rbDev);
-
-            pnlBuild.Controls.Add(_rbProd);
-            pnlBuild.Controls.Add(_rbDev);
-#endif
-
             var lblHint = new Label();
-#if INTERNAL_BUILD
-            lblHint.SetBounds(12, 158, 296, 32);
-#else
             lblHint.SetBounds(12, 80, 296, 32);
-#endif
             lblHint.Text = "Shows beta tags in VERSION and includes\r\nthem in auto-install. Off by default.";
             lblHint.Font = new Font("Consolas", 7.5F);
             lblHint.ForeColor = MainForm.ThemeMagenta;
@@ -2233,26 +2351,15 @@ namespace KekModInstaller
 
             var btnOk = new MainForm.RetroButton();
             btnOk.Text = "OK";
-#if INTERNAL_BUILD
-            btnOk.SetBounds(126, 194, 90, 26);
-#else
             btnOk.SetBounds(126, 116, 90, 26);
-#endif
             btnOk.Click += BtnOk_Click;
 
             var btnCancel = new MainForm.RetroButton();
             btnCancel.Text = "CANCEL";
-#if INTERNAL_BUILD
-            btnCancel.SetBounds(220, 194, 88, 26);
-#else
             btnCancel.SetBounds(220, 116, 88, 26);
-#endif
             btnCancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
 
             Controls.Add(pnlBeta);
-#if INTERNAL_BUILD
-            Controls.Add(pnlBuild);
-#endif
             Controls.Add(lblHint);
             Controls.Add(btnOk);
             Controls.Add(btnCancel);
@@ -2263,9 +2370,6 @@ namespace KekModInstaller
         private void BtnOk_Click(object sender, EventArgs e)
         {
             SettingsManager.SetShowBeta(_chkShowBeta.Checked);
-#if INTERNAL_BUILD
-            SettingsManager.SetUseDev(_rbDev.Checked);
-#endif
             DialogResult = DialogResult.OK;
             Close();
         }

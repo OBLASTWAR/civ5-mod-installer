@@ -6,11 +6,8 @@ setlocal
 :: Requires: .NET Framework 4.x (csc.exe) -- ships with Windows,
 :: no extra toolchain needed.
 ::
-:: Builds TWO exes from the same Installer.cs:
-::   KekModInstaller.exe           public build -- CHANNEL (stable/beta) is
-::                                  available, no BUILD (prod/dev) box
-::   KekModInstaller.Internal.exe  dev-machine build -- adds the BUILD
-::                                  (prod/dev) radio buttons on top
+:: Builds KekModInstaller.exe from the same Installer.cs. CHANNEL
+:: (stable/beta) is available via Settings.
 ::
 :: Self-update: whenever Installer.cs changes and you rebuild+publish a new
 :: KekModInstaller.exe to main, bump InstallerCore.InstallerVersion in
@@ -55,25 +52,15 @@ if exist "%~dp0UI_bc1_xits.zip" (
 )
 
 echo.
-echo === Building public (stable/beta channel, no dev build option) ===
+echo === Building KekModInstaller.exe ===
 "%CSC%" /nologo /target:winexe /platform:x64 /out:"%~dp0KekModInstaller.exe" %REFS% %RESOURCE% "%~dp0*.cs"
 if %ERRORLEVEL% neq 0 (
     echo.
-    echo BUILD FAILED ^(public, exit code %ERRORLEVEL%^)
-    exit /b %ERRORLEVEL%
-)
-
-echo.
-echo === Building internal (beta/dev channel options) ===
-"%CSC%" /nologo /target:winexe /platform:x64 /define:INTERNAL_BUILD /out:"%~dp0KekModInstaller.Internal.exe" %REFS% %RESOURCE% "%~dp0*.cs"
-if %ERRORLEVEL% neq 0 (
-    echo.
-    echo BUILD FAILED ^(internal, exit code %ERRORLEVEL%^)
+    echo BUILD FAILED ^(exit code %ERRORLEVEL%^)
     exit /b %ERRORLEVEL%
 )
 
 echo.
 echo BUILD SUCCEEDED
 echo   %~dp0KekModInstaller.exe
-echo   %~dp0KekModInstaller.Internal.exe
 exit /b 0

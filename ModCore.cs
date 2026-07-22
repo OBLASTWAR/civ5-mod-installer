@@ -126,7 +126,7 @@ namespace KekModInstaller
             Id = "kekmod",
             DisplayName = "KEK Mod",
             InstalledFolderGlob = "KEK Mod v*",
-            Source = new GitHubModSource("OBLASTWAR", "kek-mod", GitHubModSource.PickAssetByProdDevRegex, true),
+            Source = new GitHubModSource("OBLASTWAR", "kek-mod", GitHubModSource.PickProdAsset, true),
             MakeFolderName = tag => "KEK Mod " + tag, // tag "v1.5-beta8" -> "KEK Mod v1.5-beta8"
             ZipTopLevelIsFinalFolderName = true,
             ZipSourceDirPrefix = null,
@@ -217,7 +217,6 @@ namespace KekModInstaller
     internal class InstallOptions
     {
         public bool WantBeta;
-        public bool WantDev;
         // Exact release tag to install (e.g. "v1.4"), from the VERSION
         // dropdown. null/empty = automatic: newest per WantBeta.
         public string TagName;
@@ -302,7 +301,7 @@ namespace KekModInstaller
             }
             progress(100);
 
-            log("Done: " + folderName);
+            log("DONE: " + folderName + " installed.");
 
             var result = new InstallResult();
             result.ModId = mod.Id;
@@ -476,7 +475,7 @@ namespace KekModInstaller
                 mod.RemoveExtra(dlcRoot, log);
             }
 
-            log("Uninstall complete.");
+            log("DONE: " + mod.DisplayName + " uninstalled.");
             progress(100);
         }
 
