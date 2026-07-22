@@ -1,8 +1,8 @@
 // GitHubModSource.cs -- IModSource backed by GitHub Releases. Parameterized
 // by repo owner/name and an asset-picking rule, so this one class can cover
-// every mod that's plain GitHub Releases even though the picking rules
-// differ (kek-mod: regex prod/dev match; a future mod might always have
-// exactly one asset per release).
+// every mod that's plain GitHub Releases even though the picking rules could
+// in principle differ (every mod today publishes exactly one asset per
+// release, via PickSoleAsset).
 
 using System;
 using System.Collections.Generic;
@@ -12,7 +12,6 @@ using System.Net;
 using System.Net.Http;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
-using System.Text.RegularExpressions;
 
 namespace KekModInstaller
 {
@@ -113,31 +112,9 @@ namespace KekModInstaller
             return mr;
         }
 
-        // gh CLI sanitizes spaces in uploaded asset filenames (observed:
-        // "kekmod prod 1.5.zip" -> "kekmod.prod.1.5.zip" on GitHub), so match
-        // "prod" as a whole word regardless of the separator (space, dot,
-        // dash, underscore) around it.
-        public static GhAsset PickProdAsset(GhRelease release, InstallOptions options)
-        {
-            var pattern = new Regex("\\bprod\\b", RegexOptions.IgnoreCase);
-            GhAsset asset = null;
-            if (release.Assets != null)
-            {
-                asset = release.Assets.FirstOrDefault(a => pattern.IsMatch(a.Name));
-            }
-            if (asset == null)
-            {
-                string found = release.Assets == null
-                    ? ""
-                    : string.Join(", ", release.Assets.Select(a => a.Name).ToArray());
-                throw new InvalidOperationException(
-                    "Release " + release.TagName + " has no asset matching \"prod\". Assets found: " + found);
-            }
-            return asset;
-        }
-
-        // Always exactly one asset per release (Tournament Mod), no
-        // prod/dev concept to pick between.
+        // Always exactly one asset per release -- the dev zip (package.sh
+        // still builds it for local LAN testing) is never published, so
+        // there's nothing to pick between.
         public static GhAsset PickSoleAsset(GhRelease release, InstallOptions options)
         {
             if (release.Assets == null || release.Assets.Count == 0)

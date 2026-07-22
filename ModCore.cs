@@ -126,7 +126,7 @@ namespace KekModInstaller
             Id = "kekmod",
             DisplayName = "KEK Mod",
             InstalledFolderGlob = "KEK Mod v*",
-            Source = new GitHubModSource("OBLASTWAR", "kek-mod", GitHubModSource.PickProdAsset, true),
+            Source = new GitHubModSource("OBLASTWAR", "kek-mod", GitHubModSource.PickSoleAsset, true),
             MakeFolderName = tag => "KEK Mod " + tag, // tag "v1.5-beta8" -> "KEK Mod v1.5-beta8"
             ZipTopLevelIsFinalFolderName = true,
             ZipSourceDirPrefix = null,
