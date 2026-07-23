@@ -596,6 +596,15 @@ namespace KekModInstaller
             return TryAutoLocateCiv5DlcFolder();
         }
 
+        // The game's install root (the folder holding CivilizationV.exe and
+        // CivilizationV_DX11.exe) -- backs MainForm's direct-exe LAUNCH
+        // DX9/DX11 buttons.
+        public static string TryGetCiv5GameFolder()
+        {
+            string assetsFolder = TryGetAssetsFolder();
+            return assetsFolder == null ? null : Path.GetDirectoryName(assetsFolder);
+        }
+
         // Points at one of the player's OWN already-installed Civ5 cursors
         // under Assets/UI/Cursors (e.g. "Pointer.ani", "Edit.ani"), never
         // bundled/redistributed by us -- same principle as running

@@ -125,7 +125,7 @@ namespace KekModInstaller
         // TryFetchLatestInstallerVersion below. Unrelated to the mod's own
         // version (release tags like "v1.5-beta8") -- this is the installer
         // program's own version.
-        private const string InstallerVersion = "1.1";
+        private const string InstallerVersion = "1.2";
 
         public static string GetInstallerVersion()
         {
@@ -412,7 +412,8 @@ namespace KekModInstaller
         private RetroButton _btnOpenFolder;
         private RetroButton _btnScanExtras;
         private RetroButton _btnClearGfx;
-        private RetroButton _btnLaunchCiv;
+        private RetroButton _btnLaunchDx9;
+        private RetroButton _btnLaunchDx11;
         private RetroButton _btnMute;
         private RetroButton _btnSettings;
         private RetroButton _btnUpdate;
@@ -678,12 +679,13 @@ namespace KekModInstaller
                 _txtLog.Cursor = civEdit;
             }
 
-            // Four buttons share this row now (was three) -- "OPEN DLC
-            // FOLDER" is the tighter rename that made room, and it names
-            // what the button actually opens anyway.
+            // Five buttons share this row now (was four) -- the single
+            // LAUNCH CIV button split into explicit DX9/DX11 buttons after
+            // Steam's rungameid launch was caught silently picking DX9 (see
+            // LaunchCiv for the story).
             _btnOpenFolder = new RetroButton();
             _btnOpenFolder.Text = "OPEN DLC FOLDER";
-            _btnOpenFolder.SetBounds(12, openFolderY, 128, openFolderHeight);
+            _btnOpenFolder.SetBounds(12, openFolderY, 122, openFolderHeight);
             _btnOpenFolder.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             _btnOpenFolder.Click += BtnOpenFolder_Click;
 
@@ -693,7 +695,7 @@ namespace KekModInstaller
             // years can review and Keep/Archive/Delete each one.
             _btnScanExtras = new RetroButton();
             _btnScanExtras.Text = "VERIFY MODS";
-            _btnScanExtras.SetBounds(146, openFolderY, 128, openFolderHeight);
+            _btnScanExtras.SetBounds(138, openFolderY, 90, openFolderHeight);
             _btnScanExtras.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             _btnScanExtras.Click += BtnScanExtras_Click;
 
@@ -702,16 +704,22 @@ namespace KekModInstaller
             // GraphicsCacheExtra.cs for the story).
             _btnClearGfx = new RetroButton();
             _btnClearGfx.Text = "CLEAR GFX CACHE";
-            _btnClearGfx.SetBounds(280, openFolderY, 128, openFolderHeight);
+            _btnClearGfx.SetBounds(232, openFolderY, 122, openFolderHeight);
             _btnClearGfx.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             _btnClearGfx.Click += BtnClearGfx_Click;
 
-            _btnLaunchCiv = new RetroButton();
-            _btnLaunchCiv.Text = "LAUNCH CIV";
-            _btnLaunchCiv.SetBounds(414, openFolderY, 130, openFolderHeight);
-            _btnLaunchCiv.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
-            _btnLaunchCiv.Click += BtnLaunchCiv_Click;
-            UpdateLaunchCivButton();
+            _btnLaunchDx9 = new RetroButton();
+            _btnLaunchDx9.Text = "LAUNCH DX9";
+            _btnLaunchDx9.SetBounds(358, openFolderY, 88, openFolderHeight);
+            _btnLaunchDx9.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+            _btnLaunchDx9.Click += BtnLaunchDx9_Click;
+
+            _btnLaunchDx11 = new RetroButton();
+            _btnLaunchDx11.Text = "LAUNCH DX11";
+            _btnLaunchDx11.SetBounds(450, openFolderY, LaunchDx11Width, openFolderHeight);
+            _btnLaunchDx11.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+            _btnLaunchDx11.Click += BtnLaunchDx11_Click;
+            UpdateLaunchCivButtons();
 
             _tickerViewport = new Panel();
             _tickerViewport.SetBounds(12, bottomStripY, 498, 20);
@@ -757,7 +765,8 @@ namespace KekModInstaller
             Controls.Add(_btnOpenFolder);
             Controls.Add(_btnScanExtras);
             Controls.Add(_btnClearGfx);
-            Controls.Add(_btnLaunchCiv);
+            Controls.Add(_btnLaunchDx9);
+            Controls.Add(_btnLaunchDx11);
             Controls.Add(_tickerViewport);
             Controls.Add(_btnMute);
             Controls.Add(_btnSettings);
@@ -1146,7 +1155,7 @@ namespace KekModInstaller
         {
             _cursorOn = !_cursorOn;
             _lblStatus.Text = "> " + _statusBase + (_cursorOn ? "_" : " ");
-            UpdateLaunchCivButton();
+            UpdateLaunchCivButtons();
         }
 
         private void TickerTimer_Tick(object sender, EventArgs e)
@@ -2027,29 +2036,48 @@ namespace KekModInstaller
             _txtLog.AppendText("Done. Caches rebuild automatically on next launch." + Environment.NewLine);
         }
 
-        // Steam AppID for Sid Meier's Civilization V -- going through Steam
-        // (rather than launching the exe directly) means Steam applies the
-        // player's own launch options/DLC selection exactly like clicking
-        // Play in the library, and handles the case where Steam itself isn't
-        // running yet.
-        private const string Civ5SteamAppId = "8930";
+        // While Civ5 runs, the DX9 button hides and the DX11 button widens
+        // across both launch slots as the red FORCE CLOSE CIV button --
+        // CursorTimer_Tick (already polling every 500ms for the status-bar
+        // blink) keeps this synced, including if the game exits or crashes
+        // on its own. The Text comparison doubles as the layout guard:
+        // bounds only move on an actual state flip, not every tick.
+        private const int LaunchDx11Width = 94;
 
-        // Same button doubles as LAUNCH CIV / FORCE CLOSE CIV depending on
-        // whether the game is currently running -- CursorTimer_Tick (already
-        // polling every 500ms for the status-bar blink) keeps the label
-        // synced, including if the game exits or crashes on its own.
-        private void UpdateLaunchCivButton()
+        private void UpdateLaunchCivButtons()
         {
             bool running = InstallerCore.IsCiv5Running();
-            string text = running ? "FORCE CLOSE CIV" : "LAUNCH CIV";
-            if (_btnLaunchCiv.Text != text)
+            string text = running ? "FORCE CLOSE CIV" : "LAUNCH DX11";
+            if (_btnLaunchDx11.Text == text)
             {
-                _btnLaunchCiv.Text = text;
-                _btnLaunchCiv.ForeColor = running ? ThemeRed : ThemeGreen;
+                return;
             }
+            _btnLaunchDx11.Text = text;
+            _btnLaunchDx11.ForeColor = running ? ThemeRed : ThemeGreen;
+            _btnLaunchDx9.Visible = !running;
+            int left = running ? _btnLaunchDx9.Left : _btnLaunchDx9.Left + _btnLaunchDx9.Width + 4;
+            int width = running ? _btnLaunchDx9.Width + 4 + LaunchDx11Width : LaunchDx11Width;
+            _btnLaunchDx11.SetBounds(left, _btnLaunchDx11.Top, width, _btnLaunchDx11.Height);
         }
 
-        private void BtnLaunchCiv_Click(object sender, EventArgs e)
+        private void BtnLaunchDx9_Click(object sender, EventArgs e)
+        {
+            LaunchCiv("CivilizationV.exe");
+        }
+
+        private void BtnLaunchDx11_Click(object sender, EventArgs e)
+        {
+            LaunchCiv("CivilizationV_DX11.exe");
+        }
+
+        // Launches the exe directly rather than via steam://rungameid/8930:
+        // the URL launch silently uses whatever renderer the logged-in Steam
+        // account last picked in Steam's chooser -- caught live 2026-07-22
+        // handing DX9 to a machine whose DX9 path draws a black map -- and a
+        // rungameid URL has no way to pin a launch option. Direct exe launch
+        // is the only way to guarantee the renderer. Steam still needs to be
+        // running for the game to boot; the game itself says so if it isn't.
+        private void LaunchCiv(string exeName)
         {
             if (InstallerCore.IsCiv5Running())
             {
@@ -2059,25 +2087,36 @@ namespace KekModInstaller
                     "Force close Civilization V",
                     MessageBoxButtons.YesNo,
                     MessageBoxIcon.Warning);
-                if (confirm != DialogResult.Yes)
+                if (confirm == DialogResult.Yes)
                 {
-                    return;
+                    InstallerCore.ForceCloseCiv5();
+                    UpdateLaunchCivButtons();
                 }
+                return;
+            }
 
-                InstallerCore.ForceCloseCiv5();
-                UpdateLaunchCivButton();
+            string gameFolder = InstallerCore.TryGetCiv5GameFolder();
+            string exePath = gameFolder == null ? null : Path.Combine(gameFolder, exeName);
+            if (exePath == null || !File.Exists(exePath))
+            {
+                MessageBox.Show(
+                    this,
+                    "Couldn't find " + exeName + " in the Civilization V install folder.",
+                    "Launch Civilization V",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Error);
                 return;
             }
 
             try
             {
-                Process.Start(new ProcessStartInfo("steam://rungameid/" + Civ5SteamAppId) { UseShellExecute = true });
+                Process.Start(new ProcessStartInfo(exePath) { WorkingDirectory = gameFolder, UseShellExecute = true });
             }
             catch (Exception ex)
             {
                 MessageBox.Show(
                     this,
-                    "Couldn't launch Civilization V via Steam: " + ex.Message,
+                    "Couldn't launch " + exeName + ": " + ex.Message,
                     "Launch Civilization V",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Error);
@@ -2225,7 +2264,7 @@ namespace KekModInstaller
     // and closes this dialog to loop around; CANCEL closes the installer
     // entirely; FORCE CLOSE returns DialogResult.Abort as a sentinel so the
     // caller can run the same confirm-then-kill path as the main window's
-    // LAUNCH CIV/FORCE CLOSE CIV button, rather than duplicating that
+    // launch/FORCE CLOSE CIV buttons, rather than duplicating that
     // confirmation inside this dialog.
     internal class Civ5RunningForm : Form
     {
