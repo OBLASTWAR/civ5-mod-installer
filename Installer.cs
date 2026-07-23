@@ -1204,7 +1204,7 @@ namespace KekModInstaller
 
                 bool installed = _installedModIds.Contains(mod.Id);
                 row.Indicator.Text = installed ? filled : hollow;
-                row.Indicator.ForeColor = installed ? ThemeGreen : ThemeDim;
+                row.Indicator.ForeColor = installed ? ThemeGreen : ThemeMagenta;
                 row.NameLabel.ForeColor = installed ? ThemeGreen : ThemeMagenta;
 
                 string installedVersion;
@@ -1251,7 +1251,7 @@ namespace KekModInstaller
                 {
                     bool extraInstalled = mod.ExtraModId != null && _installedModIds.Contains(mod.ExtraModId);
                     row.ExtraIndicator.Text = extraInstalled ? filled : hollow;
-                    row.ExtraIndicator.ForeColor = extraInstalled ? ThemeGreen : ThemeDim;
+                    row.ExtraIndicator.ForeColor = extraInstalled ? ThemeGreen : ThemeMagenta;
                     row.ExtraNameLabel.ForeColor = extraInstalled ? ThemeGreen : ThemeMagenta;
 
                     string extraVersion;
@@ -1282,7 +1282,7 @@ namespace KekModInstaller
                 bool mismatch = active && _installedEuiVersionMismatch;
 
                 _euiRows[i].Indicator.Text = !active ? "○" : (mismatch ? "⚠" : "●");
-                _euiRows[i].Indicator.ForeColor = !active ? ThemeDim : (mismatch ? ThemeRed : ThemeGreen);
+                _euiRows[i].Indicator.ForeColor = !active ? ThemeMagenta : (mismatch ? ThemeRed : ThemeGreen);
                 _euiRows[i].NameLabel.ForeColor = !active ? ThemeMagenta : (mismatch ? ThemeRed : ThemeGreen);
                 // Mismatch means the installed copy is NOT confirmed to be
                 // DisplayVersion -- showing that version number alongside
