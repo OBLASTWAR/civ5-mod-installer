@@ -679,13 +679,18 @@ namespace KekModInstaller
                 _txtLog.Cursor = civEdit;
             }
 
-            // Five buttons share this row now (was four) -- the single
-            // LAUNCH CIV button split into explicit DX9/DX11 buttons after
-            // Steam's rungameid launch was caught silently picking DX9 (see
-            // LaunchCiv for the story).
+            // Three buttons fill this row -- was five with the DX9/DX11
+            // launch buttons, but those are hidden for now (see their
+            // Controls.Add call below), so the remaining three stretch to
+            // fill the freed-up width instead of leaving a gap.
+            int rowGap = 4;
+            int rowWidth = _txtLog.Width;
+            int btnWidth = (rowWidth - 2 * rowGap) / 3;
+            int btnWidth1 = rowWidth - 2 * (btnWidth + rowGap); // remainder to the last button
+
             _btnOpenFolder = new RetroButton();
             _btnOpenFolder.Text = "OPEN DLC FOLDER";
-            _btnOpenFolder.SetBounds(12, openFolderY, 122, openFolderHeight);
+            _btnOpenFolder.SetBounds(12, openFolderY, btnWidth, openFolderHeight);
             _btnOpenFolder.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             _btnOpenFolder.Click += BtnOpenFolder_Click;
 
@@ -695,7 +700,7 @@ namespace KekModInstaller
             // years can review and Keep/Archive/Delete each one.
             _btnScanExtras = new RetroButton();
             _btnScanExtras.Text = "VERIFY MODS";
-            _btnScanExtras.SetBounds(138, openFolderY, 90, openFolderHeight);
+            _btnScanExtras.SetBounds(12 + btnWidth + rowGap, openFolderY, btnWidth, openFolderHeight);
             _btnScanExtras.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             _btnScanExtras.Click += BtnScanExtras_Click;
 
@@ -704,7 +709,7 @@ namespace KekModInstaller
             // GraphicsCacheExtra.cs for the story).
             _btnClearGfx = new RetroButton();
             _btnClearGfx.Text = "CLEAR GFX CACHE";
-            _btnClearGfx.SetBounds(232, openFolderY, 122, openFolderHeight);
+            _btnClearGfx.SetBounds(12 + 2 * (btnWidth + rowGap), openFolderY, btnWidth1, openFolderHeight);
             _btnClearGfx.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             _btnClearGfx.Click += BtnClearGfx_Click;
 
