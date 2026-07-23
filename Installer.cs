@@ -125,7 +125,7 @@ namespace KekModInstaller
         // TryFetchLatestInstallerVersion below. Unrelated to the mod's own
         // version (release tags like "v1.5-beta8") -- this is the installer
         // program's own version.
-        private const string InstallerVersion = "1.2";
+        private const string InstallerVersion = "1.3";
 
         public static string GetInstallerVersion()
         {
@@ -765,8 +765,13 @@ namespace KekModInstaller
             Controls.Add(_btnOpenFolder);
             Controls.Add(_btnScanExtras);
             Controls.Add(_btnClearGfx);
-            Controls.Add(_btnLaunchDx9);
-            Controls.Add(_btnLaunchDx11);
+            // LAUNCH DX9/DX11 buttons hidden for release -- direct-exe launch
+            // (see LaunchCiv) still isn't reliably forcing the renderer on
+            // every machine tested 2026-07-22. Code kept intact for when
+            // that gets debugged; just not added to Controls so they never
+            // render or receive clicks.
+            // Controls.Add(_btnLaunchDx9);
+            // Controls.Add(_btnLaunchDx11);
             Controls.Add(_tickerViewport);
             Controls.Add(_btnMute);
             Controls.Add(_btnSettings);
