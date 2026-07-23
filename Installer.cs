@@ -319,7 +319,6 @@ namespace KekModInstaller
             public Panel Box;
             public Label Indicator;
             public Label NameLabel;
-            public Label UpdateIcon; // shown only when an update is available -- see UpdateModRowStyles
             public Label ExtraIndicator; // null if this mod has no bonus component
             public Label ExtraNameLabel; // null if this mod has no bonus component
             public RetroButton InstallButton;
@@ -344,8 +343,8 @@ namespace KekModInstaller
         // here just shows its name with no version suffix.
         private readonly Dictionary<string, string> _installedExtraVersionByModId = new Dictionary<string, string>();
         // Mods where what's installed isn't what auto-install would pick
-        // right now (see IsUpdateAvailable) -- shown as a small badge next
-        // to the mod's name.
+        // right now (see IsUpdateAvailable) -- turns that mod's INSTALL
+        // button into an UPDATE button, see UpdateModRowStyles.
         private readonly HashSet<string> _updateAvailableModIds = new HashSet<string>();
 
         // EUI section: same per-box-buttons treatment as the mod boxes --
@@ -864,23 +863,8 @@ namespace KekModInstaller
             box.Controls.Add(versionBtn);
             row.VersionButton = versionBtn;
 
-            // Small badge shown only when IsUpdateAvailable finds a newer
-            // release than what's installed -- see UpdateModRowStyles.
-            const int updateIconW = 26;
-            int updateIconX = btnsX - 8 - updateIconW;
-
-            var updateIcon = new Label();
-            updateIcon.SetBounds(updateIconX, 13, updateIconW, 26);
-            updateIcon.Font = new Font("Consolas", 15F, FontStyle.Bold);
-            updateIcon.TextAlign = ContentAlignment.MiddleCenter;
-            updateIcon.ForeColor = ThemeRed;
-            updateIcon.BackColor = Color.Black;
-            _tooltip.SetToolTip(updateIcon, "New version available");
-            box.Controls.Add(updateIcon);
-            row.UpdateIcon = updateIcon;
-
             var nameLabel = new Label();
-            nameLabel.SetBounds(34, 18, updateIconX - 4 - 34, 20);
+            nameLabel.SetBounds(34, 18, btnsX - 4 - 34, 20);
             nameLabel.Text = mod.DisplayName;
             nameLabel.Font = new Font("Consolas", 9F, FontStyle.Bold);
             nameLabel.ForeColor = ThemeGreen;
@@ -953,7 +937,7 @@ namespace KekModInstaller
             row.InstallButton = installBtn;
 
             var removeBtn = new RetroButton();
-            removeBtn.Text = "REMOVE";
+            removeBtn.Text = "UNINSTALL";
             removeBtn.Font = new Font("Consolas", 7F, FontStyle.Bold);
             removeBtn.SetBounds(btnsX + (btnW + btnGap), 16, btnW, btnH);
             removeBtn.Enabled = false; // enabled once install-state detection finds this variant active
@@ -1210,15 +1194,20 @@ namespace KekModInstaller
                     : mod.DisplayName;
 
                 bool updateAvailable = _updateAvailableModIds.Contains(mod.Id);
-                row.UpdateIcon.Text = updateAvailable ? "▲" : "";
-                row.UpdateIcon.Visible = updateAvailable;
 
                 // Relabeled rather than disabled once installed -- INSTALL
                 // stays a valid action against an already-installed mod (it's
                 // how a corrupted/incomplete install gets fixed, or how a
                 // different VERSION pick gets applied), just worded for what
-                // it'll actually do at that point.
-                row.InstallButton.Text = installed ? "REINSTALL" : "INSTALL";
+                // it'll actually do at that point. When a newer release
+                // exists it becomes UPDATE instead -- same click handler
+                // (OnModInstallClick), just relabeled/recolored so the row
+                // itself is the call to action instead of a separate passive
+                // badge. No extra confirmation on click: OnModInstallClick's
+                // only popup path is for switching to a DIFFERENT, conflicting
+                // mod, which can't apply when updating the mod already
+                // installed.
+                row.InstallButton.Text = updateAvailable ? "UPDATE" : (installed ? "REINSTALL" : "INSTALL");
                 if (!_actionInProgress)
                 {
                     row.InstallButton.Enabled = true;
@@ -1228,10 +1217,12 @@ namespace KekModInstaller
 
                 // Border green once installed (matches the box's own
                 // border), text pink while not -- see RetroButton.BorderColor.
+                // UPDATE overrides both to red so it stands out over the
+                // ordinary installed styling.
                 Color? btnBorder = installed ? ThemeGreen : (Color?)null;
                 Color btnText = installed ? ThemeGreen : ThemeMagenta;
-                row.InstallButton.BorderColor = btnBorder;
-                row.InstallButton.ForeColor = btnText;
+                row.InstallButton.BorderColor = updateAvailable ? ThemeRed : btnBorder;
+                row.InstallButton.ForeColor = updateAvailable ? ThemeRed : btnText;
                 row.UninstallButton.BorderColor = btnBorder;
                 row.UninstallButton.ForeColor = btnText;
                 row.VersionButton.BorderColor = btnBorder;
@@ -1317,11 +1308,16 @@ namespace KekModInstaller
         {
             // Beta on/off is read live by each mod's own VERSION popup
             // (OnModVersionClick) every time it's opened, so there's nothing
-            // to refresh here -- no shared dropdown left to keep in sync.
+            // to refresh there. But it also feeds IsUpdateAvailable (the
+            // same beta-aware pick auto-install would make), so toggling it
+            // can flip a mod between INSTALL/REINSTALL and UPDATE --
+            // refresh local state to pick that up. Local-only, so cheap
+            // enough to run even if the checkbox didn't actually change.
             using (var dlg = new SettingsForm())
             {
                 dlg.ShowDialog(this);
             }
+            RefreshLocalState();
         }
 
         // Downloads the new installer exe and relaunches -- see
@@ -1336,19 +1332,6 @@ namespace KekModInstaller
                 return;
             }
 
-            DialogResult confirm = MessageBox.Show(
-                this,
-                "A new installer version (" + _latestInstallerVersion + ") is available. Download it now? "
-                    + "The installer will close and restart automatically.",
-                "Update available",
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Information);
-            if (confirm != DialogResult.Yes)
-            {
-                return;
-            }
-
-            string previousStatus = _statusBase;
             try
             {
                 _btnUpdate.Enabled = false;
@@ -1359,9 +1342,7 @@ namespace KekModInstaller
             catch (Exception ex)
             {
                 _btnUpdate.Enabled = true;
-                SetStatus(previousStatus);
-                MessageBox.Show(this, "Update failed: " + ex.Message, "Update available",
-                    MessageBoxButtons.OK, MessageBoxIcon.Error);
+                SetStatus("UPDATE FAILED: " + ex.Message);
             }
         }
 
@@ -2374,7 +2355,8 @@ namespace KekModInstaller
         }
     }
 
-    // Small modal dialog reached only via MainForm's gear button. "Enable
+    // Small modal dialog reached only via MainForm's gear button -- generic
+    // home for misc installer settings, currently just beta opt-in. "Enable
     // beta builds" is the sole way to surface beta tags in each mod's own
     // VERSION popup (see VersionPickerForm) and have Install consider them
     // (see OnModInstallClick).
@@ -2385,14 +2367,17 @@ namespace KekModInstaller
         public SettingsForm()
         {
             Text = "CIV V MOD INSTALLER // SETTINGS";
-            ClientSize = new Size(320, 150);
+            ClientSize = new Size(320, 120);
             StartPosition = FormStartPosition.CenterParent;
             FormBorderStyle = FormBorderStyle.FixedDialog;
             MaximizeBox = false;
             MinimizeBox = false;
             BackColor = Color.Black;
 
-            Panel pnlBeta = MainForm.MakeRetroBox("BETA", 12, 12, 296, 60);
+            // Generic "SETTINGS" container -- this is where every misc
+            // installer setting lives, not just beta, so it's titled for the
+            // whole page rather than this one checkbox.
+            Panel pnlSettings = MainForm.MakeRetroBox("SETTINGS", 12, 12, 296, 60);
 
             _chkShowBeta = new CheckBox();
             _chkShowBeta.Text = "Enable beta builds";
@@ -2401,27 +2386,19 @@ namespace KekModInstaller
             _chkShowBeta.BackColor = Color.Black;
             _chkShowBeta.Font = new Font("Consolas", 8.5F);
             _chkShowBeta.Checked = SettingsManager.GetShowBeta();
-            pnlBeta.Controls.Add(_chkShowBeta);
-
-            var lblHint = new Label();
-            lblHint.SetBounds(12, 80, 296, 32);
-            lblHint.Text = "Shows beta tags in VERSION and includes\r\nthem in auto-install. Off by default.";
-            lblHint.Font = new Font("Consolas", 7.5F);
-            lblHint.ForeColor = MainForm.ThemeMagenta;
-            lblHint.BackColor = Color.Black;
+            pnlSettings.Controls.Add(_chkShowBeta);
 
             var btnOk = new MainForm.RetroButton();
             btnOk.Text = "OK";
-            btnOk.SetBounds(126, 116, 90, 26);
+            btnOk.SetBounds(126, 82, 90, 26);
             btnOk.Click += BtnOk_Click;
 
             var btnCancel = new MainForm.RetroButton();
             btnCancel.Text = "CANCEL";
-            btnCancel.SetBounds(220, 116, 88, 26);
+            btnCancel.SetBounds(220, 82, 88, 26);
             btnCancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
 
-            Controls.Add(pnlBeta);
-            Controls.Add(lblHint);
+            Controls.Add(pnlSettings);
             Controls.Add(btnOk);
             Controls.Add(btnCancel);
 
