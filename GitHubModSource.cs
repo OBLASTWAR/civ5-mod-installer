@@ -64,10 +64,9 @@ namespace KekModInstaller
 
         public ModRelease ResolveRelease(InstallOptions options)
         {
-            List<GhRelease> releases = FetchReleases(_owner, _repo);
-
             if (!string.IsNullOrEmpty(options.TagName))
             {
+                List<GhRelease> releases = FetchReleases(_owner, _repo);
                 GhRelease byTag = releases.FirstOrDefault(
                     r => string.Equals(r.TagName, options.TagName, StringComparison.OrdinalIgnoreCase));
                 if (byTag == null)
@@ -80,13 +79,19 @@ namespace KekModInstaller
 
             if (!_supportsBetaChannel)
             {
-                return ToModRelease(releases[0]); // newest overall -- no beta channel to filter on
+                // Don't assume releases[0] from the list matches GitHub's own
+                // "Latest" designation -- some mods (catscats' tournament map
+                // pack) don't publish releases in order, so the newest entry
+                // by list order can differ from whichever release GitHub
+                // itself marks Latest. Ask GitHub directly instead.
+                return ToModRelease(FetchLatestRelease(_owner, _repo));
             }
 
             // GitHub returns releases newest-first. WantBeta takes the newest
             // release of any kind; otherwise the newest one that isn't a
             // prerelease.
-            GhRelease chosen = options.WantBeta ? releases[0] : releases.FirstOrDefault(r => !r.Prerelease);
+            List<GhRelease> allReleases = FetchReleases(_owner, _repo);
+            GhRelease chosen = options.WantBeta ? allReleases[0] : allReleases.FirstOrDefault(r => !r.Prerelease);
             if (chosen == null)
             {
                 throw new InvalidOperationException(
@@ -149,6 +154,35 @@ namespace KekModInstaller
                             "No releases found for " + owner + "/" + repo + ". Has anything been published yet?");
                     }
                     return releases;
+                }
+            }
+        }
+
+        public static GhRelease FetchLatestRelease(string owner, string repo)
+        {
+            string url = "https://api.github.com/repos/" + owner + "/" + repo + "/releases/latest";
+            using (var client = new HttpClient())
+            {
+                client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
+                client.DefaultRequestHeaders.Add("Accept", "application/vnd.github+json");
+
+                HttpResponseMessage response = client.GetAsync(url).GetAwaiter().GetResult();
+                if (!response.IsSuccessStatusCode)
+                {
+                    if (response.StatusCode == HttpStatusCode.NotFound)
+                    {
+                        throw new InvalidOperationException(
+                            "No \"Latest\" release found for " + owner + "/" + repo
+                            + ". Every release may be marked as a prerelease or draft.");
+                    }
+                    throw new InvalidOperationException(DescribeError(response, owner, repo));
+                }
+
+                byte[] body = response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+                var serializer = new DataContractJsonSerializer(typeof(GhRelease));
+                using (var stream = new MemoryStream(body))
+                {
+                    return (GhRelease)serializer.ReadObject(stream);
                 }
             }
         }
