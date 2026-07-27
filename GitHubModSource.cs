@@ -59,7 +59,42 @@ namespace KekModInstaller
 
         public List<ModRelease> ListReleases()
         {
-            return FetchReleases(_owner, _repo).Select(ToModRelease).ToList();
+            List<GhRelease> releases = FetchReleases(_owner, _repo);
+            if (!_supportsBetaChannel)
+            {
+                // Keep this list's "newest first" contract honest for mods
+                // whose releases[0] we can't trust (see ResolveRelease) --
+                // this cached list is also what IsUpdateAvailable and the
+                // VERSION picker's "Latest (auto)" entry use, so if it stays
+                // in raw list order those get the same wrong-latest bug even
+                // though installing itself (ResolveRelease) is now fixed.
+                MoveLatestToFront(releases);
+            }
+            return releases.Select(ToModRelease).ToList();
+        }
+
+        // Best-effort: a failed extra lookup just leaves the list in its
+        // original (occasionally wrong) order rather than failing the whole
+        // release list fetch.
+        private void MoveLatestToFront(List<GhRelease> releases)
+        {
+            GhRelease latest;
+            try
+            {
+                latest = FetchLatestRelease(_owner, _repo);
+            }
+            catch (Exception)
+            {
+                return;
+            }
+
+            int idx = releases.FindIndex(
+                r => string.Equals(r.TagName, latest.TagName, StringComparison.OrdinalIgnoreCase));
+            if (idx > 0)
+            {
+                releases.RemoveAt(idx);
+                releases.Insert(0, latest);
+            }
         }
 
         public ModRelease ResolveRelease(InstallOptions options)
