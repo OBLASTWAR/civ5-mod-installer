@@ -125,7 +125,7 @@ namespace KekModInstaller
         // TryFetchLatestInstallerVersion below. Unrelated to the mod's own
         // version (release tags like "v1.5-beta8") -- this is the installer
         // program's own version.
-        private const string InstallerVersion = "1.6";
+        private const string InstallerVersion = "1.7";
 
         public static string GetInstallerVersion()
         {
@@ -1849,22 +1849,6 @@ namespace KekModInstaller
         private void OnModUninstallClick(ModDefinition mod)
         {
             if (_actionInProgress)
-            {
-                return;
-            }
-
-            // InstallerCore.Uninstall calls mod.RemoveExtra unconditionally
-            // for any mod that has one (Fish Map Script, Better Pangaea,
-            // Lekmap), so the confirm dialog should mention it for whichever
-            // mod this is, not just kek-mod specifically.
-            string extraNote = mod.ExtraDisplayName != null ? " and the " + mod.ExtraDisplayName : "";
-            DialogResult confirm = MessageBox.Show(
-                this,
-                "Remove all installed " + mod.DisplayName + " versions" + extraNote + " from your Civilization V install?",
-                "Uninstall " + mod.DisplayName,
-                MessageBoxButtons.YesNo,
-                MessageBoxIcon.Warning);
-            if (confirm != DialogResult.Yes)
             {
                 return;
             }
