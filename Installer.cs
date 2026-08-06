@@ -125,7 +125,7 @@ namespace KekModInstaller
         // TryFetchLatestInstallerVersion below. Unrelated to the mod's own
         // version (release tags like "v1.5-beta8") -- this is the installer
         // program's own version.
-        private const string InstallerVersion = "1.7";
+        private const string InstallerVersion = "1.8";
 
         public static string GetInstallerVersion()
         {
@@ -1803,10 +1803,24 @@ namespace KekModInstaller
                 return;
             }
 
+            // UPDATE means "get the latest" regardless of whatever tag a
+            // previous VERSION popup pick left in _selectedVersionTagByModId
+            // -- otherwise clicking UPDATE just re-downloads that stale
+            // pinned version instead of advancing past it. Clear the
+            // override here too, so it doesn't linger and cause the same
+            // thing on the next update.
+            bool isUpdate = _updateAvailableModIds.Contains(mod.Id);
+            if (isUpdate)
+            {
+                _selectedVersionTagByModId.Remove(mod.Id);
+            }
+
             var options = new InstallOptions();
             options.WantBeta = SettingsManager.GetShowBeta();
             string tag;
-            options.TagName = _selectedVersionTagByModId.TryGetValue(mod.Id, out tag) ? tag : null;
+            options.TagName = isUpdate
+                ? null
+                : (_selectedVersionTagByModId.TryGetValue(mod.Id, out tag) ? tag : null);
 
             if (mod.Id == ModRegistry.TournamentMod.Id && _installedEuiVariantId == "eui_xits"
                 && !ConfirmTournamentModXitsConflict())
