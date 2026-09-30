@@ -412,6 +412,7 @@ namespace KekModInstaller
         private RetroButton _btnOpenFolder;
         private RetroButton _btnScanExtras;
         private RetroButton _btnClearGfx;
+        private RetroButton _btnResetGame;
         private RetroButton _btnLaunchDx9;
         private RetroButton _btnLaunchDx11;
         private RetroButton _btnMute;
@@ -426,6 +427,7 @@ namespace KekModInstaller
         private BackgroundWorker _worker;
         private BackgroundWorker _statusWorker;
         private BackgroundWorker _uninstallWorker;
+        private BackgroundWorker _resetWorker;
         private Timer _tickerTimer;
         private Timer _cursorTimer;
         private ToolTip _tooltip;
@@ -679,14 +681,14 @@ namespace KekModInstaller
                 _txtLog.Cursor = civEdit;
             }
 
-            // Three buttons fill this row -- was five with the DX9/DX11
-            // launch buttons, but those are hidden for now (see their
-            // Controls.Add call below), so the remaining three stretch to
-            // fill the freed-up width instead of leaving a gap.
+            // Four buttons fill this row -- the DX9/DX11 launch buttons are
+            // hidden for now (see their Controls.Add call below), so the
+            // rest stretch to fill the freed-up width instead of leaving a
+            // gap.
             int rowGap = 4;
             int rowWidth = _txtLog.Width;
-            int btnWidth = (rowWidth - 2 * rowGap) / 3;
-            int btnWidth1 = rowWidth - 2 * (btnWidth + rowGap); // remainder to the last button
+            int btnWidth = (rowWidth - 3 * rowGap) / 4;
+            int btnWidth1 = rowWidth - 3 * (btnWidth + rowGap); // remainder to the last button
 
             _btnOpenFolder = new RetroButton();
             _btnOpenFolder.Text = "OPEN DLC FOLDER";
@@ -709,9 +711,19 @@ namespace KekModInstaller
             // GraphicsCacheExtra.cs for the story).
             _btnClearGfx = new RetroButton();
             _btnClearGfx.Text = "CLEAR GFX CACHE";
-            _btnClearGfx.SetBounds(12 + 2 * (btnWidth + rowGap), openFolderY, btnWidth1, openFolderHeight);
+            _btnClearGfx.SetBounds(12 + 2 * (btnWidth + rowGap), openFolderY, btnWidth, openFolderHeight);
             _btnClearGfx.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
             _btnClearGfx.Click += BtnClearGfx_Click;
+
+            // Last resort: deletes the whole game folder so Steam downloads
+            // it again (see GameResetExtra.cs). Red, like FORCE CLOSE --
+            // the one button here that can't be undone.
+            _btnResetGame = new RetroButton();
+            _btnResetGame.Text = "REDOWNLOAD CIV";
+            _btnResetGame.ForeColor = ThemeRed;
+            _btnResetGame.SetBounds(12 + 3 * (btnWidth + rowGap), openFolderY, btnWidth1, openFolderHeight);
+            _btnResetGame.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
+            _btnResetGame.Click += BtnResetGame_Click;
 
             _btnLaunchDx9 = new RetroButton();
             _btnLaunchDx9.Text = "LAUNCH DX9";
@@ -770,6 +782,7 @@ namespace KekModInstaller
             Controls.Add(_btnOpenFolder);
             Controls.Add(_btnScanExtras);
             Controls.Add(_btnClearGfx);
+            Controls.Add(_btnResetGame);
             // LAUNCH DX9/DX11 buttons hidden for release -- direct-exe launch
             // (see LaunchCiv) still isn't reliably forcing the renderer on
             // every machine tested 2026-07-22. Code kept intact for when
@@ -799,6 +812,12 @@ namespace KekModInstaller
             _euiWorker.DoWork += EuiWorker_DoWork;
             _euiWorker.ProgressChanged += Worker_ProgressChanged;
             _euiWorker.RunWorkerCompleted += EuiWorker_RunWorkerCompleted;
+
+            _resetWorker = new BackgroundWorker();
+            _resetWorker.WorkerReportsProgress = true;
+            _resetWorker.DoWork += ResetWorker_DoWork;
+            _resetWorker.ProgressChanged += Worker_ProgressChanged;
+            _resetWorker.RunWorkerCompleted += ResetWorker_RunWorkerCompleted;
 
             _statusWorker = new BackgroundWorker();
             _statusWorker.DoWork += StatusWorker_DoWork;
@@ -1346,7 +1365,7 @@ namespace KekModInstaller
         // from disk.
         private void BtnUpdate_Click(object sender, EventArgs e)
         {
-            if (_worker.IsBusy || _uninstallWorker.IsBusy)
+            if (_worker.IsBusy || _uninstallWorker.IsBusy || _resetWorker.IsBusy)
             {
                 return;
             }
@@ -2044,6 +2063,150 @@ namespace KekModInstaller
             _txtLog.AppendText("Done. Caches rebuild automatically on next launch." + Environment.NewLine);
         }
 
+        // Deletes the whole game folder, then has Steam download it again
+        // -- see GameResetExtra.cs for why Steam's own verify/uninstall
+        // don't cover this. Typed confirmation first: this is the one
+        // action in the installer that can't be undone.
+        private void BtnResetGame_Click(object sender, EventArgs e)
+        {
+            if (_actionInProgress)
+            {
+                return;
+            }
+            if (InstallerCore.IsCiv5Running())
+            {
+                MessageBox.Show(
+                    this,
+                    "Civilization V is currently running. Close the game first, then redownload it.",
+                    "Redownload Civ",
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+
+            string reason;
+            string gameFolder = GameReset.ResolveGameFolder(out reason);
+            if (gameFolder == null)
+            {
+                MessageBox.Show(this, reason, "Redownload Civ", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            long bytes;
+            Cursor = Cursors.WaitCursor;
+            try
+            {
+                bytes = GameReset.MeasureBytes(gameFolder);
+            }
+            finally
+            {
+                Cursor = Cursors.Default;
+            }
+
+            using (var dlg = new ResetGameForm(gameFolder, bytes))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK)
+                {
+                    return;
+                }
+            }
+
+            // Re-checked after the dialog: the player may have started the
+            // game while it was open.
+            if (InstallerCore.IsCiv5Running())
+            {
+                MessageBox.Show(this, "Civilization V was started -- redownload cancelled.", "Redownload Civ",
+                    MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+
+            SetControlsEnabled(false);
+            _progress.Value = 0;
+            SetStatus("DELETING GAME FILES...");
+            _txtLog.AppendText("=== REDOWNLOAD CIV ===" + Environment.NewLine);
+            _resetWorker.RunWorkerAsync(gameFolder);
+        }
+
+        private void ResetWorker_DoWork(object sender, DoWorkEventArgs e)
+        {
+            var gameFolder = (string)e.Argument;
+            var worker = (BackgroundWorker)sender;
+            int lastPercent = 0;
+            Action<string> log = msg => worker.ReportProgress(lastPercent, msg);
+            Action<int> progress = pct => { lastPercent = pct; worker.ReportProgress(pct, null); };
+
+            // Checked before deleting: once the folder is gone there's no
+            // way to tell whether Steam still tracks the game.
+            bool tracked = GameReset.SteamStillTracksGame(gameFolder);
+
+            GameResetResult result = GameReset.DeleteGameFolder(gameFolder, log, progress);
+            log(result.FilesDeleted + " files deleted"
+                + (result.FilesSkipped > 0 ? ", " + result.FilesSkipped + " in use/skipped" : "") + ".");
+            foreach (string f in result.Leftovers)
+            {
+                log("  couldn't delete: " + f);
+            }
+
+            // Same safe cache wipe as CLEAR GFX CACHE -- Civ5's cached DBs
+            // would otherwise outlive the reinstall.
+            int cacheFiles = 0;
+            foreach (GraphicsCacheResult r in GraphicsCacheClear.ClearAll())
+            {
+                cacheFiles += r.FilesDeleted;
+            }
+            log("Caches cleared (" + cacheFiles + " files).");
+
+            e.Result = new object[] { result, tracked };
+        }
+
+        private void ResetWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
+        {
+            SetControlsEnabled(true);
+
+            if (e.Error != null)
+            {
+                SetStatus("FAILED: " + e.Error.Message);
+                _txtLog.AppendText(Environment.NewLine + "ERROR: " + e.Error.Message + Environment.NewLine);
+                RefreshLocalState();
+                return;
+            }
+
+            var pair = (object[])e.Result;
+            var result = (GameResetResult)pair[0];
+            bool tracked = (bool)pair[1];
+
+            if (!result.FolderRemoved)
+            {
+                // Steam can still restore stock files, but whatever was
+                // locked may be exactly the leftover causing trouble -- say
+                // so instead of reporting success.
+                SetStatus("DELETE INCOMPLETE -- SEE LOG");
+                _txtLog.AppendText("Some files were in use and couldn't be deleted. Close Steam and anything"
+                    + " open in the game folder, then run REDOWNLOAD CIV again." + Environment.NewLine);
+            }
+            else
+            {
+                SetStatus("GAME FILES DELETED.");
+            }
+
+            // validate re-downloads everything missing while Steam still
+            // has the appmanifest; install is the way back in without it.
+            string url = "steam://" + (tracked ? "validate/" : "install/") + GameReset.SteamAppId;
+            _txtLog.AppendText("Asking Steam to download the game again (" + url + ")." + Environment.NewLine
+                + "When the download finishes, reinstall your mods and EUI here." + Environment.NewLine);
+            try
+            {
+                Process.Start(url);
+            }
+            catch (Exception ex)
+            {
+                _txtLog.AppendText("Couldn't open Steam (" + ex.Message + "). In Steam: right-click Civilization V"
+                    + " > Properties > Installed Files > Verify integrity of game files." + Environment.NewLine);
+            }
+
+            RefreshLocalState();
+        }
+
         // While Civ5 runs, the DX9 button hides and the DX11 button widens
         // across both launch slots as the red FORCE CLOSE CIV button --
         // CursorTimer_Tick (already polling every 500ms for the status-bar
@@ -2319,6 +2482,75 @@ namespace KekModInstaller
             Controls.Add(btnCancel);
             AcceptButton = btnRetry;
             CancelButton = btnCancel;
+        }
+    }
+
+    // Typed confirmation for REDOWNLOAD CIV. REDOWNLOAD stays disabled until the
+    // player types DELETE -- a click-through OK is too easy for the one
+    // action here that can't be undone.
+    internal class ResetGameForm : Form
+    {
+        private const string ConfirmWord = "DELETE";
+
+        public ResetGameForm(string gameFolder, long bytes)
+        {
+            Text = "CIV V MOD INSTALLER";
+            ClientSize = new Size(460, 250);
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = false;
+            MinimizeBox = false;
+            BackColor = Color.Black;
+
+            Panel pnl = MainForm.MakeRetroBox("REDOWNLOAD CIV", 12, 12, 436, 176, () => MainForm.ThemeRed);
+
+            var lbl = new Label();
+            lbl.SetBounds(12, 18, 412, 116);
+            lbl.BackColor = Color.Black;
+            lbl.ForeColor = MainForm.ThemeGreen;
+            lbl.Font = new Font("Consolas", 9F);
+            lbl.Text = "Deletes the ENTIRE game folder:\r\n"
+                + gameFolder + "\r\n\r\n"
+                + "Steam then downloads it again (" + (bytes / (1024 * 1024 * 1024.0)).ToString("0.0") + " GB).\r\n"
+                + "Every mod and EUI in it is removed. Saves and settings\r\n"
+                + "in Documents are kept.";
+            pnl.Controls.Add(lbl);
+
+            var prompt = new Label();
+            prompt.SetBounds(12, 140, 200, 22);
+            prompt.BackColor = Color.Black;
+            prompt.ForeColor = MainForm.ThemeRed;
+            prompt.Font = new Font("Consolas", 9F, FontStyle.Bold);
+            prompt.Text = "Type " + ConfirmWord + " to confirm:";
+            pnl.Controls.Add(prompt);
+
+            var txt = new TextBox();
+            txt.SetBounds(212, 137, 120, 22);
+            txt.BackColor = Color.Black;
+            txt.ForeColor = MainForm.ThemeRed;
+            txt.BorderStyle = BorderStyle.FixedSingle;
+            txt.Font = new Font("Consolas", 9F, FontStyle.Bold);
+            txt.CharacterCasing = CharacterCasing.Upper;
+            pnl.Controls.Add(txt);
+
+            var btnReset = new MainForm.RetroButton();
+            btnReset.Text = "REDOWNLOAD";
+            btnReset.ForeColor = MainForm.ThemeRed;
+            btnReset.Enabled = false;
+            btnReset.SetBounds(12, 202, 120, 30);
+            btnReset.Click += (s, e) => { DialogResult = DialogResult.OK; Close(); };
+            txt.TextChanged += (s, e) => btnReset.Enabled = txt.Text.Trim() == ConfirmWord;
+
+            var btnCancel = new MainForm.RetroButton();
+            btnCancel.Text = "CANCEL";
+            btnCancel.SetBounds(328, 202, 120, 30);
+            btnCancel.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
+
+            Controls.Add(pnl);
+            Controls.Add(btnReset);
+            Controls.Add(btnCancel);
+            CancelButton = btnCancel; // no AcceptButton: Enter must never confirm this
+            ActiveControl = txt;
         }
     }
 
