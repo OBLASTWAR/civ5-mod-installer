@@ -1,0 +1,3450 @@
+#!/usr/bin/env python3
+# civ5-mod-installer -- Civ V Mod Installer, Linux (Proton) edition of KekModInstaller.exe.
+#
+#   ./civ5-mod-installer                              full-screen installer (same as `tui`)
+#   ./civ5-mod-installer status                       what's installed, updates, checks
+#   ./civ5-mod-installer install kekmod               latest release (also: tournament, lekmod)
+#   ./civ5-mod-installer install kekmod --version v2.0
+#   ./civ5-mod-installer uninstall kekmod
+#   ./civ5-mod-installer versions kekmod              list published releases
+#   ./civ5-mod-installer eui install [eui|xits]       / eui uninstall
+#   ./civ5-mod-installer verify                       checks + unrecognized mod folders
+#   ./civ5-mod-installer clear-cache                  shader caches + Civ V's cached DBs
+#   ./civ5-mod-installer redownload                   delete the game, have Steam fetch it
+#   ./civ5-mod-installer launch | kill | open         start Civ V / force close it / open DLC folder
+#   ./civ5-mod-installer settings --beta on           persistent settings
+#   ./civ5-mod-installer self-update
+#   ./civ5-mod-installer install-self | uninstall-self
+#   (see --help, or `<command> --help`)
+#
+# Players install it with one line; afterwards it's just `civ5-mod-installer`:
+#   curl -fsSL https://raw.githubusercontent.com/OBLASTWAR/kek-mod/main/installer/linux/civ5-mod-installer | python3 - install-self
+#
+# Mirrors installer/*.cs feature for feature: three mutually exclusive mods,
+# each with its bonus map (Fish Map Script / Better Pangaea / Lekmap), the two
+# bundled EUI variants, VERIFY MODS, CLEAR GFX CACHE, REDOWNLOAD CIV, the beta
+# setting and self-update. Where Windows and Linux differ:
+#
+#   * The game is found through Steam's libraryfolders.vdf (native, ~/.steam,
+#     Flatpak, Snap) instead of the registry, and must be the Windows build
+#     running under Proton -- KEK Mod replaces a Windows DLL.
+#   * Civ V's Documents folder lives inside the Proton prefix
+#     (steamapps/compatdata/8930/pfx/...).
+#   * EUI isn't fetchable from anywhere stable (see EuiExtra.cs), so it comes
+#     from the same bundled zips the Windows build embeds: they're read straight
+#     out of installer/KekModInstaller.exe (this checkout's copy, else the one
+#     on main), so the exact-match check compares against identical bytes.
+#   * Every mod ships a ui_check.bat. BatchScript below runs the small subset
+#     of batch those scripts use (copy/xcopy, del, IF EXIST, FIND/FINDSTR, set,
+#     one PowerShell string replace), sandboxed to Assets/DLC, with Windows'
+#     case-insensitive path lookups.
+#   * Shader caches are Linux/Proton ones (Steam's per-game cache, DXVK, Mesa,
+#     NVIDIA) plus the Windows-side ones inside the prefix.
+#
+# Needs only python3 (3.8+, standard library). Settings live in
+# ~/.config/civ5-mod-installer, downloads are cached in ~/.cache/civ5-mod-installer.
+# Set GITHUB_TOKEN to lift GitHub's 60 requests/hour anonymous limit.
+
+import argparse
+import hashlib
+import http.cookiejar
+import json
+import locale
+import os
+import queue
+import re
+import shutil
+import signal
+import struct
+import subprocess
+import sys
+import tempfile
+import textwrap
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import zipfile
+
+# Kept in step with the Windows build (InstallerCore.InstallerVersion in
+# installer/Installer.cs and installer/installer_version.txt): when one
+# bumps, bump this too.
+VERSION = "1.9"
+
+REPO_OWNER = "OBLASTWAR"
+REPO_NAME = "kek-mod"
+# Self-update, ticker and the bundled EUI all come from main, never a
+# release/* branch -- those get deleted once a version ships (same reasoning
+# as InstallerCore.TickerBranch).
+RAW_MAIN = "https://raw.githubusercontent.com/%s/%s/main" % (REPO_OWNER, REPO_NAME)
+SELF_REPO_PATH = "installer/linux/civ5-mod-installer"
+EXE_REPO_PATH = "installer/KekModInstaller.exe"
+
+CIV_APPID = "8930"
+CIV_FOLDER = "Sid Meier's Civilization V"
+CIV_DOCS_FOLDER = "Sid Meier's Civilization 5"
+# Explicit list, not a "CivilizationV*" prefix -- that would also match
+# Civilization VI (see ModCore.cs Civ5ProcessNames).
+CIV_PROCESS_NAMES = ["CivilizationV", "CivilizationV_DX11", "CivilizationV_Tablet", "CivilizationV_Vulkan"]
+
+DEFAULT_TICKER = ("*** GREETINGS FELLOW CIV ADDICTS ***  FUCK ALL THE HATING ASSES, RESYNCS, "
+                  "QUITTERS, UNSTABALIZERS ***  -=[ OBLAST ]=- ***")
+
+SCRIPT_PATH = os.path.realpath(__file__)
+SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "civ5-mod-installer")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "civ5-mod-installer")
+USER_AGENT = "Civ5ModInstaller-Linux/" + VERSION
+
+
+class InstallerError(Exception):
+    """A failure with a message meant for the player, shown as-is."""
+
+
+# ── Settings ──────────────────────────────────────────────────────────────────
+# Same opt-ins as SettingsManager (registry on Windows), plus civ_dir: the
+# Windows build asks for the folder each time auto-detect fails, here it's
+# remembered.
+
+class Settings:
+    PATH = os.path.join(CONFIG_DIR, "settings.json")
+
+    def __init__(self):
+        self.show_beta = False
+        self.civ_dir = None
+        try:
+            with open(self.PATH) as f:
+                data = json.load(f)
+            self.show_beta = bool(data.get("show_beta", False))
+            self.civ_dir = data.get("civ_dir") or None
+        except (OSError, ValueError):
+            pass
+
+    def save(self):
+        os.makedirs(CONFIG_DIR, exist_ok=True)
+        tmp = self.PATH + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump({"show_beta": self.show_beta, "civ_dir": self.civ_dir}, f, indent=2)
+        os.replace(tmp, self.PATH)
+
+
+# ── HTTP ──────────────────────────────────────────────────────────────────────
+
+def _request(url, accept=None):
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    if accept:
+        req.add_header("Accept", accept)
+    token = os.environ.get("GITHUB_TOKEN")
+    if token and urllib.parse.urlparse(url).hostname == "api.github.com":
+        req.add_header("Authorization", "Bearer " + token)
+    return req
+
+
+def _describe_http_error(e, url):
+    # Same idea as GitHubModSource.DescribeError: the anonymous rate limit is
+    # by far the most common failure, and the bare status code says nothing.
+    host = urllib.parse.urlparse(url).hostname
+    if e.code in (403, 429) and e.headers.get("X-RateLimit-Remaining") == "0":
+        note = ""
+        reset = e.headers.get("X-RateLimit-Reset")
+        if reset and reset.isdigit():
+            note = " Try again after %s." % time.strftime("%H:%M", time.localtime(int(reset)))
+        return ("GitHub API rate limit reached (60 requests/hour without signing in)." + note
+                + " Setting GITHUB_TOKEN raises the limit.")
+    if e.code == 404:
+        return "Not found (404): " + url
+    return "%s returned %d %s." % (host, e.code, e.reason)
+
+
+def http_open(url, accept=None, opener=None, timeout=60):
+    try:
+        return (opener or urllib.request.build_opener()).open(_request(url, accept), timeout=timeout)
+    except urllib.error.HTTPError as e:
+        raise InstallerError(_describe_http_error(e, url)) from None
+    except (urllib.error.URLError, OSError) as e:
+        reason = getattr(e, "reason", e)
+        raise InstallerError("Couldn't reach %s (%s)." % (urllib.parse.urlparse(url).hostname, reason)) from None
+
+
+def http_bytes(url, accept=None, timeout=60):
+    with http_open(url, accept, timeout=timeout) as r:
+        return r.read()
+
+
+def github_api(path):
+    data = http_bytes("https://api.github.com/" + path, accept="application/vnd.github+json")
+    return json.loads(data.decode("utf-8"))
+
+
+def download_to(url, dest, progress=None, opener=None):
+    """Streams url into dest. Returns the response's media type; for a
+    text/html response nothing is written (Google Drive's interstitial)."""
+    with http_open(url, opener=opener, timeout=120) as r:
+        ctype = r.headers.get_content_type()
+        if ctype == "text/html":
+            return ctype
+        total = int(r.headers.get("Content-Length") or 0)
+        done = 0
+        with open(dest, "wb") as out:
+            while True:
+                chunk = r.read(1 << 16)
+                if not chunk:
+                    break
+                out.write(chunk)
+                done += len(chunk)
+                if progress and total:
+                    progress(min(1.0, done / total))
+        return ctype
+
+
+# ── Versions ──────────────────────────────────────────────────────────────────
+
+def version_key(raw):
+    """"v34.15" / "5.2b" -> comparable key. Unparseable sorts lowest, the
+    same fallback LekmodModSource/TournamentMapExtra use."""
+    s = raw[1:] if raw[:1] in ("v", "V") else raw
+    m = re.match(r"^(\d+(?:\.\d+)*)([a-zA-Z]*)$", s or "")
+    if not m:
+        return (0, (), raw)
+    nums = [int(x) for x in m.group(1).split(".")]
+    while len(nums) > 1 and nums[-1] == 0:
+        nums.pop()
+    return (1, tuple(nums), m.group(2))
+
+
+def is_newer_version(remote, local):
+    # Plain dotted numbers compare numerically; anything else falls back to
+    # "different means newer" like InstallerCore.IsNewerVersion.
+    if re.match(r"^\d+(\.\d+)*$", remote) and re.match(r"^\d+(\.\d+)*$", local):
+        return version_key(remote) > version_key(local)
+    return remote.lower() != local.lower()
+
+
+# ── Filesystem helpers ────────────────────────────────────────────────────────
+# Windows resolves paths case-insensitively and every script/zip we deal with
+# was written for that, so lookups go through ci_resolve.
+
+def ci_resolve(path):
+    """path, with each component matched case-insensitively against what's on
+    disk. Components that don't exist are kept as given."""
+    if os.path.lexists(path):
+        return path
+    parent, name = os.path.split(path)
+    if not name or parent == path:
+        return path
+    parent = ci_resolve(parent)
+    try:
+        lname = name.lower()
+        for entry in os.listdir(parent):
+            if entry.lower() == lname:
+                return os.path.join(parent, entry)
+    except OSError:
+        pass
+    return os.path.join(parent, name)
+
+
+def ci_dirs_with_prefix(root, prefix):
+    """Subfolders of root whose names start with prefix, ignoring case (the
+    Directory.GetDirectories(root, "<prefix>*") equivalent)."""
+    try:
+        names = sorted(os.listdir(root))
+    except OSError:
+        return []
+    lp = prefix.lower()
+    return [os.path.join(root, n) for n in names
+            if n.lower().startswith(lp) and os.path.isdir(os.path.join(root, n))
+            and not os.path.islink(os.path.join(root, n))]
+
+
+def remove_tree(path):
+    if os.path.islink(path) or os.path.isfile(path):
+        os.unlink(path)
+    elif os.path.isdir(path):
+        shutil.rmtree(path)
+
+
+def dir_size(root):
+    total = 0
+    for dirpath, _dirs, files in os.walk(root):
+        for f in files:
+            try:
+                total += os.lstat(os.path.join(dirpath, f)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def format_size(n):
+    if n >= 1 << 30:
+        return "%.1f GB" % (n / float(1 << 30))
+    if n >= 1 << 20:
+        return "%.1f MB" % (n / float(1 << 20))
+    return "%d KB" % (n // 1024)
+
+
+def extract_zip(zip_path, dest_root):
+    # Release zips made with PowerShell's Compress-Archive store paths with
+    # backslashes; turn those into real folders instead of files named
+    # "KEK Mod v2.0\Art\x.dds". Also refuses entries escaping dest_root.
+    dest_root = os.path.realpath(dest_root)
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            rel = info.filename.replace("\\", "/").lstrip("/")
+            if not rel:
+                continue
+            dest = os.path.realpath(os.path.join(dest_root, rel))
+            if dest != dest_root and not dest.startswith(dest_root + os.sep):
+                raise InstallerError("Refusing to extract outside the target folder: " + info.filename)
+            if rel.endswith("/"):
+                os.makedirs(dest, exist_ok=True)
+                continue
+            os.makedirs(os.path.dirname(dest), exist_ok=True)
+            with zf.open(info) as src, open(dest, "wb") as out:
+                shutil.copyfileobj(src, out)
+
+
+def zip_top_dirs(zip_path):
+    with zipfile.ZipFile(zip_path) as zf:
+        return sorted({n.replace("\\", "/").lstrip("/").split("/")[0] for n in zf.namelist()} - {""})
+
+
+def open_in_desktop(target):
+    """xdg-open (folders, steam:// URLs), falling back to `steam <url>` for
+    steam:// links. False if nothing could take it."""
+    cmds = [["xdg-open", target]]
+    if target.startswith("steam://"):
+        cmds.append(["steam", target])
+    for cmd in cmds:
+        if shutil.which(cmd[0]):
+            try:
+                subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                 stderr=subprocess.DEVNULL, start_new_session=True)
+                return True
+            except OSError:
+                continue
+    return False
+
+
+# ── Finding the game ──────────────────────────────────────────────────────────
+
+def steam_roots():
+    home = os.path.expanduser("~")
+    return [os.path.join(home, p) for p in (
+        ".local/share/Steam",
+        ".steam/steam",
+        ".steam/root",
+        ".var/app/com.valvesoftware.Steam/.local/share/Steam",
+        "snap/steam/common/.local/share/Steam",
+    )]
+
+
+def steam_libraries():
+    """Every Steam library folder (the dirs holding steamapps/), main install
+    first, de-duplicated across the symlinked Steam roots."""
+    seen, out = set(), []
+
+    def add(path):
+        real = os.path.realpath(path)
+        if real not in seen and os.path.isdir(os.path.join(real, "steamapps")):
+            seen.add(real)
+            out.append(real)
+
+    for root in steam_roots():
+        if not os.path.isdir(os.path.join(root, "steamapps")):
+            continue
+        add(root)
+        for vdf in (os.path.join(root, "steamapps", "libraryfolders.vdf"),
+                    os.path.join(root, "config", "libraryfolders.vdf")):
+            try:
+                with open(vdf, encoding="utf-8", errors="replace") as f:
+                    for m in re.finditer(r'"path"\s*"([^"]+)"', f.read()):
+                        add(m.group(1).replace("\\\\", "\\"))
+            except OSError:
+                pass
+    return out
+
+
+class Game:
+    """One Civ V install plus everything derived from it: Assets/DLC,
+    Assets/Maps, and the Proton prefix that holds its Documents folder."""
+
+    def __init__(self, root):
+        self.root = os.path.realpath(root)
+        self.assets = ci_resolve(os.path.join(self.root, "Assets"))
+        self.dlc = ci_resolve(os.path.join(self.assets, "DLC"))
+        self.maps = ci_resolve(os.path.join(self.assets, "Maps"))
+        parent = os.path.dirname(self.root)
+        grand = os.path.dirname(parent)
+        self.steamapps = grand if (os.path.basename(parent).lower() == "common"
+                                   and os.path.basename(grand).lower() == "steamapps") else None
+        self.prefix = self._find_prefix()
+        self.docs = None
+        if self.prefix:
+            self.docs = ci_resolve(os.path.join(self.prefix, "drive_c", "users", "steamuser", "Documents",
+                                                "My Games", CIV_DOCS_FOLDER))
+
+    def _find_prefix(self):
+        # compatdata normally sits in the same library as the game, but Steam
+        # can keep it in the main library instead.
+        candidates = []
+        if self.steamapps:
+            candidates.append(self.steamapps)
+        candidates += [os.path.join(lib, "steamapps") for lib in steam_libraries()]
+        for sa in candidates:
+            pfx = os.path.join(sa, "compatdata", CIV_APPID, "pfx")
+            if os.path.isdir(pfx):
+                return pfx
+        return None
+
+    def problem(self):
+        """None when mods can be installed here, else why not."""
+        if not os.path.isdir(self.root):
+            return "%s doesn't exist." % self.root
+        has_exe = any(os.path.isfile(os.path.join(self.root, n))
+                      for n in ("CivilizationV_DX11.exe", "CivilizationV.exe"))
+        if not has_exe or not os.path.isdir(self.dlc):
+            return ("%s is the native Linux build of Civ V. KEK Mod replaces a Windows DLL, so it needs "
+                    "the Windows build: in Steam, Civ V > Properties > Compatibility > force a Proton "
+                    "version, let Steam finish updating, launch the game once, then come back here."
+                    % self.root)
+        return None
+
+
+def find_game(settings, override=None):
+    path = override or settings.civ_dir
+    if path:
+        return Game(os.path.expanduser(path))
+    for lib in steam_libraries():
+        candidate = os.path.join(lib, "steamapps", "common", CIV_FOLDER)
+        if os.path.isdir(candidate):
+            return Game(candidate)
+    return None
+
+
+# ── Civ V processes ───────────────────────────────────────────────────────────
+# Under Proton the game shows up as a Wine process whose argv[0] is the
+# Windows exe path, and whose comm is the exe name cut to 15 characters.
+
+def _civ_pids():
+    exe_names = {n.lower() + ".exe" for n in CIV_PROCESS_NAMES}
+    comms = {(n + ".exe")[:15].lower() for n in CIV_PROCESS_NAMES}
+    pids = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % entry, "rb") as f:
+                argv0 = f.read().split(b"\0", 1)[0].decode("utf-8", "replace")
+            with open("/proc/%s/comm" % entry) as f:
+                comm = f.read().strip().lower()
+        except OSError:
+            continue
+        base = re.split(r"[\\/]", argv0)[-1].lower()
+        if base in exe_names or comm in comms:
+            pids.append(int(entry))
+    return pids
+
+
+def is_civ_running():
+    return bool(_civ_pids())
+
+
+def force_close_civ():
+    """Kills the game outright (SIGKILL) -- unsaved progress is lost, callers
+    confirm first."""
+    pids = _civ_pids()
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except OSError:
+            pass
+    deadline = time.time() + 5
+    while time.time() < deadline and _civ_pids():
+        time.sleep(0.1)
+    return len(pids)
+
+
+# ── Mod sources ───────────────────────────────────────────────────────────────
+
+class Release:
+    def __init__(self, tag, prerelease=False, extra=None, native=None):
+        self.tag = tag
+        self.prerelease = prerelease
+        self.extra = extra    # extra text for version lists, e.g. Lekmod's date/size
+        self.native = native  # source-specific payload used to download it
+
+
+class GitHubSource:
+    """GitHub Releases, one asset per release (GitHubModSource.cs)."""
+
+    def __init__(self, owner, repo, supports_beta):
+        self.owner, self.repo, self.supports_beta = owner, repo, supports_beta
+
+    def _fetch(self):
+        rels = github_api("repos/%s/%s/releases?per_page=50" % (self.owner, self.repo))
+        if not rels:
+            raise InstallerError("No releases found for %s/%s." % (self.owner, self.repo))
+        return rels
+
+    def _latest(self):
+        try:
+            return github_api("repos/%s/%s/releases/latest" % (self.owner, self.repo))
+        except InstallerError as e:
+            if "404" in str(e):
+                raise InstallerError('No "Latest" release found for %s/%s.' % (self.owner, self.repo)) from None
+            raise
+
+    @staticmethod
+    def _to_release(r):
+        return Release(r["tag_name"], bool(r.get("prerelease")), None, r)
+
+    def list_releases(self):
+        rels = self._fetch()
+        if not self.supports_beta:
+            # catscats doesn't publish in order -- trust GitHub's own Latest
+            # flag over list order (see GitHubModSource.MoveLatestToFront).
+            try:
+                latest = self._latest()
+                idx = next((i for i, r in enumerate(rels) if r["tag_name"].lower() == latest["tag_name"].lower()), -1)
+                if idx > 0:
+                    rels.insert(0, rels.pop(idx))
+            except InstallerError:
+                pass
+        return [self._to_release(r) for r in rels]
+
+    def resolve(self, tag, want_beta):
+        if tag:
+            for r in self._fetch():
+                if r["tag_name"].lower() == tag.lower():
+                    return self._to_release(r)
+            raise InstallerError("Release %s doesn't exist on GitHub. Pick another version." % tag)
+        if not self.supports_beta:
+            return self._to_release(self._latest())
+        rels = self._fetch()
+        chosen = rels[0] if want_beta else next((r for r in rels if not r.get("prerelease")), None)
+        if chosen is None:
+            raise InstallerError("No stable release found. Enable beta builds to install the latest beta.")
+        return self._to_release(chosen)
+
+    def download(self, release, dest_dir, log, progress):
+        assets = release.native.get("assets") or []
+        if not assets:
+            raise InstallerError("Release %s has no assets." % release.tag)
+        asset = assets[0]
+        log("Asset: " + asset["name"])
+        path = os.path.join(dest_dir, "release.zip")
+        download_to(asset["browser_download_url"], path, progress)
+        return path
+
+
+class LekmodSource:
+    """Lekmod's versions.json manifest + Google Drive files (LekmodModSource.cs)."""
+
+    MANIFEST = "https://raw.githubusercontent.com/EnormousApplePie/Lekmod/main/LekmodInstaller/github_setup/versions.json"
+    supports_beta = False
+
+    def _manifest(self):
+        # Cache-buster: raw.githubusercontent.com can serve a stale copy for minutes.
+        data = json.loads(http_bytes(self.MANIFEST + "?t=%d" % int(time.time())).decode("utf-8"))
+        out = []
+        for tag, entry in data.items():
+            if isinstance(entry, dict) and entry.get("file_id"):
+                extra = ", ".join(x for x in (entry.get("release_date"), entry.get("size")) if x) or None
+                out.append(Release(tag, False, extra, entry))
+        out.sort(key=lambda r: version_key(r.tag), reverse=True)
+        return out
+
+    def list_releases(self):
+        return self._manifest()
+
+    def resolve(self, tag, want_beta):
+        rels = self._manifest()
+        if not rels:
+            raise InstallerError("No Lekmod versions found in the online manifest.")
+        if tag:
+            for r in rels:
+                if r.tag.lower() == tag.lower():
+                    return r
+            raise InstallerError("Lekmod %s isn't in the online manifest. Pick another version." % tag)
+        return rels[0]
+
+    def download(self, release, dest_dir, log, progress):
+        # Same fallback chain as Lekmod's own installer: plain link, then the
+        # confirm-token cookie, then drive.usercontent.google.com with
+        # confirm=t for files past the virus-scan size limit.
+        file_id = release.native["file_id"]
+        size = release.native.get("size")
+        log("Google Drive file: " + file_id + (" (%s)" % size if size else ""))
+        jar = http.cookiejar.CookieJar()
+        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+        path = os.path.join(dest_dir, "release.zip")
+        url = "https://drive.google.com/uc?export=download&id=" + file_id
+        if download_to(url, path, progress, opener) != "text/html":
+            return path
+        token = next((c.value for c in jar if "download_warning" in c.name.lower() or "confirm" in c.name.lower()), None)
+        if token:
+            if download_to(url + "&confirm=" + token, path, progress, opener) != "text/html":
+                return path
+        log("Large file, bypassing Google Drive's virus-scan page...")
+        url = "https://drive.usercontent.google.com/download?id=%s&export=download&confirm=t" % file_id
+        if download_to(url, path, progress, opener) != "text/html":
+            return path
+        raise InstallerError("Google Drive returned a web page instead of the file. It may no longer be "
+                             "shared publicly, or its download quota is used up for today.")
+
+
+# ── Bonus maps ────────────────────────────────────────────────────────────────
+# Each is best-effort and "install once, never auto-update", exactly like the
+# Windows extras: a failure is logged and never fails the mod install.
+
+class FishMapExtra:
+    id = "fishmapscript"
+    name = "Fish Map Script"
+    folder = "Fish Map Script"
+
+    def _dir(self, game):
+        return ci_resolve(os.path.join(game.maps, self.folder))
+
+    def detect(self, game):
+        d = self._dir(game)
+        if not os.path.isdir(d):
+            return None
+        for f in sorted(os.listdir(d)):
+            m = re.search(r"(\d+(?:\.\d+)*)\.modinfo$", f, re.I)
+            if m:
+                return "v" + m.group(1)
+        return ""
+
+    def ensure(self, game, log):
+        try:
+            if os.path.isdir(self._dir(game)):
+                log(self.name + " already installed, skipping.")
+                return
+            log("Installing " + self.name + "...")
+            rels = github_api("repos/OBLASTWAR/pangea-stratbal/releases?per_page=50")
+            if not rels or not rels[0].get("assets"):
+                log(self.name + ": no release asset found, skipping.")
+                return
+            with tempfile.TemporaryDirectory(prefix="kekmod-") as tmp:
+                zp = os.path.join(tmp, "fish.zip")
+                download_to(rels[0]["assets"][0]["browser_download_url"], zp)
+                os.makedirs(game.maps, exist_ok=True)
+                extract_zip(zp, game.maps)
+            log("%s %s installed." % (self.name, rels[0]["tag_name"]))
+        except Exception as e:
+            log("%s: couldn't install (%s)" % (self.name, e))
+
+    def remove(self, game, log):
+        try:
+            d = self._dir(game)
+            if os.path.isdir(d):
+                log("Removing " + self.name + "...")
+                remove_tree(d)
+        except Exception as e:
+            log("%s: couldn't remove (%s)" % (self.name, e))
+
+
+class BetterPangaeaExtra:
+    id = "betterpangaea"
+    name = "Better Pangaea"
+    pattern = re.compile(r"^Better_Pangaea_V(.+)\.lua$", re.I)
+
+    def _local(self, game):
+        try:
+            for f in sorted(os.listdir(game.maps)):
+                if self.pattern.match(f):
+                    return os.path.join(game.maps, f)
+        except OSError:
+            pass
+        return None
+
+    def detect(self, game):
+        f = self._local(game)
+        return None if f is None else "V" + self.pattern.match(os.path.basename(f)).group(1)
+
+    def ensure(self, game, log):
+        try:
+            existing = self._local(game)
+            if existing:
+                log(os.path.basename(existing) + " already installed, skipping.")
+                return
+            log("Checking for the latest Better Pangaea map...")
+            entries = github_api("repos/ImmoSS/Civ5-Patch/contents/Maps")
+            best = None
+            for e in entries:
+                m = self.pattern.match(e.get("name") or "")
+                if m and (best is None or version_key(m.group(1)) > version_key(best[1])):
+                    best = (e, m.group(1))
+            if best is None:
+                log("Better Pangaea: no map file found upstream, skipping.")
+                return
+            log("Installing " + best[0]["name"] + "...")
+            os.makedirs(game.maps, exist_ok=True)
+            download_to(best[0]["download_url"], os.path.join(game.maps, best[0]["name"]))
+            log(best[0]["name"] + " installed.")
+        except Exception as e:
+            log("Better Pangaea: couldn't install (%s)" % e)
+
+    def remove(self, game, log):
+        try:
+            f = self._local(game)
+            if f:
+                log("Removing " + os.path.basename(f) + "...")
+                os.unlink(f)
+        except Exception as e:
+            log("Better Pangaea: couldn't remove (%s)" % e)
+
+
+class LekmapExtra:
+    id = "lekmap"
+    name = "Lekmap"
+    folder = "Lekmap"
+
+    def _dir(self, game):
+        return ci_resolve(os.path.join(game.maps, self.folder))
+
+    def detect(self, game):
+        d = self._dir(game)
+        if not os.path.isdir(d):
+            return None
+        for f in sorted(os.listdir(d)):
+            m = re.match(r"^LekmapPangaeaFractalv(.+)\.lua$", f, re.I)
+            if m:
+                return "v" + m.group(1)
+        return ""
+
+    def ensure(self, game, log):
+        try:
+            target = self._dir(game)
+            if os.path.isdir(target):
+                log(self.folder + " already installed, skipping.")
+                return
+            log("Checking for Lekmap...")
+            files = [e for e in github_api("repos/EnormousApplePie/Lekmod/contents/Lekmap")
+                     if e.get("download_url") and e.get("type", "file") == "file"]
+            if not files:
+                log("Lekmap: no files found upstream, skipping.")
+                return
+            log("Installing Lekmap (%d files)..." % len(files))
+            os.makedirs(target, exist_ok=True)
+            for e in files:
+                download_to(e["download_url"], os.path.join(target, os.path.basename(e["name"])))
+            log("Lekmap installed.")
+        except Exception as e:
+            log("Lekmap: couldn't install (%s)" % e)
+
+    def remove(self, game, log):
+        try:
+            d = self._dir(game)
+            if os.path.isdir(d):
+                log("Removing Lekmap...")
+                remove_tree(d)
+        except Exception as e:
+            log("Lekmap: couldn't remove (%s)" % e)
+
+
+# ── Mod registry (ModCore.cs ModRegistry) ─────────────────────────────────────
+
+class ModDef:
+    def __init__(self, id, name, aliases, folder_prefix, source, zip_prefix, beta_optin, extra):
+        self.id = id
+        self.name = name
+        self.aliases = aliases
+        self.folder_prefix = folder_prefix  # Assets/DLC folder = prefix + tag
+        self.source = source
+        # None: the zip's single top-level folder is the mod. Otherwise the
+        # zip's folder has this fixed unversioned name (Lekmod's "LEKMOD").
+        self.zip_prefix = zip_prefix
+        self.beta_optin = beta_optin
+        self.extra = extra
+
+    def folder_for(self, tag):
+        return self.folder_prefix + tag
+
+    def version_of(self, folder):
+        return folder[len(self.folder_prefix):] if folder.lower().startswith(self.folder_prefix.lower()) else folder
+
+
+MODS = [
+    ModDef("kekmod", "KEK Mod", ["kek", "kek-mod"], "KEK Mod ",
+           GitHubSource("OBLASTWAR", "kek-mod", True), None, True, FishMapExtra()),
+    # catscatsforever is the upstream with releases; ImmoSS is a fork (see ModCore.cs).
+    ModDef("tournament", "Tournament Mod", ["tm", "tournament-mod"], "Tournament Mod V",
+           GitHubSource("catscatsforever", "Civ5-Patch", False), None, False, BetterPangaeaExtra()),
+    ModDef("lekmod", "Lekmod", ["lek"], "LEKMOD_",
+           LekmodSource(), "LEKMOD", False, LekmapExtra()),
+]
+TOURNAMENT = MODS[1]
+
+
+def mod_by_name(name):
+    n = name.lower()
+    for m in MODS:
+        if n == m.id or n in m.aliases or n == m.name.lower():
+            return m
+    raise InstallerError("Unknown mod '%s'. Choose one of: %s." % (name, ", ".join(m.id for m in MODS)))
+
+
+def installed_folders(game, mod):
+    """This mod's folders in Assets/DLC ("KEK Mod v*", "Tournament Mod V*",
+    "LEKMOD_v*"), matched case-insensitively like Windows does."""
+    return [d for d in ci_dirs_with_prefix(game.dlc, mod.folder_prefix)
+            if len(os.path.basename(d)) > len(mod.folder_prefix)]
+
+
+# ── Bundled EUI (read out of KekModInstaller.exe) ─────────────────────────────
+
+class Bundle:
+    """The EUI zips the Windows build embeds as .NET manifest resources.
+
+    Looked up in order: loose zips next to the Windows sources (dev machine),
+    this checkout's KekModInstaller.exe, a cached copy of main's exe. The
+    resources blob in a .NET PE is a run of 8-byte-aligned [u32 length][data]
+    entries; zips are told apart by their top-level folder name."""
+
+    def __init__(self):
+        self._zips = None
+
+    def _exe_candidates(self):
+        return [os.path.join(os.path.dirname(SCRIPT_DIR), "KekModInstaller.exe"),
+                os.path.join(SCRIPT_DIR, "KekModInstaller.exe"),
+                os.path.join(CACHE_DIR, "KekModInstaller.exe")]
+
+    def local_exe(self):
+        return next((p for p in self._exe_candidates() if os.path.isfile(p)), None)
+
+    def fetch_exe(self, log=None):
+        """Downloads main's KekModInstaller.exe into the cache (~6 MB)."""
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        dest = os.path.join(CACHE_DIR, "KekModInstaller.exe")
+        if log:
+            log("Fetching bundled EUI (KekModInstaller.exe from GitHub)...")
+        tmp = dest + ".part"
+        download_to(RAW_MAIN + "/" + EXE_REPO_PATH, tmp)
+        os.replace(tmp, dest)
+        self._zips = None
+        return dest
+
+    @staticmethod
+    def _resources(exe_bytes):
+        d = exe_bytes
+        pe = struct.unpack_from("<I", d, 0x3C)[0]
+        nsec = struct.unpack_from("<H", d, pe + 6)[0]
+        optsz = struct.unpack_from("<H", d, pe + 20)[0]
+        opt = pe + 24
+        datadirs = opt + (112 if struct.unpack_from("<H", d, opt)[0] == 0x20B else 96)
+        sections = []
+        for i in range(nsec):
+            s = opt + optsz + 40 * i
+            vsize, va = struct.unpack_from("<II", d, s + 8)
+            sections.append((va, vsize, struct.unpack_from("<I", d, s + 20)[0]))
+
+        def offset(rva):
+            for va, vsize, raw in sections:
+                if va <= rva < va + vsize:
+                    return rva - va + raw
+            raise ValueError("RVA outside sections")
+
+        cli = offset(struct.unpack_from("<I", d, datadirs + 14 * 8)[0])  # CLR runtime header
+        res_rva, res_size = struct.unpack_from("<II", d, cli + 24)
+        base, pos = offset(res_rva), 0
+        while pos + 4 <= res_size:
+            n = struct.unpack_from("<I", d, base + pos)[0]
+            yield d[base + pos + 4:base + pos + 4 + n]
+            pos = (pos + 4 + n + 7) & ~7
+
+    def zips(self):
+        """{"UI_bc1": path, "UI_bc1_xits": path} for whatever is available
+        without network access."""
+        if self._zips is not None:
+            return self._zips
+        found = {}
+        for name in ("UI_bc1", "UI_bc1_xits"):
+            loose = os.path.join(os.path.dirname(SCRIPT_DIR), name + ".zip")
+            if os.path.isfile(loose):
+                found[name] = loose
+        exe = self.local_exe()
+        if exe and len(found) < 2:
+            try:
+                with open(exe, "rb") as f:
+                    data = f.read()
+                outdir = os.path.join(CACHE_DIR, "bundle-" + hashlib.sha256(data).hexdigest()[:12])
+                for blob in self._resources(data):
+                    if not blob.startswith(b"PK\x03\x04"):
+                        continue
+                    path = os.path.join(outdir, "eui.zip.part")
+                    os.makedirs(outdir, exist_ok=True)
+                    with open(path, "wb") as f:
+                        f.write(blob)
+                    tops = zip_top_dirs(path)
+                    if len(tops) == 1 and tops[0] in ("UI_bc1", "UI_bc1_xits") and tops[0] not in found:
+                        final = os.path.join(outdir, tops[0] + ".zip")
+                        os.replace(path, final)
+                        found[tops[0]] = final
+                    else:
+                        os.unlink(path)
+            except (OSError, ValueError, struct.error, zipfile.BadZipFile):
+                pass
+        self._zips = found
+        return found
+
+    def zip_for(self, folder, log=None):
+        z = self.zips().get(folder)
+        if z is None and not os.path.isfile(os.path.join(CACHE_DIR, "KekModInstaller.exe")):
+            self.fetch_exe(log)
+            z = self.zips().get(folder)
+        return z
+
+
+BUNDLE = Bundle()
+
+
+class EuiVariant:
+    def __init__(self, id, name, folder, version):
+        self.id, self.name, self.folder, self.version = id, name, folder, version
+
+    def label(self):
+        return "%s (%s)" % (self.name, self.version) if self.version else self.name
+
+
+EUI_VARIANTS = [
+    EuiVariant("eui", "EUI", "UI_bc1", "v1.28g"),
+    EuiVariant("eui_xits", "EUI XITS", "UI_bc1_xits", None),
+]
+
+
+def eui_by_name(name):
+    n = (name or "eui").lower()
+    for v in EUI_VARIANTS:
+        if n in (v.id, v.folder.lower(), v.name.lower()) or (n == "xits" and v.id == "eui_xits"):
+            return v
+    raise InstallerError("Unknown EUI variant '%s'. Choose eui or xits." % name)
+
+
+def eui_detect(game):
+    """Installed variant id or None. Exact folder names first, then any "UI*"
+    folder (a renamed/hand-installed EUI), as EuiExtra.DetectInstalledVariantId."""
+    for v in EUI_VARIANTS:
+        if os.path.isdir(ci_resolve(os.path.join(game.dlc, v.folder))):
+            return v.id
+    for d in ci_dirs_with_prefix(game.dlc, "UI"):
+        return "eui_xits" if "xits" in os.path.basename(d).lower() else "eui"
+    return None
+
+
+def eui_exact_match(game, variant):
+    """True when every file of the bundled copy is on disk byte-for-byte; None
+    when there's no bundled copy to compare with (offline, nothing cached)."""
+    zp = BUNDLE.zips().get(variant.folder)
+    if zp is None:
+        return None
+    target = ci_resolve(os.path.join(game.dlc, variant.folder))
+    if not os.path.isdir(target):
+        return False
+    try:
+        with zipfile.ZipFile(zp) as zf:
+            for info in zf.infolist():
+                name = info.filename.replace("\\", "/")
+                if name.endswith("/"):
+                    continue
+                rel = name.split("/", 1)[1] if "/" in name else name
+                disk = ci_resolve(os.path.join(target, rel))
+                if not os.path.isfile(disk):
+                    return False
+                h = hashlib.sha256()
+                with open(disk, "rb") as f:
+                    for chunk in iter(lambda: f.read(1 << 16), b""):
+                        h.update(chunk)
+                if h.digest() != hashlib.sha256(zf.read(info)).digest():
+                    return False
+        return True
+    except (OSError, zipfile.BadZipFile):
+        return False
+
+
+def eui_install(game, variant, log, progress=lambda p: None):
+    zp = BUNDLE.zip_for(variant.folder, log)
+    if zp is None:
+        raise InstallerError(variant.name + " isn't in the bundled KekModInstaller.exe -- nothing to install.")
+    progress(20)
+    for d in ci_dirs_with_prefix(game.dlc, "UI"):  # only one EUI may be active
+        log("Removing " + os.path.basename(d) + "...")
+        remove_tree(d)
+    progress(40)
+    log("Installing " + variant.name + "...")
+    extract_zip(zp, game.dlc)
+    progress(70)
+    rerun_ui_checks(game, log)
+    clear_civ_db_cache(game, log)
+    progress(100)
+    log("DONE: " + variant.name + " installed.")
+
+
+def eui_remove(game, log, progress=lambda p: None):
+    for d in ci_dirs_with_prefix(game.dlc, "UI"):
+        log("Removing " + os.path.basename(d) + "...")
+        try:
+            remove_tree(d)
+        except OSError as e:
+            log("%s: couldn't remove (%s)" % (os.path.basename(d), e))
+    progress(60)
+    rerun_ui_checks(game, log)
+    clear_civ_db_cache(game, log)
+    progress(100)
+    log("DONE: EUI removed.")
+
+
+# ── ui_check.bat ──────────────────────────────────────────────────────────────
+
+class _BatchExit(Exception):
+    pass
+
+
+class BatchScript:
+    """Runs a mod's ui_check.bat without Windows.
+
+    Supports exactly what the shipped scripts (kek-mod, Tournament Mod,
+    Lekmod) use: @echo off, rem, pushd "%~dp0", cd, set, for %%I in ("%cd%")
+    do set "x=%%~nxI", del, copy, xcopy, echo text> file, IF [NOT] EXIST,
+    FIND/FINDSTR ... && ( ) || ( ), exit, and Lekmod's one PowerShell
+    $env:VAR .Replace('a','b'). Anything else is reported, not guessed at.
+
+    Sandboxed: nothing outside the DLC folder (the script's parent) is ever
+    written or deleted."""
+
+    IF_RE = re.compile(r'^if\s+(not\s+)?exist\s+("[^"]*"|\S+)\s*(.*)$', re.I)
+    FIND_RE = re.compile(r'^(find|findstr)\b(.*?)&&\s*\($', re.I)
+    FOR_NXI_RE = re.compile(r'^for\s+%%(\w)\s+in\s+\("%cd%"\)\s+do\s+set\s+"(\w+)=%%~nx\1"$', re.I)
+    PS_REPLACE_RE = re.compile(r"\$env:(\w+).*?\.Replace\('((?:[^']|'')*)'\s*,\s*'((?:[^']|'')*)'\)", re.I)
+
+    def __init__(self, path):
+        self.path = os.path.abspath(path)
+        self.dir = os.path.dirname(self.path)
+        self.sandbox = os.path.dirname(self.dir)
+        self.cwd = self.dir
+        self.vars = {}
+        self.copied = 0
+        self.failures = []
+        self.unsupported = []
+
+    def run(self):
+        with open(self.path, "rb") as f:
+            text = f.read().decode("latin-1")
+        lines = [l.strip() for l in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+        nodes, _i, _t = self._parse(lines, 0, True)
+        try:
+            self._exec(nodes)
+        except _BatchExit:
+            pass
+        return self
+
+    # parsing -- a flat list of ("cmd", lineno, text) and
+    # ("if", cond, then_nodes, else_nodes) nodes
+    def _parse(self, lines, i, top):
+        nodes = []
+        while i < len(lines):
+            line, lineno = lines[i], i + 1
+            i += 1
+            low = line.lower()
+            if not line or low == "rem" or low.startswith("rem ") or line.startswith("::"):
+                continue
+            if line.startswith(")"):
+                if top:
+                    raise InstallerError("ui_check.bat line %d: unmatched ')'" % lineno)
+                return nodes, i, line
+            m = self.IF_RE.match(line)
+            if m:
+                cond = ("exist", m.group(2), bool(m.group(1)))
+                if m.group(3) == "(":
+                    then, i, term = self._parse(lines, i, False)
+                    els = []
+                    if re.match(r"^\)\s*else\s*\($", term, re.I):
+                        els, i, term = self._parse(lines, i, False)
+                    nodes.append(("if", cond, then, els))
+                else:
+                    nodes.append(("if", cond, [("cmd", lineno, m.group(3))], []))
+                continue
+            m = self.FIND_RE.match(line)
+            if m:
+                then, i, term = self._parse(lines, i, False)
+                els = []
+                if re.match(r"^\)\s*\|\|\s*\($", term):
+                    els, i, term = self._parse(lines, i, False)
+                nodes.append(("if", ("find", line[:line.rindex("&&")], lineno), then, els))
+                continue
+            nodes.append(("cmd", lineno, line))
+        if not top:
+            raise InstallerError("ui_check.bat: unterminated '(' block")
+        return nodes, i, None
+
+    def _exec(self, nodes):
+        for n in nodes:
+            if n[0] == "if":
+                self._exec(n[2] if self._cond(n[1]) else n[3])
+            else:
+                self._cmd(n[1], n[2])
+
+    # helpers
+    def _expand(self, s):
+        s = re.sub(r"%~dp0", lambda m: self.dir + "/", s, flags=re.I)
+
+        def var(m):
+            name = m.group(1).lower()
+            return self.cwd if name == "cd" else self.vars.get(name, "")
+        return re.sub(r"%([A-Za-z_][A-Za-z0-9_]*)%", var, s)
+
+    def _path(self, raw):
+        p = raw.strip().strip('"').replace("\\", "/")
+        if not os.path.isabs(p):
+            p = os.path.join(self.cwd, p)
+        return ci_resolve(os.path.normpath(p))
+
+    def _inside(self, path):
+        real = os.path.realpath(path)
+        return real == self.sandbox or real.startswith(self.sandbox + os.sep)
+
+    @staticmethod
+    def _tokens(s):
+        return re.findall(r'/C:"[^"]*"|"[^"]*"|\S+', s, re.I)
+
+    @staticmethod
+    def _drop_redirects(tokens):
+        out, skip = [], False
+        for t in tokens:
+            if skip:
+                skip = False
+                continue
+            if t in (">", "1>", "2>"):
+                skip = True
+            elif re.match(r"^\d?>(&\d|nul)?$", t, re.I):
+                continue
+            else:
+                out.append(t)
+        return out
+
+    def _cond(self, cond):
+        if cond[0] == "exist":
+            return os.path.exists(self._path(self._expand(cond[1]))) != cond[2]
+        tokens = self._drop_redirects(self._tokens(self._expand(cond[1])))
+        verb, args = tokens[0].lower(), tokens[1:]
+        ignore_case = any(a.lower() == "/i" for a in args)
+        needle, files = None, []
+        for a in args:
+            if a.upper().startswith("/C:"):
+                needle = a[3:].strip('"')
+            elif a.startswith("/"):
+                continue
+            elif needle is None and verb == "find":
+                needle = a.strip('"')
+            else:
+                files.append(a)
+        if needle is None or not files:
+            self.unsupported.append("line %d: %s" % (cond[2], cond[1]))
+            return False
+        for f in files:
+            try:
+                with open(self._path(f), "rb") as fh:
+                    hay = fh.read().decode("latin-1")
+            except OSError:
+                continue
+            if (needle.lower() in hay.lower()) if ignore_case else (needle in hay):
+                return True
+        return False
+
+    def _cmd(self, lineno, raw):
+        m = self.FOR_NXI_RE.match(raw)
+        if m:
+            self.vars[m.group(2).lower()] = os.path.basename(self.cwd)
+            return
+        line = self._expand(raw).strip().lstrip("@").strip()
+        low = line.lower()
+        if low in ("echo off", "echo on", "cls", "popd", "setlocal", "endlocal") or low.startswith("title "):
+            return
+        if low == "exit" or low.startswith("exit "):
+            raise _BatchExit()
+        m = re.match(r"^echo\s+\w\s*\|\s*(.*)$", line, re.I)  # "ECHO F | xcopy", "ECHO Y | del"
+        if m:
+            line = m.group(1)
+            low = line.lower()
+        m = re.match(r'^echo\s(.*?)\s*>\s*("[^"]*"|\S+)\s*$', line, re.I)
+        if m and m.group(2).lower() != "nul":
+            target = self._path(m.group(2))
+            if not self._inside(target):
+                self.failures.append("line %d: write outside DLC refused" % lineno)
+                return
+            os.makedirs(os.path.dirname(target), exist_ok=True)
+            with open(target, "wb") as f:
+                f.write(m.group(1).encode("latin-1") + b"\r\n")
+            return
+        if low == "echo" or low.startswith(("echo ", "echo.")):
+            return  # console output only
+        verb = low.split(None, 1)[0] if low else ""
+        rest = line[len(verb):].strip()
+        if verb in ("pushd", "cd", "chdir"):
+            target = self._path(rest or ".")
+            if os.path.isdir(target):
+                self.cwd = target
+            else:
+                self.failures.append("line %d: no such folder %s" % (lineno, target))
+        elif verb == "set":
+            body = rest[1:-1] if rest.startswith('"') and rest.endswith('"') else rest
+            if "=" in body:
+                k, v = body.split("=", 1)
+                self.vars[k.strip().lower()] = v
+        elif verb in ("del", "erase"):
+            for t in self._drop_redirects(self._tokens(rest)):
+                if not t.startswith("/"):
+                    self._del(lineno, t)
+        elif verb in ("copy", "xcopy"):
+            args = [t for t in self._drop_redirects(self._tokens(rest)) if not t.startswith("/")]
+            if len(args) != 2:
+                self.unsupported.append("line %d: %s" % (lineno, raw))
+            else:
+                self._copy(lineno, args[0], args[1])
+        elif verb == "powershell":
+            self._powershell(lineno, raw, line)
+        else:
+            self.unsupported.append("line %d: %s" % (lineno, raw))
+
+    def _del(self, lineno, raw):
+        target = self._path(raw)
+        if not self._inside(target):
+            self.failures.append("line %d: delete outside DLC refused (%s)" % (lineno, target))
+            return
+        if os.path.isdir(target):  # `del dir\` deletes the files directly inside it
+            for n in os.listdir(target):
+                p = os.path.join(target, n)
+                if os.path.isfile(p) or os.path.islink(p):
+                    os.unlink(p)
+        elif os.path.lexists(target):
+            os.unlink(target)
+
+    def _copy(self, lineno, src_raw, dst_raw):
+        src, dst = self._path(src_raw), self._path(dst_raw)
+        if not os.path.isfile(src):
+            self.failures.append("line %d: missing %s" % (lineno, os.path.relpath(src, self.sandbox)))
+            return
+        if os.path.isdir(dst) or dst_raw.strip('"').endswith(("\\", "/")):
+            dst = os.path.join(dst, os.path.basename(src))
+        if not self._inside(dst):
+            self.failures.append("line %d: copy outside DLC refused (%s)" % (lineno, dst))
+            return
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        shutil.copyfile(src, dst)
+        self.copied += 1
+
+    def _powershell(self, lineno, raw, line):
+        m = self.PS_REPLACE_RE.search(line)
+        if not m or self.vars.get(m.group(1).lower()) is None:
+            self.unsupported.append("line %d: %s" % (lineno, raw))
+            return
+        target = self._path(self.vars[m.group(1).lower()])
+        if not os.path.isfile(target):
+            return  # the script guards with File.Exists too
+        if not self._inside(target):
+            self.failures.append("line %d: write outside DLC refused" % lineno)
+            return
+        old, new = (s.replace("''", "'").encode("utf-8") for s in (m.group(2), m.group(3)))
+        with open(target, "rb") as f:
+            data = f.read()
+        if old in data:
+            with open(target, "wb") as f:
+                f.write(data.replace(old, new))
+
+
+def run_ui_check(label, folder, log):
+    bat = ci_resolve(os.path.join(folder, "ui_check.bat"))
+    if not os.path.isfile(bat):
+        log(label + ": ui_check.bat not found in the mod folder, skipping.")
+        return
+    log(label + ": running ui_check.bat...")
+    try:
+        script = BatchScript(bat).run()
+    except (InstallerError, OSError) as e:
+        log("%s: ui_check.bat failed (%s)" % (label, e))
+        return
+    if script.unsupported or script.failures:
+        log("%s: ui_check.bat finished with warnings (%d files copied):" % (label, script.copied))
+        for line in (script.failures + ["unsupported " + u for u in script.unsupported])[:12]:
+            log("  " + line)
+    else:
+        log("%s: ui_check.bat finished successfully (%d files)." % (label, script.copied))
+
+
+def rerun_ui_checks(game, log):
+    # EUI is shared by every mod -- re-run each installed mod's script so its
+    # UI file picks follow the new EUI state (EuiWorker_DoWork).
+    for mod in MODS:
+        dirs = installed_folders(game, mod)
+        if dirs:
+            run_ui_check(mod.name, dirs[0], log)
+
+
+def clear_civ_db_cache(game, log):
+    """Civ V's cached gameplay DBs (top-level *.db only) -- rebuilt on launch.
+    install-linux.sh always did this after installing."""
+    if not game.docs:
+        return 0
+    cache = ci_resolve(os.path.join(game.docs, "cache"))
+    n = 0
+    try:
+        for f in os.listdir(cache):
+            p = os.path.join(cache, f)
+            if f.lower().endswith(".db") and os.path.isfile(p):
+                os.unlink(p)
+                n += 1
+    except OSError:
+        return 0
+    if n:
+        log("Cleared Civ V's cached databases (%d files)." % n)
+    return n
+
+
+# ── Install / uninstall (InstallerCore.Run / Uninstall) ───────────────────────
+
+def install_mod(game, mod, tag, want_beta, log, progress):
+    progress(0)
+    rel = mod.source.resolve(tag, want_beta)
+    log("%s release: %s%s%s" % (mod.name, rel.tag, " (prerelease)" if rel.prerelease else "",
+                                " [selected version]" if tag else ""))
+    progress(10)
+    folder = mod.folder_for(rel.tag)
+    # Scratch space inside Assets (same filesystem, so the final move is a
+    # rename) but outside Assets/DLC, so a half-extracted copy can never be
+    # picked up by the game.
+    scratch = tempfile.mkdtemp(prefix=".kekmod-install-", dir=game.assets)
+    try:
+        log("Downloading...")
+        zp = mod.source.download(rel, scratch, log, lambda f: progress(10 + int(40 * f)))
+        progress(50)
+        log("Civ V DLC folder: " + game.dlc)
+        target = ci_resolve(os.path.join(game.dlc, folder))
+        if os.path.lexists(target):
+            log("Removing existing " + os.path.basename(target) + "...")
+            remove_tree(target)
+        target = os.path.join(game.dlc, folder)
+        progress(60)
+        log("Extracting...")
+        out = os.path.join(scratch, "x")
+        extract_zip(zp, out)
+        os.unlink(zp)
+        tops = [os.path.join(out, n) for n in os.listdir(out) if os.path.isdir(os.path.join(out, n))]
+        if mod.zip_prefix is None:
+            if len(tops) != 1:
+                raise InstallerError("Unexpected archive layout (top level: %s)." % ", ".join(os.listdir(out)))
+            found = tops[0]
+        else:
+            found = None
+            for dirpath, dirnames, _f in os.walk(out):
+                hit = next((d for d in sorted(dirnames) if d.lower().startswith(mod.zip_prefix.lower())), None)
+                if hit:
+                    found = os.path.join(dirpath, hit)
+                    break
+            if found is None:
+                raise InstallerError(mod.name + " folder not found in the downloaded archive.")
+        os.rename(found, target)
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    progress(75)
+    run_ui_check(mod.name, target, log)
+    progress(90)
+    # Other versions of THIS mod go only once the new one is in place.
+    for d in installed_folders(game, mod):
+        if os.path.basename(d).lower() != folder.lower():
+            log("Removing old version " + os.path.basename(d) + "...")
+            remove_tree(d)
+    progress(95)
+    if mod.extra:
+        mod.extra.ensure(game, log)
+    clear_civ_db_cache(game, log)
+    progress(100)
+    log("DONE: " + folder + " installed.")
+    return folder
+
+
+def uninstall_mod(game, mod, log, progress):
+    progress(0)
+    dirs = installed_folders(game, mod)
+    if not dirs:
+        log("Nothing to uninstall.")
+    for i, d in enumerate(dirs):
+        log("Removing " + os.path.basename(d) + "...")
+        remove_tree(d)
+        progress(10 + 80 * (i + 1) // len(dirs))
+    if mod.extra:
+        mod.extra.remove(game, log)
+    clear_civ_db_cache(game, log)
+    log("DONE: " + mod.name + " uninstalled.")
+    progress(100)
+
+
+# ── State + checks (MainForm.DetectInstalledState / RunAllChecks) ─────────────
+
+class State:
+    def __init__(self, game, releases, show_beta):
+        self.installed = {}   # mod id -> [folder names]
+        self.extras = {}      # extra id -> version label ("" if unknown); absent = not installed
+        self.updates = {}     # mod id -> tag auto-install would pick now
+        self.eui = None
+        self.eui_match = None  # True / False / None (no bundled copy to compare against)
+        if game is None or game.problem():
+            return
+        for mod in MODS:
+            dirs = installed_folders(game, mod)
+            if dirs:
+                self.installed[mod.id] = [os.path.basename(d) for d in dirs]
+                latest = latest_release(mod, releases.get(mod.id), show_beta)
+                if latest and mod.folder_for(latest.tag).lower() != self.installed[mod.id][0].lower():
+                    self.updates[mod.id] = latest.tag
+            if mod.extra:
+                v = mod.extra.detect(game)
+                if v is not None:
+                    self.extras[mod.extra.id] = v
+        self.eui = eui_detect(game)
+        if self.eui:
+            self.eui_match = eui_exact_match(game, self.eui_variant())
+
+    def eui_variant(self):
+        return next((v for v in EUI_VARIANTS if v.id == self.eui), None)
+
+    def mod_version(self, mod):
+        folders = self.installed.get(mod.id)
+        return mod.version_of(folders[0]) if folders else None
+
+    def installed_mods(self):
+        return [m for m in MODS if m.id in self.installed]
+
+    def missing_maps(self):
+        return [m for m in self.installed_mods() if m.extra and m.extra.id not in self.extras]
+
+
+def latest_release(mod, releases, show_beta):
+    if not releases:
+        return None
+    if mod.beta_optin and not show_beta:
+        return next((r for r in releases if not r.prerelease), None)
+    return releases[0]
+
+
+def run_checks(game, state):
+    """[(ok, message)] -- the VERIFY MODS checks, plus the Proton build check."""
+    out = []
+    problem = game.problem() if game else "Civilization V wasn't found in any Steam library."
+    out.append((problem is None, "Civ V is the Windows build (Proton)." if problem is None else problem))
+    running = is_civ_running()
+    out.append((not running, "Civilization V is currently running." if running else "Civilization V is not running."))
+    inst = state.installed_mods()
+    out.append((len(inst) < 2, " and ".join(m.name for m in inst) + " are both installed -- they can't run together."
+                if len(inst) >= 2 else "No conflicting mods installed."))
+    xits = state.eui == "eui_xits" and TOURNAMENT.id in state.installed
+    out.append((not xits, "Tournament Mod and EUI XITS are installed together -- not compatible."
+                if xits else "No Tournament Mod / EUI XITS conflict."))
+    missing = state.missing_maps()
+    out.append((not missing, "; ".join("%s is missing its %s" % (m.name, m.extra.name) for m in missing) + "."
+                if missing else "No missing bonus maps."))
+    v = state.eui_variant()
+    if v is None:
+        out.append((True, "No EUI variant installed."))
+    elif state.eui_match is None:
+        out.append((True, v.label() + " installed (bundled copy not available to compare)."))
+    else:
+        out.append((state.eui_match, v.label() + (" matches this installer's bundled copy exactly."
+                                                   if state.eui_match else
+                                                   " doesn't exactly match this installer's bundled copy.")))
+    ups = [m.name for m in MODS if m.id in state.updates]
+    out.append((not ups, "Update available for: " + ", ".join(ups) + "." if ups else "All installed mods are up to date."))
+    return out
+
+
+# ── Unrecognized folders (ExtraModScan.cs) ────────────────────────────────────
+
+STOCK_DLC = {"expansion", "expansion2", "shared", "tablet"}
+
+
+class ExtraFolder:
+    def __init__(self, path, where):
+        self.path, self.where = path, where
+        self.name = os.path.basename(path)
+        try:
+            self.size = dir_size(path)
+        except OSError:
+            self.size = 0
+
+
+def scan_extra_folders(game):
+    found = []
+    if game is None or not os.path.isdir(game.dlc):
+        return found
+    mod_prefixes = [m.folder_prefix.lower() for m in MODS]
+    for name in sorted(os.listdir(game.dlc)):
+        p = os.path.join(game.dlc, name)
+        low = name.lower()
+        if not os.path.isdir(p) or low.startswith(".kekmod-"):
+            continue
+        # Stock DLC is always "DLC*" (fail safe: never offer paid content for
+        # deletion); "UI*" is EUI's namespace.
+        if low.startswith(("dlc", "ui")) or low in STOCK_DLC or any(low.startswith(px) for px in mod_prefixes):
+            continue
+        found.append(ExtraFolder(p, "DLC"))
+    if os.path.isdir(game.maps):
+        for name in sorted(os.listdir(game.maps)):
+            p = os.path.join(game.maps, name)
+            if os.path.isdir(p) and name.lower() not in ("fish map script", "lekmap"):
+                found.append(ExtraFolder(p, "Maps"))
+    return found
+
+
+def archive_folder(info):
+    """Zips the folder in place (<name>.zip next to it, the folder as the zip's
+    single top-level entry) and deletes it. A zip is never loaded by the game;
+    extracting it back restores the folder. An existing same-named zip is
+    kept, not overwritten."""
+    zp = os.path.join(os.path.dirname(info.path), info.name + ".zip")
+    if not os.path.exists(zp):
+        tmp = zp + ".part"
+        with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as zf:
+            for dirpath, dirnames, files in os.walk(info.path):
+                rel = os.path.relpath(dirpath, os.path.dirname(info.path))
+                zf.write(dirpath, rel + "/")
+                for f in files:
+                    full = os.path.join(dirpath, f)
+                    if not os.path.islink(full):
+                        zf.write(full, os.path.join(rel, f))
+        os.replace(tmp, zp)
+    remove_tree(info.path)
+    return zp
+
+
+# ── Graphics caches (GraphicsCacheExtra.cs, Linux edition) ────────────────────
+# Every target is a cache by contract -- the driver, DXVK or Steam rebuilds
+# whatever is missing, so wiping is always safe. Locked/unreadable files are
+# skipped and counted.
+
+def gfx_cache_targets(game):
+    """[(label, path, mode)]; mode is "all", "db" (top-level *.db only) or
+    "dxvk" (top-level *.dxvk-cache only)."""
+    xdg = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
+    flat = os.path.expanduser("~/.var/app/com.valvesoftware.Steam/cache")
+    t = []
+    if game:
+        if game.steamapps:
+            t.append(("Steam shader cache (Civ V)", os.path.join(game.steamapps, "shadercache", CIV_APPID), "all"))
+        t.append(("DXVK state cache", game.root, "dxvk"))
+        if game.prefix:
+            local = os.path.join(game.prefix, "drive_c", "users", "steamuser", "AppData", "Local")
+            for label, rel in (("D3D cache", "D3DSCache"), ("NVIDIA DX cache", "NVIDIA/DXCache"),
+                               ("NVIDIA GL cache", "NVIDIA/GLCache"), ("NVIDIA NV_Cache", "NVIDIA Corporation/NV_Cache"),
+                               ("AMD DX cache", "AMD/DxCache"), ("AMD DXC cache", "AMD/DxcCache"),
+                               ("AMD GL cache", "AMD/GLCache"), ("AMD Vulkan cache", "AMD/VkCache"),
+                               ("AMD OGL cache", "AMD/OglCache"), ("Intel shader cache", "Intel/ShaderCache")):
+                t.append(("Proton " + label, os.path.join(local, rel), "all"))
+        if game.docs:
+            t.append(("Civ V game cache", ci_resolve(os.path.join(game.docs, "cache")), "db"))
+    for base, suffix in ((xdg, ""), (flat, " (Flatpak Steam)")):
+        t.append(("Mesa shader cache" + suffix, os.path.join(base, "mesa_shader_cache"), "all"))
+        t.append(("Mesa shader cache DB" + suffix, os.path.join(base, "mesa_shader_cache_db"), "all"))
+        t.append(("NVIDIA GL cache" + suffix, os.path.join(base, "nvidia", "GLCache"), "all"))
+    t.append(("NVIDIA GL cache (legacy)", os.path.expanduser("~/.nv/GLCache"), "all"))
+    return t
+
+
+def clear_gfx_caches(game):
+    """[(label, deleted, skipped)] for every target that exists."""
+    results = []
+    for label, path, mode in gfx_cache_targets(game):
+        if not os.path.isdir(path) or os.path.islink(path):
+            continue
+        deleted = skipped = 0
+        if mode == "all":
+            files = []
+            for dirpath, _d, names in os.walk(path):
+                files += [os.path.join(dirpath, n) for n in names]
+        else:
+            ext = ".db" if mode == "db" else ".dxvk-cache"
+            files = [os.path.join(path, n) for n in os.listdir(path)
+                     if n.lower().endswith(ext) and os.path.isfile(os.path.join(path, n))]
+        if mode == "dxvk" and not files:
+            continue
+        for f in files:
+            try:
+                os.unlink(f)
+                deleted += 1
+            except OSError:
+                skipped += 1
+        if mode == "all":  # empty subfolders only, never the root itself
+            for dirpath, _d, _f in sorted(os.walk(path, topdown=False), key=lambda w: -len(w[0])):
+                if dirpath != path:
+                    try:
+                        os.rmdir(dirpath)
+                    except OSError:
+                        pass
+        results.append((label, deleted, skipped))
+    return results
+
+
+# ── Redownload (GameResetExtra.cs) ────────────────────────────────────────────
+
+def validate_game_folder(game):
+    """Full path to delete, or raises with the reason. Every check must pass:
+    this is the only delete not confined to a folder we created."""
+    if game is None or not os.path.isdir(game.root):
+        raise InstallerError("Couldn't find a Civilization V install with Steam.")
+    path = os.path.abspath(game.root)
+    parent, grand = os.path.dirname(path), os.path.dirname(os.path.dirname(path))
+    if (os.path.basename(path).lower() != CIV_FOLDER.lower() or os.path.basename(parent).lower() != "common"
+            or os.path.basename(grand).lower() != "steamapps"):
+        raise InstallerError('"%s" isn\'t a standard Steam game folder -- not deleting it.' % path)
+    if os.path.islink(path):
+        raise InstallerError('"%s" is a link to another folder -- not deleting it. Delete the game manually.' % path)
+    if not any(os.path.isfile(os.path.join(path, n)) for n in ("CivilizationV.exe", "CivilizationV_DX11.exe")):
+        raise InstallerError('"%s" has no CivilizationV.exe -- not deleting it.' % path)
+    return path
+
+
+def steam_tracks_game(path):
+    steamapps = os.path.dirname(os.path.dirname(path))
+    return os.path.isfile(os.path.join(steamapps, "appmanifest_%s.acf" % CIV_APPID))
+
+
+def delete_game_folder(path, log, progress):
+    """Deletes files, then folders deepest first. Symlinks are unlinked, never
+    followed, so nothing outside the game folder can go with it. Returns
+    (deleted, skipped, leftovers, folder_removed)."""
+    log("Listing files in %s ..." % path)
+    files, dirs = [], []
+    for dirpath, dirnames, names in os.walk(path, followlinks=False):
+        for d in dirnames:
+            full = os.path.join(dirpath, d)
+            (files if os.path.islink(full) else dirs).append(full)
+        files += [os.path.join(dirpath, n) for n in names]
+    log("%d files to delete." % len(files))
+    deleted = skipped = 0
+    leftovers = []
+    last = -1
+    for i, f in enumerate(files):
+        try:
+            os.unlink(f)
+            deleted += 1
+        except OSError:
+            skipped += 1
+            if len(leftovers) < 10:
+                leftovers.append(f)
+        pct = (i + 1) * 100 // max(1, len(files))
+        if pct != last:
+            progress(pct)
+            last = pct
+    for d in sorted(dirs, key=len, reverse=True):
+        try:
+            os.rmdir(d)
+        except OSError:
+            pass
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass
+    return deleted, skipped, leftovers, not os.path.exists(path)
+
+
+def redownload_game(game, log, progress):
+    path = validate_game_folder(game)
+    tracked = steam_tracks_game(path)
+    deleted, skipped, leftovers, removed = delete_game_folder(path, log, progress)
+    log("%d files deleted%s." % (deleted, ", %d in use/skipped" % skipped if skipped else ""))
+    for f in leftovers:
+        log("  couldn't delete: " + f)
+    n = sum(r[1] for r in clear_gfx_caches(game))
+    log("Caches cleared (%d files)." % n)
+    if not removed:
+        log("Some files couldn't be deleted. Close Steam and anything open in the game folder, "
+            "then run REDOWNLOAD CIV again.")
+    url = "steam://%s/%s" % ("validate" if tracked else "install", CIV_APPID)
+    log("Asking Steam to download the game again (%s)." % url)
+    log("When the download finishes, set Proton for Civ V if needed, then reinstall your mods and EUI here.")
+    if not open_in_desktop(url):
+        log("Couldn't open Steam. In Steam: Civ V > Properties > Installed Files > Verify integrity of game files.")
+    return removed
+
+
+# ── Installer self-update + ticker ────────────────────────────────────────────
+
+def fetch_ticker():
+    try:
+        text = http_bytes(RAW_MAIN + "/installer/ticker.txt", timeout=15).decode("utf-8", "replace").strip()
+        return " ".join(text.split()) or None
+    except InstallerError:
+        return None
+
+
+def fetch_latest_self():
+    """(version, script bytes) of the copy on main."""
+    try:
+        data = http_bytes(RAW_MAIN + "/" + SELF_REPO_PATH, timeout=30)
+    except InstallerError as e:
+        if "404" in str(e):
+            raise InstallerError("No Linux installer is published on main yet.") from None
+        raise
+    m = re.search(rb'^VERSION = "([^"]+)"', data, re.M)
+    if not m:
+        raise InstallerError("Couldn't read the version of the installer on GitHub.")
+    return m.group(1).decode(), data
+
+
+def in_git_checkout():
+    """True when this is the repo's own installer/linux/civ5-mod-installer --
+    not merely some file under a git work tree (e.g. a dotfiles repo in ~)."""
+    root = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+    return (os.path.basename(SCRIPT_DIR) == "linux" and os.path.basename(os.path.dirname(SCRIPT_DIR)) == "installer"
+            and os.path.exists(os.path.join(root, ".git")))
+
+
+def apply_self_update(data):
+    if in_git_checkout():
+        raise InstallerError("This copy lives in a git checkout -- update it with `git pull` instead.")
+    if not os.access(SCRIPT_DIR, os.W_OK):
+        raise InstallerError("Can't write to %s -- if a package manager installed this, update it there." % SCRIPT_DIR)
+    tmp = SCRIPT_PATH + ".new"
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.chmod(tmp, os.stat(SCRIPT_PATH).st_mode)
+    os.replace(tmp, SCRIPT_PATH)
+    # The cached EUI bundle tracks main too -- refresh it alongside.
+    try:
+        os.unlink(os.path.join(CACHE_DIR, "KekModInstaller.exe"))
+    except OSError:
+        pass
+
+
+# ── Installing this program onto the machine ──────────────────────────────────
+# The one-liner pipes this file into `python3 - install-self`, which puts a
+# copy in ~/.local/bin (the per-user bin folder most distros already have on
+# PATH), makes sure it IS on PATH, and adds an app-menu entry -- after that
+# players just type `civ5-mod-installer`. Self-update keeps that copy current.
+
+APP_CMD = "civ5-mod-installer"
+BIN_DIR = os.path.expanduser("~/.local/bin")
+INSTALLED_PATH = os.path.join(BIN_DIR, APP_CMD)
+DESKTOP_PATH = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
+                            "applications", APP_CMD + ".desktop")
+RC_MARKER = "# added by " + APP_CMD
+PATH_LINE = 'export PATH="$HOME/.local/bin:$PATH"  ' + RC_MARKER
+FISH_CONF = os.path.expanduser("~/.config/fish/conf.d/%s.fish" % APP_CMD)
+
+
+def _shell_rc_files():
+    """Startup files to put PATH_LINE in: ~/.bashrc always (bash is the login
+    shell on SteamOS, Fedora, Ubuntu...), ~/.zshrc when zsh is in use."""
+    files = [os.path.expanduser("~/.bashrc")]
+    if os.path.exists(os.path.expanduser("~/.zshrc")) or os.environ.get("SHELL", "").endswith("zsh"):
+        files.append(os.path.expanduser("~/.zshrc"))
+    return files
+
+
+def _on_path(folder):
+    return any(os.path.realpath(p) == os.path.realpath(folder)
+               for p in os.environ.get("PATH", "").split(os.pathsep) if p)
+
+
+def install_self(log):
+    """Returns True when the current shell already finds `civ5-mod-installer`."""
+    data = None
+    if os.path.isfile(SCRIPT_PATH):
+        with open(SCRIPT_PATH, "rb") as f:
+            data = f.read()
+    if not data or b'\nVERSION = "' not in data:
+        log("Downloading the installer from GitHub...")  # piped in: there's no file to copy
+        data = fetch_latest_self()[1]
+    os.makedirs(BIN_DIR, exist_ok=True)
+    if os.path.realpath(SCRIPT_PATH) != os.path.realpath(INSTALLED_PATH):
+        tmp = INSTALLED_PATH + ".new"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, INSTALLED_PATH)
+    log("Installed " + INSTALLED_PATH)
+
+    os.makedirs(os.path.dirname(DESKTOP_PATH), exist_ok=True)
+    with open(DESKTOP_PATH, "w") as f:
+        f.write("[Desktop Entry]\nType=Application\nName=Civ V Mod Installer\n"
+                "Comment=Install KEK Mod, Tournament Mod, Lekmod and EUI for Civilization V (Proton)\n"
+                'Exec="%s"\nTerminal=true\nIcon=applications-games\nCategories=Game;\n' % INSTALLED_PATH)
+    log("Added 'Civ V Mod Installer' to the app menu")
+
+    if _on_path(BIN_DIR):
+        return True
+    for rc in _shell_rc_files():
+        try:
+            with open(rc) as f:
+                if RC_MARKER in f.read():
+                    continue
+        except OSError:
+            pass
+        with open(rc, "a") as f:
+            f.write("\n" + PATH_LINE + "\n")
+        log("Added ~/.local/bin to PATH in " + rc.replace(os.path.expanduser("~"), "~"))
+    if os.path.isdir(os.path.dirname(FISH_CONF)):
+        with open(FISH_CONF, "w") as f:
+            f.write("fish_add_path -g $HOME/.local/bin  %s\n" % RC_MARKER)
+        log("Added ~/.local/bin to PATH for fish")
+    return False
+
+
+def uninstall_self(log):
+    """Removes the program, its menu entry, PATH lines, settings and cache.
+    Mods installed into the game are left alone."""
+    for path in (INSTALLED_PATH, DESKTOP_PATH, FISH_CONF):
+        if os.path.isfile(path):
+            os.unlink(path)
+            log("Removed " + path)
+    for rc in _shell_rc_files():
+        try:
+            with open(rc) as f:
+                lines = f.read().split("\n")
+        except OSError:
+            continue
+        kept = []
+        for l in lines:
+            if RC_MARKER in l:
+                if kept and kept[-1] == "":
+                    kept.pop()  # the blank line install_self put before it
+                continue
+            kept.append(l)
+        if len(kept) != len(lines):
+            with open(rc, "w") as f:
+                f.write("\n".join(kept))
+            log("Removed the PATH line from " + rc.replace(os.path.expanduser("~"), "~"))
+    for d in (CONFIG_DIR, CACHE_DIR):
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+            log("Removed " + d)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Command line
+# ══════════════════════════════════════════════════════════════════════════════
+
+class Out:
+    """Themed plain-terminal output: magenta everywhere, green only for what's
+    installed (same as the full-screen UI), plain text when piped or NO_COLOR.
+    Every line starts in magenta and colored spans fall back to it, so
+    uncolored text is never the terminal's default color."""
+
+    BASE = "1;38;5;199"
+
+    def __init__(self, color):
+        self.color = color
+        self.tty = sys.stdout.isatty()
+        self._bar = False
+
+    def c(self, code, s):
+        return "\033[%sm%s\033[0;%sm" % (code, s, self.BASE) if self.color else s
+
+    def g(self, s):
+        return self.c("1;38;5;46", s)
+
+    def m(self, s):
+        return self.c(self.BASE, s)
+
+    def d(self, s):
+        return self.c("38;5;89", s)
+
+    def _emit(self, s, stream=None):
+        if self.color:
+            s = "\033[%sm%s\033[0m" % (self.BASE, s)
+        print(s, file=stream or sys.stdout)
+
+    def _clear_bar(self):
+        if self._bar:
+            sys.stdout.write("\r\033[K")
+            self._bar = False
+
+    def banner(self):
+        self._emit("-=[ CIV V MOD INSTALLER ]=-" + self.d("  v%s // linux @OBLAST" % VERSION))
+
+    def section(self, title):
+        self._emit("═[ %s ]%s" % (title, "═" * max(3, 50 - len(title))))
+
+    def line(self, s):
+        self._clear_bar()
+        self._emit(s)
+
+    def log(self, msg):
+        self._clear_bar()
+        self._emit("  ▸ " + msg)
+
+    def progress(self, pct):
+        if not self.tty:
+            return
+        width = 30
+        fill = width * pct // 100
+        bar = "  [" + "█" * fill + self.d("░" * (width - fill)) + "] %3d%%" % pct
+        sys.stdout.write("\r\033[K" + ("\033[%sm%s\033[0m" % (self.BASE, bar) if self.color else bar))
+        sys.stdout.flush()
+        self._bar = True
+
+    def done(self):
+        self._clear_bar()
+
+    def error(self, msg):
+        self._clear_bar()
+        self._emit("[!!] " + msg, sys.stderr)
+
+    def check(self, ok, msg):
+        self._emit("  " + ("[OK]" if ok else "[!!]") + " " + msg)
+
+
+class Cli:
+    def __init__(self, args, out):
+        self.args = args
+        self.out = out
+        self.settings = Settings()
+
+    # helpers
+    def game(self, require=True):
+        game = find_game(self.settings, self.args.civ_dir)
+        if require:
+            if game is None:
+                raise InstallerError("Civilization V wasn't found in any Steam library. Pass --civ-dir "
+                                     "\".../steamapps/common/%s\" or save it with `settings --civ-dir`." % CIV_FOLDER)
+            problem = game.problem()
+            if problem:
+                raise InstallerError(problem)
+        return game
+
+    def confirm(self, question):
+        if self.args.yes:
+            return True
+        if not sys.stdin.isatty():
+            raise InstallerError(question + " (re-run with --yes to confirm)")
+        ans = input(self.out.m("[??] ") + question + " [y/N] ").strip().lower()
+        return ans in ("y", "yes")
+
+    def require_civ_closed(self):
+        if is_civ_running():
+            raise InstallerError("Civilization V is running. Close it first (or `civ5-mod-installer kill`).")
+
+    def releases(self, mods=MODS):
+        out = {}
+        for m in mods:
+            try:
+                out[m.id] = m.source.list_releases()
+            except InstallerError:
+                pass
+        return out
+
+    def run_job(self, fn, *a):
+        fn(*a, self.out.log, self.out.progress)
+        self.out.done()
+
+    def beta(self):
+        return self.args.beta or self.settings.show_beta
+
+    # commands
+    def cmd_status(self):
+        game = self.game(require=False)
+        offline = getattr(self.args, "offline", False)
+        releases = {} if offline else self.releases()
+        state = State(game, releases, self.settings.show_beta)
+        self.out.banner()
+        self.out.line(self.out.d(" game   ") + (game.root if game else self.out.m("not found")))
+        if game:
+            self.out.line(self.out.d(" prefix ") + (game.prefix or self.out.m("none yet -- launch Civ V once under Proton")))
+        self.out.section("GAME MODS")
+        for mod in MODS:
+            v = state.mod_version(mod)
+            dot = self.out.g("●") if v else self.out.m("○")
+            line = "  %s %s" % (dot, (self.out.g(mod.name) if v else self.out.m(mod.name)))
+            if v:
+                line += self.out.g("  " + v)
+            if mod.id in state.updates:
+                line += self.out.g("  » update: " + state.updates[mod.id])
+            self.out.line(line)
+            if mod.extra:
+                ev = state.extras.get(mod.extra.id)
+                self.out.line("      %s %s" % (self.out.g("└─ ●") if ev is not None else self.out.m("└─ ○"),
+                                                   self.out.g(mod.extra.name + ("  " + ev if ev else "")) if ev is not None
+                                                   else self.out.m(mod.extra.name)))
+        self.out.section("INTERFACE MODS")
+        for v in EUI_VARIANTS:
+            active = state.eui == v.id
+            if active and state.eui_match is False:
+                self.out.line("  %s %s" % (self.out.g("!"), self.out.g(v.name + " -- VERSION MISMATCH")))
+            else:
+                self.out.line("  %s %s" % (self.out.g("●") if active else self.out.m("○"),
+                                           self.out.g(v.label()) if active else self.out.m(v.label())))
+        self.out.section("CHECKS")
+        checks = run_checks(game, state)
+        for ok, msg in checks:
+            self.out.check(ok, msg)
+        if offline:
+            self.out.line(self.out.d("  (offline: update check skipped)"))
+        return 0 if all(ok for ok, _ in checks) else 1
+
+    def cmd_versions(self):
+        mod = mod_by_name(self.args.mod)
+        rels = mod.source.list_releases()
+        beta = self.beta()
+        game = self.game(require=False)
+        current = None
+        if game and not game.problem():
+            current = State(game, {}, beta).mod_version(mod)
+        self.out.section(mod.name.upper() + " VERSIONS")
+        latest = latest_release(mod, rels, beta)
+        for r in rels:
+            if r.prerelease and not beta:
+                continue
+            tags = []
+            if mod.beta_optin:
+                tags.append("[beta]" if r.prerelease else "[stable]")
+            if r.extra:
+                tags.append(r.extra)
+            if latest and r.tag == latest.tag:
+                tags.append(self.out.m("« latest"))
+            if current and r.tag.lower() == current.lower():
+                tags.append(self.out.m("« installed"))
+            self.out.line("  %-16s %s" % (r.tag, "  ".join(tags)))
+        if mod.beta_optin and not beta:
+            self.out.line(self.out.d("  (betas hidden -- add --beta or `settings --beta on`)"))
+        return 0
+
+    def cmd_install(self):
+        mod = mod_by_name(self.args.mod)
+        game = self.game()
+        self.require_civ_closed()
+        state = State(game, {}, self.settings.show_beta)
+        if mod is TOURNAMENT and state.eui == "eui_xits":
+            if not self.confirm("Tournament Mod and EUI XITS are not compatible. Install anyway?"):
+                return 1
+        conflicts = [m for m in state.installed_mods() if m is not mod]
+        if conflicts:
+            names = ", ".join(m.name for m in conflicts)
+            if not self.confirm("Installing %s will uninstall %s first -- these mods can't run side by side. "
+                                "Continue?" % (mod.name, names)):
+                return 1
+        self.out.banner()
+        for c in conflicts:
+            self.out.section("REMOVING " + c.name.upper())
+            self.run_job(uninstall_mod, game, c)
+        self.out.section("INSTALLING " + mod.name.upper())
+        self.run_job(install_mod, game, mod, self.args.version, self.beta())
+        return 0
+
+    def cmd_uninstall(self):
+        mod = mod_by_name(self.args.mod)
+        game = self.game()
+        self.require_civ_closed()
+        self.out.section("REMOVING " + mod.name.upper())
+        self.run_job(uninstall_mod, game, mod)
+        return 0
+
+    def cmd_eui(self):
+        game = self.game()
+        self.require_civ_closed()
+        if self.args.action == "install":
+            v = eui_by_name(self.args.variant)
+            state = State(game, {}, False)
+            if v.id == "eui_xits" and TOURNAMENT.id in state.installed:
+                if not self.confirm("Tournament Mod and EUI XITS are not compatible. Install anyway?"):
+                    return 1
+            self.out.section("INSTALLING " + v.name.upper())
+            self.run_job(eui_install, game, v)
+        else:
+            self.out.section("REMOVING EUI")
+            self.run_job(eui_remove, game)
+        return 0
+
+    def cmd_verify(self):
+        game = self.game(require=False)
+        state = State(game, self.releases(), self.settings.show_beta)
+        self.out.section("CHECKS")
+        checks = run_checks(game, state)
+        for ok, msg in checks:
+            self.out.check(ok, msg)
+        extras = scan_extra_folders(game)
+        self.out.section("UNRECOGNIZED FOLDERS")
+        if not extras:
+            self.out.line(self.out.d("  Nothing -- every folder in Assets/DLC and Assets/Maps is accounted for."))
+        by_name = {}
+        for e in extras:
+            by_name.setdefault(e.name.lower(), []).append(e)
+            self.out.line("  %s %-40s %s" % (self.out.m("[%s]" % e.where), e.name, self.out.d(format_size(e.size))))
+        if extras and not (self.args.archive or self.args.delete):
+            self.out.line(self.out.d("  Keep them, or: verify --archive NAME (zip in place) / --delete NAME (no undo)"))
+
+        def pick(name):
+            hits = by_name.get(name.lower())
+            if not hits:
+                raise InstallerError("'%s' isn't one of the unrecognized folders listed above." % name)
+            return hits[0]
+
+        for name in self.args.archive or []:
+            e = pick(name)
+            zp = archive_folder(e)
+            self.out.log("Archived %s -> %s" % (e.name, zp))
+        for name in self.args.delete or []:
+            e = pick(name)
+            if self.confirm('Permanently delete "%s"? This cannot be undone.' % e.name):
+                remove_tree(e.path)
+                self.out.log("Deleted " + e.name)
+        return 0 if all(ok for ok, _ in checks) else 1
+
+    def cmd_clear_cache(self):
+        game = self.game(require=False)
+        self.require_civ_closed()
+        self.out.section("CLEAR GFX CACHE")
+        for label, deleted, skipped in clear_gfx_caches(game):
+            self.out.log("%s: %d deleted%s" % (label, deleted, ", %d in use/skipped" % skipped if skipped else ""))
+        self.out.log("DONE. Caches rebuild automatically on next launch.")
+        return 0
+
+    def cmd_redownload(self):
+        game = self.game(require=False)
+        self.require_civ_closed()
+        path = validate_game_folder(game)
+        size = dir_size(path)
+        self.out.section("REDOWNLOAD CIV")
+        self.out.line(self.out.m("  Deletes the ENTIRE game folder:"))
+        self.out.line("  " + path)
+        self.out.line("  Steam then downloads it again (%s). Every mod and EUI in it is removed." % format_size(size))
+        self.out.line("  Saves and settings in the Proton prefix are kept.")
+        if self.args.confirm != "DELETE":
+            if not sys.stdin.isatty():
+                raise InstallerError("Refusing without confirmation: pass --confirm DELETE.")
+            if input(self.out.m("  Type DELETE to confirm: ")).strip() != "DELETE":
+                self.out.line("  Cancelled.")
+                return 1
+        self.require_civ_closed()
+        removed = redownload_game(game, self.out.log, self.out.progress)
+        self.out.done()
+        return 0 if removed else 1
+
+    def cmd_launch(self):
+        if is_civ_running():
+            self.out.line("Civilization V is already running.")
+            return 0
+        if not open_in_desktop("steam://rungameid/" + CIV_APPID):
+            raise InstallerError("Couldn't hand steam://rungameid/%s to Steam (no xdg-open or steam found)." % CIV_APPID)
+        self.out.log("Asked Steam to launch Civilization V.")
+        return 0
+
+    def cmd_kill(self):
+        if not is_civ_running():
+            self.out.line("Civilization V isn't running.")
+            return 0
+        if not self.confirm("Force-closing ends the game immediately -- unsaved progress is lost. Continue?"):
+            return 1
+        n = force_close_civ()
+        self.out.log("Killed %d Civilization V process%s." % (n, "" if n == 1 else "es"))
+        return 0
+
+    def cmd_open(self):
+        game = self.game()
+        if open_in_desktop(game.dlc):
+            self.out.log("Opened " + game.dlc)
+        else:
+            self.out.line(game.dlc)
+        return 0
+
+    def cmd_settings(self):
+        s = self.settings
+        changed = False
+        if self.args.set_beta is not None:
+            s.show_beta = self.args.set_beta == "on"
+            changed = True
+        if self.args.set_civ_dir is not None:
+            if self.args.set_civ_dir.lower() == "auto":
+                s.civ_dir = None
+            else:
+                g = Game(os.path.expanduser(self.args.set_civ_dir))
+                if g.problem():
+                    raise InstallerError(g.problem())
+                s.civ_dir = g.root
+            changed = True
+        if changed:
+            s.save()
+        self.out.section("SETTINGS")
+        self.out.line("  beta builds  " + (self.out.m("on") if s.show_beta else self.out.m("off")))
+        self.out.line("  civ folder   " + (s.civ_dir or self.out.d("auto-detect")))
+        self.out.line(self.out.d("  file: " + Settings.PATH))
+        return 0
+
+    def cmd_install_self(self):
+        self.out.section("INSTALLING " + APP_CMD.upper())
+        ready = install_self(self.out.log)
+        self.out.line("")
+        if ready:
+            self.out.line("  Done. Run it any time with:  " + APP_CMD)
+        else:
+            self.out.line("  Done. Open a new terminal, then run:  " + APP_CMD)
+            self.out.line("  (or right now:  ~/.local/bin/" + APP_CMD + ")")
+        self.out.line("  It's also in your app menu as 'Civ V Mod Installer'.")
+        return 0
+
+    def cmd_uninstall_self(self):
+        if not self.confirm("Remove %s from this machine? Mods already installed in Civ V stay." % APP_CMD):
+            return 1
+        self.out.section("REMOVING " + APP_CMD.upper())
+        uninstall_self(self.out.log)
+        return 0
+
+    def cmd_self_update(self):
+        if in_git_checkout():
+            raise InstallerError("This copy lives in a git checkout -- update it with `git pull` instead.")
+        latest, data = fetch_latest_self()
+        if not is_newer_version(latest, VERSION):
+            self.out.line("Already up to date (v%s)." % VERSION)
+            return 0
+        apply_self_update(data)
+        self.out.log("Updated v%s -> v%s." % (VERSION, latest))
+        return 0
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="civ5-mod-installer",
+        description="KEK Mod installer for Civilization V under Steam Proton. Run with no command "
+                    "for the full-screen installer.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="mods: kekmod, tournament, lekmod    eui variants: eui, xits")
+    p.add_argument("--civ-dir", metavar="DIR", help="Civ V folder (.../steamapps/common/%s) for this run" % CIV_FOLDER)
+    p.add_argument("--no-color", action="store_true", help="plain output")
+    p.add_argument("--ascii", action="store_true", help="full-screen UI without Unicode box art")
+    p.add_argument("-y", "--yes", action="store_true", help="answer yes to confirmations")
+    p.add_argument("--version", action="version", version="civ5-mod-installer " + VERSION)
+    sub = p.add_subparsers(dest="command", metavar="command")
+
+    sub.add_parser("tui", help="full-screen installer (default)")
+    s = sub.add_parser("status", help="installed mods, updates and checks")
+    s.add_argument("--offline", action="store_true", help="skip the GitHub update check")
+    for name, hlp in (("install", "install or update a mod"), ("uninstall", "remove a mod and its bonus map")):
+        s = sub.add_parser(name, help=hlp)
+        s.add_argument("mod", help="kekmod, tournament or lekmod")
+        if name == "install":
+            s.add_argument("--version", dest="version", metavar="TAG", help="exact release tag (default: latest)")
+            s.add_argument("--beta", action="store_true", help="consider beta releases for 'latest'")
+    s = sub.add_parser("versions", help="list a mod's releases")
+    s.add_argument("mod")
+    s.add_argument("--beta", action="store_true", help="include betas")
+    s = sub.add_parser("eui", help="install/remove EUI")
+    s.add_argument("action", choices=["install", "uninstall"])
+    s.add_argument("variant", nargs="?", default="eui", help="eui (default) or xits")
+    s = sub.add_parser("verify", help="run every check and list unrecognized mod folders")
+    s.add_argument("--archive", action="append", metavar="NAME", help="zip an unrecognized folder in place")
+    s.add_argument("--delete", action="append", metavar="NAME", help="permanently delete an unrecognized folder")
+    sub.add_parser("clear-cache", help="wipe shader caches + Civ V's cached DBs (black map fix)")
+    s = sub.add_parser("redownload", help="delete the whole game folder and have Steam download it again")
+    s.add_argument("--confirm", metavar="DELETE", help="skip the typed confirmation")
+    sub.add_parser("launch", help="launch Civ V through Steam")
+    sub.add_parser("kill", help="force close a running Civ V")
+    sub.add_parser("open", help="open the DLC folder")
+    s = sub.add_parser("settings", help="show or change settings")
+    s.add_argument("--beta", dest="set_beta", choices=["on", "off"], help="enable beta builds")
+    s.add_argument("--civ-dir", dest="set_civ_dir", metavar="DIR|auto", help="remember the Civ V folder")
+    sub.add_parser("self-update", help="update this installer from GitHub")
+    sub.add_parser("install-self", help="install this program as the `%s` command + app menu entry" % APP_CMD)
+    sub.add_parser("uninstall-self", help="remove this program from the machine (mods stay)")
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    for attr in ("beta", "version", "offline", "archive", "delete", "confirm", "set_beta", "set_civ_dir"):
+        if not hasattr(args, attr):
+            setattr(args, attr, None)
+    color = not args.no_color and sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+    out = Out(color)
+    command = args.command
+    if command is None:
+        command = "tui" if sys.stdin.isatty() and sys.stdout.isatty() else "status"
+    try:
+        if command == "tui":
+            return run_tui(args)
+        return getattr(Cli(args, out), "cmd_" + command.replace("-", "_"))()
+    except InstallerError as e:
+        out.error(str(e))
+        return 1
+    except KeyboardInterrupt:
+        out.done()
+        out.error("Interrupted.")
+        return 130
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+#  Full-screen installer (curses)
+# ══════════════════════════════════════════════════════════════════════════════
+# Same "cracktro" look as the WinForms build: black background, neon green
+# text, magenta box art cut with [ TITLES ], a scrolling greetz ticker and a
+# blinking "> STATUS_" line -- plus an ANSI-shadow logo with copper-bar color
+# cycling when the terminal has 256 colors. Keyboard (arrows/Tab/Enter,
+# hotkeys) and mouse both work.
+
+LOGO_GLYPHS = {
+    "C": [" ██████╗", "██╔════╝", "██║     ", "██║     ", "╚██████╗", " ╚═════╝"],
+    "I": ["██╗", "██║", "██║", "██║", "██║", "╚═╝"],
+    "V": ["██╗   ██╗", "██║   ██║", "██║   ██║", "╚██╗ ██╔╝", " ╚████╔╝ ", "  ╚═══╝  "],
+    " ": ["   "] * 6,
+}
+LOGO = ["".join(LOGO_GLYPHS[ch][i] for ch in "CIV V") for i in range(6)]
+LOGO_WIDTH = len(LOGO[0])
+# Copper-bar cycle for the logo and ticker -- magentas only; green means "installed".
+COPPER = [53, 89, 125, 161, 162, 199, 205, 199, 162, 161, 125, 89]
+SPINNER = "|/-\\"
+TICKER_CHARS_PER_SEC = 8
+
+
+def run_tui(args):
+    try:
+        import curses  # noqa: F401
+    except ImportError:
+        raise InstallerError("This Python has no curses module -- use the commands instead (see --help).")
+    locale.setlocale(locale.LC_ALL, "")
+    os.environ.setdefault("ESCDELAY", "25")
+    app = Tui(args)
+    import curses
+    curses.wrapper(app.main)
+    return 0
+
+
+def tail(s, width):
+    """s cut from the left to fit width -- the end of a path is the useful part."""
+    return s if len(s) <= width else "..." + s[-(width - 3):]
+
+
+class Btn:
+    def __init__(self, id, label, action, enabled=True, color="mag", short=None):
+        self.id, self.label, self.action, self.enabled, self.color, self.short = id, label, action, enabled, color, short
+        self.y = self.x = self.w = 0
+
+
+class Tui:
+    def __init__(self, args):
+        import curses
+        self.curses = curses
+        self.args = args
+        self.settings = Settings()
+        self.game = None
+        self.releases = {}
+        self.releases_loaded = False
+        self.state = State(None, {}, False)
+        self.log_lines = []
+        self.log_scroll = 0
+        self.progress = 0
+        self.status = "SYSTEM READY"
+        self.busy = False
+        self.q = queue.Queue()
+        self.ticker = DEFAULT_TICKER
+        self.latest_self = None
+        self.focus = "mod:%s:install" % MODS[0].id
+        self.buttons = []
+        self.frame = 0
+        self.civ_running = False
+        self._civ_poll = 0
+
+    # ── setup ──
+    def main(self, scr):
+        c = self.curses
+        self.scr = scr
+        c.curs_set(0)
+        scr.keypad(True)
+        scr.timeout(40)
+        try:
+            c.mousemask(c.BUTTON1_CLICKED | c.BUTTON1_PRESSED)
+        except c.error:
+            pass
+        # What ncurses will actually emit -- not getpreferredencoding(), which
+        # Python's UTF-8 mode reports as UTF-8 even under LC_ALL=C.
+        self.uni = "utf" in (locale.nl_langinfo(locale.CODESET) or "").lower() and not self.args.ascii
+        self._init_colors()
+        self.boot()
+        while True:
+            self.pump()
+            self.draw()
+            k = scr.getch()
+            if k == -1:
+                continue
+            if not self.handle_key(k):
+                break
+
+    def _init_colors(self):
+        c = self.curses
+        c.start_color()
+        rich = c.COLORS >= 256
+        self.rich = rich
+        # Green is reserved for installed mods/maps/EUI; everything else is
+        # magenta. "dim" is a dark magenta for decoration (shadows, empty
+        # progress, key hints). Red is only the UPDATE button, as on Windows.
+        G, D, M, R = (46, 89, 199, 203) if rich else (c.COLOR_GREEN, c.COLOR_MAGENTA, c.COLOR_MAGENTA, c.COLOR_RED)
+        K = c.COLOR_BLACK
+        for i, (fg, bg) in enumerate([(G, K), (D, K), (M, K), (K, G), (K, M), (R, K), (K, R)], 1):
+            c.init_pair(i, fg, bg)
+        self.attr = {
+            "grn": c.color_pair(1) | c.A_BOLD, "dim": c.color_pair(2) | (0 if rich else c.A_DIM),
+            "mag": c.color_pair(3) | c.A_BOLD,
+            "grn_inv": c.color_pair(4) | c.A_BOLD, "mag_inv": c.color_pair(5) | c.A_BOLD,
+            # disabled: same hue as the row's install state, just not bold
+            "grn_off": c.color_pair(1), "mag_off": c.color_pair(3),
+            "red": c.color_pair(6) | c.A_BOLD, "red_inv": c.color_pair(7) | c.A_BOLD, "red_off": c.color_pair(6),
+        }
+        self.copper = []
+        if rich and c.COLOR_PAIRS > 40:
+            for i, col in enumerate(COPPER):
+                c.init_pair(20 + i, col, K)
+                self.copper.append(c.color_pair(20 + i) | c.A_BOLD)
+        self.scr.bkgd(" ", c.color_pair(1))
+
+    def boot(self):
+        self.log("CIV V MOD INSTALLER v%s // LINUX EDITION" % VERSION)
+        self.game = find_game(self.settings, self.args.civ_dir)
+        if self.game is None:
+            self.log("Steam libraries scanned: Civilization V not found.")
+            self.ask_civ_dir(first_run=True)
+        if self.game:
+            self.log("game:   " + self.game.root)
+            problem = self.game.problem()
+            if problem:
+                self.log("ERROR: " + problem)
+                self.msgbox("WRONG GAME BUILD", problem, color="mag")
+            else:
+                self.log("prefix: " + (self.game.prefix or "none yet (launch Civ V once under Proton)"))
+        self.refresh_state()
+        self.log("Fetching release lists...")
+        self.status = "CONNECTING TO GITHUB"
+        threading.Thread(target=self._fetch_thread, daemon=True).start()
+        self.civ_running_dialog()
+        self.startup_warnings()
+
+    def _fetch_thread(self):
+        rel = {}
+        for mod in MODS:
+            try:
+                rel[mod.id] = mod.source.list_releases()
+            except Exception:
+                pass
+        ticker = fetch_ticker()
+        latest = None
+        if not in_git_checkout():  # a checkout updates with git pull
+            try:
+                latest = fetch_latest_self()[0]
+            except Exception:
+                pass
+        # Make sure the exact-match check has the bundled EUI to compare with.
+        if not BUNDLE.zips():
+            try:
+                BUNDLE.fetch_exe()
+            except Exception:
+                pass
+        self.q.put(("fetched", (rel, ticker, latest)))
+
+    # ── worker plumbing ──
+    def log(self, msg):
+        for line in str(msg).split("\n"):
+            self.log_lines.append(line)
+        del self.log_lines[:-1000]
+        self.log_scroll = 0
+
+    def pump(self):
+        while True:
+            try:
+                kind, payload = self.q.get_nowait()
+            except queue.Empty:
+                break
+            if kind == "log":
+                self.log(payload)
+            elif kind == "progress":
+                self.progress = payload
+            elif kind == "done":
+                status, err = payload
+                self.busy = False
+                if err:
+                    self.status = "FAILED: " + err
+                    self.log("ERROR: " + err)
+                else:
+                    self.status = status
+                self.refresh_state()
+            elif kind == "fetched":
+                rel, ticker, latest = payload
+                self.releases = rel
+                self.releases_loaded = True
+                if ticker:
+                    self.ticker = ticker
+                if latest and is_newer_version(latest, VERSION):
+                    self.latest_self = latest
+                    self.log("Installer update available: v%s (press U)." % latest)
+                missing = [m.name for m in MODS if m.id not in rel]
+                self.log("Release lists: %d/%d loaded%s." % (len(rel), len(MODS),
+                         "" if not missing else " (offline for " + ", ".join(missing) + ")"))
+                if not self.busy:
+                    self.status = "SYSTEM READY"
+                self.refresh_state()
+        self._civ_poll -= 1
+        if self._civ_poll <= 0:
+            self.civ_running = is_civ_running()
+            self._civ_poll = 12
+
+    def start_job(self, status, fn):
+        self.busy = True
+        self.progress = 0
+        self.status = status
+        self.log_lines.append("")
+
+        def run():
+            try:
+                result = fn(lambda m: self.q.put(("log", m)), lambda p: self.q.put(("progress", p)))
+                self.q.put(("done", (result or "DONE.", None)))
+            except InstallerError as e:
+                self.q.put(("done", (None, str(e))))
+            except Exception as e:  # a bug, but never leave the UI stuck busy
+                self.q.put(("done", (None, "%s: %s" % (type(e).__name__, e))))
+        threading.Thread(target=run, daemon=True).start()
+
+    def refresh_state(self):
+        try:
+            self.state = State(self.game, self.releases, self.settings.show_beta)
+        except OSError as e:
+            self.log("ERROR: couldn't read the game folder (%s)" % e)
+
+    # ── drawing primitives ──
+    def put(self, y, x, s, attr=0, maxw=None):
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w:
+            return
+        if x < 0:
+            s, x = s[-x:], 0
+        if maxw is not None:
+            s = s[:max(0, maxw)]
+        # curses errors on writing the bottom-right cell; stop one short there.
+        s = s[:w - x - (1 if y == h - 1 else 0)]
+        if not s:
+            return
+        try:
+            self.scr.addstr(y, x, s, attr)
+        except self.curses.error:
+            pass
+
+    def ch(self, name):
+        u = {"tl": "╔", "tr": "╗", "bl": "╚", "br": "╝", "h": "═", "v": "║", "dot": "●", "hol": "○",
+             "full": "█", "empty": "░", "branch": "└─", "sh": "▒", "arrow": "»"}
+        a = {"tl": "+", "tr": "+", "bl": "+", "br": "+", "h": "-", "v": "|", "dot": "*", "hol": "o",
+             "full": "#", "empty": ".", "branch": "`-", "sh": ":", "arrow": ">"}
+        return (u if self.uni else a)[name]
+
+    def box(self, y, x, h, w, title=None, color="mag", fill=False, shadow=False):
+        a = self.attr[color]
+        if fill:
+            for i in range(1, h - 1):
+                self.put(y + i, x + 1, " " * (w - 2), self.attr["mag"])
+        if shadow:
+            sa = self.attr["dim"]
+            for i in range(1, h + 1):
+                self.put(y + i, x + w, self.ch("sh") * 2, sa)
+            self.put(y + h, x + 2, self.ch("sh") * w, sa)
+        self.put(y, x, self.ch("tl") + self.ch("h") * (w - 2) + self.ch("tr"), a)
+        for i in range(1, h - 1):
+            self.put(y + i, x, self.ch("v"), a)
+            self.put(y + i, x + w - 1, self.ch("v"), a)
+        self.put(y + h - 1, x, self.ch("bl") + self.ch("h") * (w - 2) + self.ch("br"), a)
+        if title:
+            self.put(y, x + 2, "[ ", a)
+            self.put(y, x + 4, title, self.attr["mag"])
+            self.put(y, x + 4 + len(title), " ]", a)
+
+    def button(self, b, y, x, w, registry):
+        b.y, b.x, b.w = y, x, w
+        label = b.label if len(b.label) + 4 <= w or not b.short else b.short
+        inner = label[:max(0, w - 2)].center(max(0, w - 2))
+        focused = self.focus == b.id and b.enabled
+        if not b.enabled:
+            attr = self.attr[b.color + "_off"]
+        elif focused:
+            attr = self.attr[b.color + "_inv"]
+        else:
+            attr = self.attr[b.color]
+        if focused:
+            self.put(y, x, ("▶" if self.uni else ">") + inner + ("◀" if self.uni else "<"), attr)
+        else:
+            self.put(y, x, "[" + inner + "]", attr)
+        registry.append(b)
+
+    # ── main screen ──
+    def draw(self, refresh=True):
+        self.frame += 1
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        self.buttons = []
+        if h < 22 or w < 72:
+            self.put(h // 2, max(0, (w - 34) // 2), "TERMINAL TOO SMALL -- NEED 72x22", self.attr["mag"])
+            self.put(h // 2 + 1, max(0, (w - 20) // 2), "(now %dx%d, Q quits)" % (w, h), self.attr["dim"])
+            if refresh:
+                scr.refresh()
+            return
+        W = min(w, 104)
+        x0 = (w - W) // 2
+        big = h >= 40 and W >= 78 and self.uni
+        y = self._draw_header(x0, W, big)
+        y = self._draw_mods(y, x0, W)
+        y = self._draw_eui(y, x0, W)
+        # progress + status
+        bar_w = W - 8
+        fill = bar_w * self.progress // 100
+        self.put(y, x0, "[", self.attr["mag"])
+        self.put(y, x0 + 1, self.ch("full") * fill, self.attr["mag"])
+        self.put(y, x0 + 1 + fill, self.ch("empty") * (bar_w - fill), self.attr["dim"])
+        self.put(y, x0 + 1 + bar_w, "]", self.attr["mag"])
+        self.put(y, x0 + 3 + bar_w, "%3d%%" % self.progress, self.attr["mag"])
+        y += 1
+        cursor = "_" if (self.frame // 12) % 2 == 0 else " "
+        spin = (SPINNER[(self.frame // 3) % 4] + " ") if (self.busy or not self.releases_loaded) else ""
+        status_attr = self.attr["mag"] if self.status.startswith("FAILED") else self.attr["mag"]
+        self.put(y, x0, "> " + spin + self.status + cursor, status_attr, maxw=W)
+        y += 1
+        # log
+        log_h = h - 2 - y
+        self._draw_log(y, x0, W, log_h)
+        self._draw_bottom(h - 2, x0, W)
+        self._draw_ticker(h - 1, x0, W)
+        # Focus stays on a button that's only disabled for now (busy) and
+        # resumes there; it only moves if that button is gone entirely.
+        if self.focus not in [b.id for b in self.buttons]:
+            first = next((b for b in self.buttons if b.enabled), None)
+            self.focus = first.id if first else None
+        if refresh:
+            scr.refresh()
+
+    def _draw_header(self, x0, W, big):
+        btns = []
+        if self.latest_self:
+            btns.append(Btn("update", "UPDATE v" + self.latest_self, self.on_self_update, not self.busy, "mag", "UPDATE"))
+        btns.append(Btn("setup", "SETUP", self.on_settings, not self.busy))
+        tag = "-=[ v%s // LINUX @OBLAST ]=-" % VERSION
+        if big:
+            for i, row in enumerate(LOGO):
+                for j, chh in enumerate(row):
+                    if chh == "█":
+                        a = self.copper[(i + self.frame // 4) % len(self.copper)] if self.copper else self.attr["mag"]
+                    elif chh == " ":
+                        continue
+                    else:
+                        a = self.attr["mag"]
+                    self.put(i, x0 + 1 + j, chh, a)
+            rx = x0 + LOGO_WIDTH + 5
+            self.put(0, rx, "M O D   I N S T A L L E R", self.attr["mag"])
+            self.put(2, rx, tag, self.attr["mag"])
+            bx = rx
+            for b in btns:
+                bw = min(len(b.label) + 4, x0 + W - bx)
+                self.button(b, 4, bx, bw, self.buttons)
+                bx += bw + 1
+            y = 6
+        else:
+            self.put(0, x0, "CIV V MOD INSTALLER", self.attr["mag"])
+            self.put(0, x0 + 21, tag, self.attr["mag"])
+            bx = x0 + W
+            for b in reversed(btns):
+                lbl = b.short if (b.short and x0 + 21 + len(tag) + 20 > bx - len(b.label)) else b.label
+                bw = len(lbl) + 4
+                bx -= bw
+                b.label = lbl
+                self.button(b, 0, bx, bw, self.buttons)
+                bx -= 1
+            y = 1
+        self.put(y, x0, self.ch("h") * W, self.attr["mag"])
+        return y + 1
+
+    def _mod_buttons(self, mod):
+        st = self.state
+        installed = mod.id in st.installed
+        update = mod.id in st.updates
+        ok = not self.busy
+        col = "grn" if installed else "mag"
+        return [Btn("mod:%s:install" % mod.id, "UPDATE" if update else ("REINSTALL" if installed else "INSTALL"),
+                    lambda: self.on_install(mod), ok, "red" if update else col),
+                Btn("mod:%s:uninstall" % mod.id, "UNINSTALL", lambda: self.on_uninstall(mod), ok and installed, col),
+                Btn("mod:%s:version" % mod.id, "VERSION", lambda: self.on_version(mod), ok, col)]
+
+    def _draw_mods(self, y, x0, W):
+        rows = 2 * len(MODS)
+        self.box(y, x0, rows + 2, W, "GAME MODS", "mag")
+        bw = 13
+        bx = x0 + W - 2 - (3 * bw + 2)
+        self._col_x = [bx, bx + bw + 1, bx + 2 * (bw + 1)]
+        st = self.state
+        for i, mod in enumerate(MODS):
+            ry = y + 1 + 2 * i
+            installed = mod.id in st.installed
+            a = self.attr["grn"] if installed else self.attr["mag"]
+            self.put(ry, x0 + 2, self.ch("dot") if installed else self.ch("hol"), a)
+            name = mod.name.upper()
+            self.put(ry, x0 + 4, name, a)
+            nx = x0 + 4 + len(name) + 2
+            if installed:
+                v = st.mod_version(mod)
+                self.put(ry, nx, v, a, maxw=bx - nx - 1)
+                nx += len(v) + 2
+            if mod.id in st.updates:
+                self.put(ry, nx, "%s %s available" % (self.ch("arrow"), st.updates[mod.id]), a, maxw=bx - nx - 1)
+            for b, cx in zip(self._mod_buttons(mod), self._col_x):
+                self.button(b, ry, cx, bw, self.buttons)
+            if mod.extra:
+                ev = st.extras.get(mod.extra.id)
+                ea = self.attr["grn"] if ev is not None else self.attr["mag"]
+                self.put(ry + 1, x0 + 4, self.ch("branch"), ea)
+                self.put(ry + 1, x0 + 7, self.ch("dot") if ev is not None else self.ch("hol"), ea)
+                self.put(ry + 1, x0 + 9, mod.extra.name + ("  " + ev if ev else ""), ea)
+                if installed and ev is None:
+                    self.put(ry + 1, x0 + 11 + len(mod.extra.name), "missing -- reinstall to add it", ea)
+        return y + rows + 2
+
+    def _draw_eui(self, y, x0, W):
+        n = len(EUI_VARIANTS)
+        self.box(y, x0, n + 2, W, "INTERFACE MODS", "mag")
+        bw = 13
+        st = self.state
+        for i, v in enumerate(EUI_VARIANTS):
+            ry = y + 1 + i
+            active = st.eui == v.id
+            mismatch = active and st.eui_match is False
+            a = self.attr["grn"] if active else self.attr["mag"]
+            self.put(ry, x0 + 2, "!" if mismatch else (self.ch("dot") if active else self.ch("hol")), a)
+            self.put(ry, x0 + 4, (v.name + " -- VERSION MISMATCH") if mismatch else v.label(), a)
+            col = "grn" if active else "mag"
+            ok = not self.busy
+            for b, cx in zip([Btn("eui:%s:install" % v.id, "REINSTALL" if active else "INSTALL",
+                                  lambda v=v: self.on_eui_install(v), ok, col),
+                              Btn("eui:%s:uninstall" % v.id, "UNINSTALL", self.on_eui_remove, ok and active, col)],
+                             self._col_x):
+                self.button(b, ry, cx, bw, self.buttons)
+        return y + n + 2
+
+    def _wrap_log(self, width):
+        out = []
+        for line in self.log_lines:
+            if line.startswith(("ERROR", "FAILED")) or "couldn't" in line.lower() or "warning" in line.lower():
+                a = self.attr["mag"]
+            elif line.startswith("CIV V MOD INSTALLER"):
+                a = self.attr["mag"]
+            else:
+                a = self.attr["mag"]
+            for part in (textwrap.wrap(line, width, subsequent_indent="  ") or [""]):
+                out.append((part, a))
+        return out
+
+    def _draw_log(self, y, x0, W, h):
+        hint = " %s MOVE  ENTER SELECT  PGUP/DN LOG  S SETUP  Q QUIT " % ("↑↓←→" if self.uni else "ARROWS")
+        self.box(y, x0, h, W, "LOG", "mag")
+        if len(hint) + 6 < W:
+            self.put(y + h - 1, x0 + W - len(hint) - 3, hint, self.attr["dim"])
+        inner = h - 2
+        lines = self._wrap_log(W - 4)
+        max_scroll = max(0, len(lines) - inner)
+        self.log_scroll = min(self.log_scroll, max_scroll)
+        start = max(0, len(lines) - inner - self.log_scroll)
+        for i, (text, a) in enumerate(lines[start:start + inner]):
+            self.put(y + 1 + i, x0 + 2, text, a)
+        if self.log_scroll:
+            self.put(y, x0 + W - 14, "[ +%d ]" % self.log_scroll, self.attr["mag"])
+
+    def _draw_bottom(self, y, x0, W):
+        ok = not self.busy
+        launch = (Btn("kill", "FORCE CLOSE CIV", self.on_force_close, ok, "mag", "FORCE CLOSE") if self.civ_running
+                  else Btn("launch", "LAUNCH CIV", self.on_launch, ok, "mag", "LAUNCH"))
+        btns = [Btn("open", "OPEN DLC FOLDER", self.on_open, True, "mag", "OPEN DLC"),
+                Btn("verify", "VERIFY MODS", self.on_verify, ok, "mag", "VERIFY"),
+                Btn("gfx", "CLEAR GFX CACHE", self.on_clear_gfx, ok, "mag", "CLEAR GFX"),
+                Btn("reset", "REDOWNLOAD CIV", self.on_redownload, ok, "mag", "REDOWNLOAD"),
+                launch]
+        n = len(btns)
+        bw = (W - (n - 1)) // n
+        for i, b in enumerate(btns):
+            width = bw if i < n - 1 else W - (n - 1) * (bw + 1)
+            self.button(b, y, x0 + i * (bw + 1), width, self.buttons)
+
+    def _draw_ticker(self, y, x0, W):
+        text = "   " + self.ticker + "   "
+        # Clock-based, not per frame: redraws on every keypress would
+        # otherwise speed it up while keys are held.
+        pos = int(time.monotonic() * TICKER_CHARS_PER_SEC) % len(text)
+        view = (text * (W // len(text) + 2))[pos:pos + W]
+        for i, chh in enumerate(view):
+            a = self.copper[(i + self.frame // 2) % len(self.copper)] if self.copper else self.attr["mag"]
+            self.put(y, x0 + i, chh, a)
+
+    # ── input ──
+    def handle_key(self, k):
+        c = self.curses
+        if k in (ord("q"), ord("Q"), 27):
+            if self.busy and self.msgbox("QUIT", "Something is still being installed. Quit anyway? That can "
+                                         "leave a half-installed mod behind.", ["QUIT", "STAY"], "mag", 1, 1) != 0:
+                return True
+            return False
+        if k == c.KEY_RESIZE:
+            return True
+        if k == c.KEY_MOUSE:
+            self._click(self.buttons)
+            return True
+        if k in (ord("s"), ord("S")) and not self.busy:
+            self.on_settings()
+        elif k in (ord("u"), ord("U")) and self.latest_self and not self.busy:
+            self.on_self_update()
+        elif k == c.KEY_PPAGE:
+            self.log_scroll += 5
+        elif k == c.KEY_NPAGE:
+            self.log_scroll = max(0, self.log_scroll - 5)
+        elif k in (10, 13, c.KEY_ENTER, ord(" ")):
+            b = next((b for b in self.buttons if b.id == self.focus and b.enabled), None)
+            if b:
+                b.action()
+        else:
+            self._navigate(k, self.buttons)
+        return True
+
+    def _click(self, buttons):
+        try:
+            _id, mx, my, _z, _bs = self.curses.getmouse()
+        except self.curses.error:
+            return
+        for b in buttons:
+            if b.enabled and b.y == my and b.x <= mx < b.x + b.w:
+                self.focus = b.id
+                b.action()
+                return
+
+    def _navigate(self, k, buttons):
+        c = self.curses
+        live = [b for b in buttons if b.enabled]
+        if not live:
+            return
+        cur = next((b for b in buttons if b.id == self.focus), live[0])
+        if k in (9, c.KEY_BTAB):
+            order = sorted(live + ([] if cur in live else [cur]), key=lambda b: (b.y, b.x))
+            i = order.index(cur)
+            self.focus = order[(i + (1 if k == 9 else -1)) % len(order)].id
+            return
+        if k in (c.KEY_LEFT, ord("h")):
+            cand = [b for b in live if b.y == cur.y and b.x < cur.x]
+            pick = max(cand, key=lambda b: b.x) if cand else None
+        elif k in (c.KEY_RIGHT, ord("l")):
+            cand = [b for b in live if b.y == cur.y and b.x > cur.x]
+            pick = min(cand, key=lambda b: b.x) if cand else None
+        elif k in (c.KEY_UP, ord("k"), c.KEY_DOWN, ord("j")):
+            up = k in (c.KEY_UP, ord("k"))
+            ys = sorted({b.y for b in live if (b.y < cur.y if up else b.y > cur.y)}, reverse=up)
+            pick = None
+            if ys:
+                row = [b for b in live if b.y == ys[0]]
+                center = cur.x + cur.w // 2
+                pick = min(row, key=lambda b: abs(b.x + b.w // 2 - center))
+        else:
+            return
+        if pick:
+            self.focus = pick.id
+
+    # ── dialogs ──
+    def _dialog_loop(self, draw_fn, key_fn):
+        """Runs a modal: the main screen keeps animating underneath."""
+        saved_focus = self.focus
+        try:
+            while True:
+                self.pump()
+                self.draw(refresh=False)
+                draw_fn()
+                self.scr.refresh()
+                k = self.scr.getch()
+                if k == -1 or k == self.curses.KEY_RESIZE:
+                    continue
+                res = key_fn(k)
+                if res is not None:
+                    return res[0]
+        finally:
+            self.focus = saved_focus
+
+    def _dialog_frame(self, title, width, height, color):
+        h, w = self.scr.getmaxyx()
+        width = min(width, w - 4)
+        height = min(height, h - 2)
+        y, x = max(0, (h - height) // 2), max(0, (w - width) // 2)
+        self.box(y, x, height, width, title, color, fill=True, shadow=True)
+        return y, x, width, height
+
+    def msgbox(self, title, text, buttons=("OK",), color="mag", default=0, escape=None):
+        """Returns the chosen button index (escape on ESC/q)."""
+        state = {"focus": default, "btns": []}
+        width = 66
+
+        def draw():
+            lines = []
+            for para in text.split("\n"):
+                lines += textwrap.wrap(para, width - 6) or [""]
+            y, x, W, H = self._dialog_frame(title, width, len(lines) + 5, color)
+            for i, line in enumerate(lines):
+                self.put(y + 2 + i, x + 3, line, self.attr["mag"])
+            labels = list(buttons)
+            bws = [len(l) + 4 for l in labels]
+            bx = x + W - 2 - sum(bws) - (len(labels) - 1)
+            state["btns"] = []
+            for i, l in enumerate(labels):
+                b = Btn(i, l, None, True, "mag")
+                self.focus = state["focus"]
+                self.button(b, y + H - 2, bx, bws[i], state["btns"])
+                bx += bws[i] + 1
+
+        def key(k):
+            c = self.curses
+            if k in (27, ord("q")) and escape is not None:
+                return (escape,)
+            if k in (10, 13, c.KEY_ENTER, ord(" ")):
+                return (state["focus"],)
+            if k in (c.KEY_LEFT, c.KEY_BTAB, ord("h")):
+                state["focus"] = (state["focus"] - 1) % len(buttons)
+            elif k in (c.KEY_RIGHT, 9, ord("l")):
+                state["focus"] = (state["focus"] + 1) % len(buttons)
+            elif k == c.KEY_MOUSE:
+                hit = self._hit(state["btns"])
+                if hit is not None:
+                    return (hit.id,)
+            return None
+        return self._dialog_loop(draw, key)
+
+    def _hit(self, btns):
+        try:
+            _id, mx, my, _z, _bs = self.curses.getmouse()
+        except self.curses.error:
+            return None
+        return next((b for b in btns if b.enabled and b.y == my and b.x <= mx < b.x + b.w), None)
+
+    def prompt(self, title, text, initial="", confirm_word=None, ok_label="OK", color="mag"):
+        """Text field dialog. With confirm_word, OK stays disabled until the
+        exact word is typed and Enter in the field never confirms."""
+        st = {"value": initial, "focus": "field", "btns": []}
+        c = self.curses
+
+        def ok_enabled():
+            return st["value"].strip() == confirm_word if confirm_word else bool(st["value"].strip())
+
+        def draw():
+            lines = []
+            for para in text.split("\n"):
+                lines += textwrap.wrap(para, 66 - 6) or [""]
+            y, x, W, H = self._dialog_frame(title, 72, len(lines) + 7, color)
+            for i, line in enumerate(lines):
+                self.put(y + 2 + i, x + 3, line, self.attr["mag"])
+            fy = y + 2 + len(lines) + 1
+            fw = W - 6
+            val = st["value"][-(fw - 2):]
+            cur = "_" if (self.frame // 10) % 2 == 0 and st["focus"] == "field" else " "
+            self.put(fy, x + 3, "[" + (val + cur).ljust(fw - 2) + "]",
+                     self.attr["mag"] | (self.curses.A_UNDERLINE if st["focus"] == "field" else 0))
+            st["btns"] = []
+            labels = [(ok_label, ok_enabled(), "mag"), ("CANCEL", True, "mag")]
+            bx = x + W - 2 - sum(len(l) + 4 for l, _e, _c in labels) - 1
+            for i, (l, en, col) in enumerate(labels):
+                b = Btn(i, l, None, en, col)
+                self.focus = st["focus"]
+                self.button(b, y + H - 2, bx, len(l) + 4, st["btns"])
+                bx += len(l) + 5
+
+        def key(k):
+            if k == 27:
+                return (None,)
+            if k == c.KEY_MOUSE:
+                hit = self._hit(st["btns"])
+                if hit is not None:
+                    return (st["value"].strip(),) if hit.id == 0 else (None,)
+                return None
+            if k in (9, c.KEY_DOWN, c.KEY_BTAB, c.KEY_UP):
+                order = ["field", 0, 1] if ok_enabled() else ["field", 1]
+                i = order.index(st["focus"]) if st["focus"] in order else 0
+                st["focus"] = order[(i + (-1 if k in (c.KEY_BTAB, c.KEY_UP) else 1)) % len(order)]
+                return None
+            if st["focus"] == "field":
+                if k in (10, 13, c.KEY_ENTER):
+                    if ok_enabled() and not confirm_word:
+                        return (st["value"].strip(),)
+                    if ok_enabled():
+                        st["focus"] = 0
+                elif k in (c.KEY_BACKSPACE, 127, 8):
+                    st["value"] = st["value"][:-1]
+                elif 32 <= k < 0x110000 and k not in (c.KEY_LEFT, c.KEY_RIGHT):
+                    try:
+                        chh = chr(k)
+                    except ValueError:
+                        return None
+                    if chh.isprintable():
+                        st["value"] += chh.upper() if confirm_word else chh
+                return None
+            if k in (c.KEY_LEFT, c.KEY_RIGHT):
+                st["focus"] = 1 if st["focus"] == 0 else (0 if ok_enabled() else 1)
+            elif k in (10, 13, c.KEY_ENTER, ord(" ")):
+                return (st["value"].strip(),) if st["focus"] == 0 and ok_enabled() else (None,)
+            return None
+        return self._dialog_loop(draw, key)
+
+    def pick(self, title, items, selected=0):
+        """items: [(label, attr_name)]. Returns index or None."""
+        st = {"sel": selected, "top": 0}
+        c = self.curses
+
+        def draw():
+            h, _w = self.scr.getmaxyx()
+            rows = min(len(items), max(3, h - 10))
+            y, x, W, H = self._dialog_frame(title, 60, rows + 5, "mag")
+            if st["sel"] < st["top"]:
+                st["top"] = st["sel"]
+            if st["sel"] >= st["top"] + rows:
+                st["top"] = st["sel"] - rows + 1
+            for i in range(rows):
+                idx = st["top"] + i
+                if idx >= len(items):
+                    break
+                label, an = items[idx]
+                a = self.attr["mag_inv"] if idx == st["sel"] else self.attr[an]
+                self.put(y + 2 + i, x + 3, (" " + label).ljust(W - 6)[:W - 6], a)
+                st.setdefault("rows", {})[y + 2 + i] = idx
+            self.put(y + H - 2, x + 3, "ENTER install  ESC cancel", self.attr["dim"])
+            if len(items) > rows:
+                self.put(y + H - 2, x + W - 12, "%d/%d" % (st["sel"] + 1, len(items)), self.attr["mag"])
+
+        def key(k):
+            if k in (27, ord("q")):
+                return (None,)
+            if k in (10, 13, c.KEY_ENTER, ord(" ")):
+                return (st["sel"],)
+            if k in (c.KEY_UP, ord("k")):
+                st["sel"] = max(0, st["sel"] - 1)
+            elif k in (c.KEY_DOWN, ord("j"), 9):
+                st["sel"] = min(len(items) - 1, st["sel"] + 1)
+            elif k == c.KEY_PPAGE:
+                st["sel"] = max(0, st["sel"] - 10)
+            elif k == c.KEY_NPAGE:
+                st["sel"] = min(len(items) - 1, st["sel"] + 10)
+            elif k == c.KEY_MOUSE:
+                try:
+                    _i, _mx, my, _z, _b = c.getmouse()
+                except c.error:
+                    return None
+                idx = st.get("rows", {}).get(my)
+                if idx is not None:
+                    return (idx,)
+            return None
+        return self._dialog_loop(draw, key)
+
+    # ── flows ──
+    def need_game(self):
+        if self.game is None:
+            self.ask_civ_dir()
+            if self.game is None:
+                return False
+        problem = self.game.problem()
+        if problem:
+            self.msgbox("WRONG GAME BUILD", problem, color="mag")
+            return False
+        return True
+
+    def ask_civ_dir(self, first_run=False):
+        while True:
+            choice = self.msgbox("CIVILIZATION V NOT FOUND",
+                                 "Couldn't find Civilization V in any Steam library. Enter its folder "
+                                 "(.../steamapps/common/%s) -- it's remembered for next time." % CIV_FOLDER,
+                                 ["ENTER PATH", "CONTINUE" if first_run else "CANCEL"], "mag", 0, 1)
+            if choice != 0:
+                return
+            path = self.prompt("CIV V FOLDER", "Path to the Civ V install folder:", self.settings.civ_dir or "")
+            if not path:
+                return
+            g = Game(os.path.expanduser(path))
+            if not os.path.isdir(g.root):
+                self.msgbox("NOT FOUND", g.root + " doesn't exist.", color="mag")
+                continue
+            self.game = g
+            self.settings.civ_dir = g.root
+            self.settings.save()
+            self.log("game:   " + g.root + " (saved)")
+            self.refresh_state()
+            return
+
+    def civ_running_dialog(self):
+        """RETRY / FORCE CLOSE / CANCEL until the game is gone or the player
+        gives up. True when it's safe to touch the game files."""
+        while is_civ_running():
+            choice = self.msgbox("CIVILIZATION V IS RUNNING",
+                                 "Please close the game before installing or uninstalling mods, then choose Retry.",
+                                 ["RETRY", "FORCE CLOSE", "CANCEL"], "mag", 0, 2)
+            if choice == 2:
+                return False
+            if choice == 1:
+                self.log("Force closed %d Civ V process(es)." % force_close_civ())
+        self.civ_running = False
+        return True
+
+    def startup_warnings(self):
+        st = self.state
+        inst = st.installed_mods()
+        if len(inst) >= 2:
+            self.msgbox("CONFLICTING MODS INSTALLED", " and ".join(m.name for m in inst)
+                        + " are both installed. They can't run together -- uninstall one.", color="mag")
+        missing = st.missing_maps()
+        if missing:
+            self.msgbox("MISSING BONUS MAP", "\n".join("%s is missing its %s." % (m.name, m.extra.name) for m in missing)
+                        + "\n\nReinstall to add it.", color="mag")
+        if st.eui == "eui_xits" and TOURNAMENT.id in st.installed:
+            self.msgbox("NOT COMPATIBLE", "Tournament Mod and EUI XITS are not compatible.", color="mag")
+
+    def confirm_tm_xits(self):
+        return self.msgbox("NOT COMPATIBLE", "Tournament Mod and EUI XITS are not compatible. Install anyway?",
+                           ["INSTALL", "CANCEL"], "mag", 1, 1) == 0
+
+    def on_install(self, mod, tag=None):
+        if self.busy or not self.need_game() or not self.civ_running_dialog():
+            return
+        st = self.state
+        if mod is TOURNAMENT and st.eui == "eui_xits" and not self.confirm_tm_xits():
+            return
+        conflicts = [m for m in st.installed_mods() if m is not mod]
+        if conflicts:
+            names = ", ".join(m.name for m in conflicts)
+            if self.msgbox("INSTALL " + mod.name.upper(),
+                           "Installing %s will uninstall %s first -- these mods can't run side by side in "
+                           "Civilization V. Continue?" % (mod.name, names),
+                           ["CONTINUE", "CANCEL"], "mag", 1, 1) != 0:
+                return
+        game, beta = self.game, self.settings.show_beta
+
+        def job(log, progress):
+            for cm in conflicts:
+                log("=== REMOVING %s ===" % cm.name.upper())
+                uninstall_mod(game, cm, log, progress)
+            log("=== INSTALLING %s ===" % mod.name.upper())
+            return "[INSTALLED] " + install_mod(game, mod, tag, beta, log, progress)
+        self.start_job("INSTALLING %s..." % mod.name.upper(), job)
+
+    def on_uninstall(self, mod):
+        if self.busy or not self.need_game() or not self.civ_running_dialog():
+            return
+        game = self.game
+
+        def job(log, progress):
+            log("=== REMOVING %s ===" % mod.name.upper())
+            uninstall_mod(game, mod, log, progress)
+            return "UNINSTALLED."
+        self.start_job("REMOVING %s FILES..." % mod.name.upper(), job)
+
+    def on_version(self, mod):
+        if self.busy:
+            return
+        rels = self.releases.get(mod.id) or []
+        beta = self.settings.show_beta and mod.beta_optin
+        current = (self.state.mod_version(mod) or "").lower()
+        items = [("Latest (auto -- newest, incl. beta)" if beta else "Latest (auto)", "mag")]
+        tags = [None]
+        for r in rels:
+            if r.prerelease and not self.settings.show_beta:
+                continue
+            label = r.tag
+            if r.extra:
+                label += "  - " + r.extra
+            if mod.beta_optin:
+                label += "  [beta]" if r.prerelease else "  [stable]"
+            if r.tag.lower() == current:
+                label += "  " + ("◄" if self.uni else "<") + " installed"
+            items.append((label, "mag"))
+            tags.append(r.tag)
+        if not rels:
+            items.append(("(release list unavailable -- offline?)", "dim"))
+        idx = self.pick(mod.name.upper() + " VERSION", items, 0)
+        if idx is None or idx >= len(tags):
+            return
+        self.status = "%s version set to %s" % (mod.name, tags[idx] or "auto")
+        self.on_install(mod, tags[idx])
+
+    def on_eui_install(self, v):
+        if self.busy or not self.need_game() or not self.civ_running_dialog():
+            return
+        if v.id == "eui_xits" and TOURNAMENT.id in self.state.installed and not self.confirm_tm_xits():
+            return
+        game = self.game
+
+        def job(log, progress):
+            log("=== INSTALLING %s ===" % v.name.upper())
+            eui_install(game, v, log, progress)
+            return "DONE."
+        self.start_job("INSTALLING %s..." % v.name.upper(), job)
+
+    def on_eui_remove(self):
+        if self.busy or not self.need_game() or not self.civ_running_dialog():
+            return
+        game = self.game
+
+        def job(log, progress):
+            log("=== REMOVING EUI ===")
+            eui_remove(game, log, progress)
+            return "DONE."
+        self.start_job("REMOVING EUI...", job)
+
+    def on_open(self):
+        if self.game is None:
+            self.msgbox("OPEN DLC FOLDER", "Couldn't find a Civilization V install with Steam.", color="mag")
+            return
+        if open_in_desktop(self.game.dlc):
+            self.log("Opened " + self.game.dlc)
+        else:
+            self.msgbox("OPEN DLC FOLDER", "No desktop file manager available. The folder is:\n\n" + self.game.dlc)
+
+    def on_launch(self):
+        if open_in_desktop("steam://rungameid/" + CIV_APPID):
+            self.log("Asked Steam to launch Civilization V.")
+            self._civ_poll = 0
+        else:
+            self.msgbox("LAUNCH CIV", "Couldn't reach Steam (no xdg-open or steam command found).", color="mag")
+
+    def on_force_close(self):
+        if self.msgbox("FORCE CLOSE CIVILIZATION V",
+                       "Civilization V is currently running.\n\nForce-closing it ends the process immediately -- "
+                       "any unsaved game progress will be lost. Continue?", ["FORCE CLOSE", "CANCEL"], "mag", 1, 1) == 0:
+            self.log("Force closed %d Civ V process(es)." % force_close_civ())
+            self._civ_poll = 0
+
+    def on_clear_gfx(self):
+        if is_civ_running():
+            self.msgbox("CLEAR GRAPHICS CACHES", "Civilization V is currently running. Close the game first, "
+                        "then clear the caches.")
+            return
+        self.log("=== CLEAR GFX CACHE ===")
+        results = clear_gfx_caches(self.game)
+        for label, deleted, skipped in results:
+            self.log("%s: %d deleted%s" % (label, deleted, ", %d in use/skipped" % skipped if skipped else ""))
+        if not results:
+            self.log("No shader caches found.")
+        self.log("DONE. Caches rebuild automatically on next launch.")
+        self.status = "GFX CACHES CLEARED."
+
+    def on_redownload(self):
+        if self.busy:
+            return
+        if is_civ_running():
+            self.msgbox("REDOWNLOAD CIV", "Civilization V is currently running. Close the game first, then redownload it.")
+            return
+        try:
+            path = validate_game_folder(self.game)
+        except InstallerError as e:
+            self.msgbox("REDOWNLOAD CIV", str(e), color="mag")
+            return
+        self.status = "MEASURING GAME FOLDER..."
+        self.draw()
+        size = dir_size(path)
+        self.status = "SYSTEM READY"
+        word = self.prompt("REDOWNLOAD CIV",
+                           "Deletes the ENTIRE game folder:\n%s\n\nSteam then downloads it again (%s). Every mod "
+                           "and EUI in it is removed. Saves and settings in the Proton prefix are kept.\n\n"
+                           "Type DELETE to confirm:" % (path, format_size(size)),
+                           confirm_word="DELETE", ok_label="REDOWNLOAD", color="mag")
+        if word != "DELETE":
+            return
+        if is_civ_running():
+            self.msgbox("REDOWNLOAD CIV", "Civilization V was started -- redownload cancelled.")
+            return
+        game = self.game
+
+        def job(log, progress):
+            log("=== REDOWNLOAD CIV ===")
+            return "GAME FILES DELETED." if redownload_game(game, log, progress) else "DELETE INCOMPLETE -- SEE LOG"
+        self.start_job("DELETING GAME FILES...", job)
+
+    def on_verify(self):
+        if self.busy:
+            return
+        self.status = "VERIFYING..."
+        self.draw()
+        self.refresh_state()
+        checks = run_checks(self.game, self.state)
+        extras = scan_extra_folders(self.game)
+        self.status = "SYSTEM READY"
+        self.verify_dialog(checks, extras)
+        self.refresh_state()
+
+    def verify_dialog(self, checks, extras):
+        c = self.curses
+        st = {"focus": 0, "top": 0, "btns": []}
+        all_ok = all(ok for ok, _ in checks)
+
+        def focusables():
+            out = []
+            for i in range(len(extras)):
+                out += [("archive", i), ("delete", i)]
+            return out + [("close", None)]
+
+        def draw():
+            h, _w = self.scr.getmaxyx()
+            H = min(h - 2, len(checks) + max(1, len(extras)) + 11)
+            y, x, W, H = self._dialog_frame("VERIFY MODS", 86, H, "mag")
+            for i, (ok, msg) in enumerate(checks):
+                self.put(y + 2 + i, x + 3, ("[OK] " if ok else "[!!] ") + msg, self.attr["mag"], maxw=W - 6)
+            yy = y + 3 + len(checks)
+            self.put(yy, x + 3, "Unrecognized folders in Assets/DLC + Assets/Maps. Leave a row alone to KEEP it.",
+                     self.attr["mag"], maxw=W - 6)
+            self.put(yy + 1, x + 3, "ARCHIVE = zip in place (undo: unzip).  DELETE = gone for good.",
+                     self.attr["dim"], maxw=W - 6)
+            list_y = yy + 2
+            rows = max(1, H - (list_y - y) - 3)
+            fl = focusables()
+            cur = fl[st["focus"]] if st["focus"] < len(fl) else ("close", None)
+            if cur[1] is not None:
+                if cur[1] < st["top"]:
+                    st["top"] = cur[1]
+                if cur[1] >= st["top"] + rows:
+                    st["top"] = cur[1] - rows + 1
+            st["btns"] = []
+            if not extras:
+                self.put(list_y, x + 3, "Nothing here -- everything's been kept, archived, or deleted.", self.attr["dim"])
+            for r in range(rows):
+                i = st["top"] + r
+                if i >= len(extras):
+                    break
+                e = extras[i]
+                ry = list_y + r
+                self.put(ry, x + 3, "[%s] " % e.where, self.attr["mag"])
+                self.put(ry, x + 10, e.name, self.attr["mag"], maxw=W - 52)
+                self.put(ry, x + W - 39, format_size(e.size).rjust(9), self.attr["dim"])
+                for kind, label, bx, col in (("archive", "ARCHIVE", x + W - 28, "mag"), ("delete", "DELETE", x + W - 15, "mag")):
+                    b = Btn((kind, i), label, None, True, col)
+                    self.focus = cur
+                    self.button(b, ry, bx, 12, st["btns"])
+            if len(extras) > rows:
+                self.put(list_y + rows, x + 3, "%d more -- scroll with the arrows" % (len(extras) - rows), self.attr["dim"])
+            b = Btn(("close", None), "CLOSE", None, True, "mag")
+            self.focus = cur
+            self.button(b, y + H - 2, x + W - 12, 9, st["btns"])
+
+        def act(target):
+            kind, i = target
+            if kind == "close":
+                return (None,)
+            e = extras[i]
+            try:
+                if kind == "archive":
+                    zp = archive_folder(e)
+                    self.log("Archived %s -> %s" % (e.name, zp))
+                else:
+                    if self.msgbox("CONFIRM DELETE", 'Permanently delete "%s"? This cannot be undone.' % e.name,
+                                   ["DELETE", "CANCEL"], "mag", 1, 1) != 0:
+                        return None
+                    remove_tree(e.path)
+                    self.log("Deleted " + e.name)
+            except OSError as ex:
+                self.msgbox("FAILED", "Couldn't %s %s: %s" % (kind, e.name, ex), color="mag")
+                return None
+            extras.pop(i)
+            st["focus"] = min(st["focus"], len(focusables()) - 1)
+            return None
+
+        def key(k):
+            fl = focusables()
+            if k in (27, ord("q")):
+                return (None,)
+            if k in (10, 13, c.KEY_ENTER, ord(" ")):
+                return act(fl[st["focus"]])
+            if k == c.KEY_MOUSE:
+                hit = self._hit(st["btns"])
+                return act(hit.id) if hit else None
+            if k in (c.KEY_RIGHT, 9, ord("l")):
+                st["focus"] = (st["focus"] + 1) % len(fl)
+            elif k in (c.KEY_LEFT, c.KEY_BTAB, ord("h")):
+                st["focus"] = (st["focus"] - 1) % len(fl)
+            elif k in (c.KEY_DOWN, ord("j")):
+                st["focus"] = min(len(fl) - 1, st["focus"] + 2)
+            elif k in (c.KEY_UP, ord("k")):
+                st["focus"] = max(0, st["focus"] - 2)
+            return None
+        self._dialog_loop(draw, key)
+
+    def on_settings(self):
+        c = self.curses
+        st = {"beta": self.settings.show_beta, "civ": self.settings.civ_dir, "focus": 0, "btns": []}
+        items = ["beta", "civ", "auto", "ok", "cancel"]
+
+        def draw():
+            y, x, W, H = self._dialog_frame("SETTINGS", 72, 11, "mag")
+            self.focus = items[st["focus"]]
+            mark = "[X]" if st["beta"] else "[ ]"
+            fa = self.attr["mag_inv"] if self.focus == "beta" else self.attr["mag"]
+            self.put(y + 2, x + 3, mark + " Enable beta builds", fa)
+            st["beta_row"] = y + 2
+            self.put(y + 4, x + 3, "Civ V folder:", self.attr["mag"])
+            self.put(y + 5, x + 5, tail(st["civ"], W - 8) if st["civ"] else "auto-detect (Steam libraries)",
+                     self.attr["mag"])
+            st["btns"] = []
+            for bid, label, bx in (("civ", "CHANGE", x + 3), ("auto", "AUTO-DETECT", x + 14)):
+                self.button(Btn(bid, label, None, True, "mag"), y + 6, bx, len(label) + 4, st["btns"])
+            self.put(y + 7, x + 3, "settings file: " + tail(Settings.PATH, W - 21), self.attr["dim"])
+            self.button(Btn("ok", "OK", None, True, "mag"), y + H - 2, x + W - 22, 6, st["btns"])
+            self.button(Btn("cancel", "CANCEL", None, True, "mag"), y + H - 2, x + W - 14, 10, st["btns"])
+
+        def act(item):
+            if item == "beta":
+                st["beta"] = not st["beta"]
+            elif item == "civ":
+                path = self.prompt("CIV V FOLDER", "Path to the Civ V install folder (.../steamapps/common/%s):"
+                                   % CIV_FOLDER, st["civ"] or (self.game.root if self.game else ""))
+                if path:
+                    g = Game(os.path.expanduser(path))
+                    if g.problem():
+                        self.msgbox("CAN'T USE THAT FOLDER", g.problem(), color="mag")
+                    else:
+                        st["civ"] = g.root
+            elif item == "auto":
+                st["civ"] = None
+            elif item == "ok":
+                return ("ok",)
+            elif item == "cancel":
+                return (None,)
+            return None
+
+        def key(k):
+            if k == 27:
+                return (None,)
+            if k in (10, 13, c.KEY_ENTER, ord(" ")):
+                return act(items[st["focus"]])
+            if k == c.KEY_MOUSE:
+                try:
+                    _i, mx, my, _z, _b = c.getmouse()
+                except c.error:
+                    return None
+                if my == st.get("beta_row"):
+                    return act("beta")
+                hit = next((b for b in st["btns"] if b.y == my and b.x <= mx < b.x + b.w), None)
+                return act(hit.id) if hit else None
+            if k in (c.KEY_DOWN, c.KEY_RIGHT, 9, ord("j"), ord("l")):
+                st["focus"] = (st["focus"] + 1) % len(items)
+            elif k in (c.KEY_UP, c.KEY_LEFT, c.KEY_BTAB, ord("k"), ord("h")):
+                st["focus"] = (st["focus"] - 1) % len(items)
+            return None
+
+        if self._dialog_loop(draw, key) == "ok":
+            moved = st["civ"] != self.settings.civ_dir
+            self.settings.show_beta = st["beta"]
+            self.settings.civ_dir = st["civ"]
+            self.settings.save()
+            if moved:
+                self.game = find_game(self.settings, None)
+                self.log("game:   " + (self.game.root if self.game else "not found"))
+            self.refresh_state()
+            self.status = "SETTINGS SAVED."
+
+    def on_self_update(self):
+        if self.busy:
+            return
+        if self.msgbox("UPDATE INSTALLER", "Download installer v%s from GitHub and restart?" % self.latest_self,
+                       ["UPDATE", "LATER"], "mag", 0, 1) != 0:
+            return
+        try:
+            _v, data = fetch_latest_self()
+            apply_self_update(data)
+        except InstallerError as e:
+            self.msgbox("UPDATE FAILED", str(e), color="mag")
+            return
+        self.curses.endwin()
+        os.execv(sys.executable, [sys.executable, SCRIPT_PATH] + sys.argv[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main())
