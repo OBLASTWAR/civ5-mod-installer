@@ -1,24 +1,24 @@
 #!/usr/bin/env python3
-# civ5-mod-installer -- Civ V Mod Installer, Linux (Proton) edition of KekModInstaller.exe.
+# civ5-mod -- Civ V Mod Installer, Linux (Proton) edition of KekModInstaller.exe.
 #
-#   ./civ5-mod-installer                              full-screen installer (same as `tui`)
-#   ./civ5-mod-installer status                       what's installed, updates, checks
-#   ./civ5-mod-installer install kekmod               latest release (also: tournament, lekmod)
-#   ./civ5-mod-installer install kekmod --version v2.0
-#   ./civ5-mod-installer uninstall kekmod
-#   ./civ5-mod-installer versions kekmod              list published releases
-#   ./civ5-mod-installer eui install [eui|xits]       / eui uninstall
-#   ./civ5-mod-installer verify                       checks + unrecognized mod folders
-#   ./civ5-mod-installer clear-cache                  shader caches + Civ V's cached DBs
-#   ./civ5-mod-installer redownload                   delete the game, have Steam fetch it
-#   ./civ5-mod-installer launch | kill | open         start Civ V / force close it / open DLC folder
-#   ./civ5-mod-installer settings --beta on           persistent settings
-#   ./civ5-mod-installer self-update
-#   ./civ5-mod-installer install-self | uninstall-self
+#   ./civ5-mod                         full-screen installer (same as `tui`)
+#   ./civ5-mod status                  what's installed, updates, checks
+#   ./civ5-mod install kekmod          latest release (also: tournament, lekmod)
+#   ./civ5-mod install kekmod --version v2.0
+#   ./civ5-mod uninstall kekmod
+#   ./civ5-mod versions kekmod         list published releases
+#   ./civ5-mod eui install [eui|xits]  / eui uninstall
+#   ./civ5-mod verify                  checks + unrecognized mod folders
+#   ./civ5-mod clear-cache             shader caches + Civ V's cached DBs
+#   ./civ5-mod redownload              delete the game, have Steam fetch it
+#   ./civ5-mod launch | kill | open    start Civ V / force close it / open DLC folder
+#   ./civ5-mod settings --beta on      persistent settings
+#   ./civ5-mod self-update
+#   ./civ5-mod install-self | uninstall-self
 #   (see --help, or `<command> --help`)
 #
-# Players install it with one line; afterwards it's just `civ5-mod-installer`:
-#   curl -fsSL https://raw.githubusercontent.com/OBLASTWAR/kek-mod/main/installer/linux/civ5-mod-installer | python3 - install-self
+# Players install it with one line; afterwards it's just `civ5-mod`:
+#   curl -fsSL https://raw.githubusercontent.com/OBLASTWAR/kek-mod/main/installer/linux/civ5-mod | python3 - install-self
 #
 # Mirrors installer/*.cs feature for feature: three mutually exclusive mods,
 # each with its bonus map (Fish Map Script / Better Pangaea / Lekmap), the two
@@ -42,7 +42,7 @@
 #     NVIDIA) plus the Windows-side ones inside the prefix.
 #
 # Needs only python3 (3.8+, standard library). Settings live in
-# ~/.config/civ5-mod-installer, downloads are cached in ~/.cache/civ5-mod-installer.
+# ~/.config/civ5-mod, downloads are cached in ~/.cache/civ5-mod.
 # Set GITHUB_TOKEN to lift GitHub's 60 requests/hour anonymous limit.
 
 import argparse
@@ -78,7 +78,7 @@ REPO_NAME = "kek-mod"
 # release/* branch -- those get deleted once a version ships (same reasoning
 # as InstallerCore.TickerBranch).
 RAW_MAIN = "https://raw.githubusercontent.com/%s/%s/main" % (REPO_OWNER, REPO_NAME)
-SELF_REPO_PATH = "installer/linux/civ5-mod-installer"
+SELF_REPO_PATH = "installer/linux/civ5-mod"
 EXE_REPO_PATH = "installer/KekModInstaller.exe"
 
 CIV_APPID = "8930"
@@ -93,8 +93,8 @@ DEFAULT_TICKER = ("*** GREETINGS FELLOW CIV ADDICTS ***  FUCK ALL THE HATING ASS
 
 SCRIPT_PATH = os.path.realpath(__file__)
 SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
-CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "civ5-mod-installer")
-CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "civ5-mod-installer")
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "civ5-mod")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "civ5-mod")
 USER_AGENT = "Civ5ModInstaller-Linux/" + VERSION
 
 
@@ -1691,7 +1691,7 @@ def fetch_latest_self():
 
 
 def in_git_checkout():
-    """True when this is the repo's own installer/linux/civ5-mod-installer --
+    """True when this is the repo's own installer/linux/civ5-mod --
     not merely some file under a git work tree (e.g. a dotfiles repo in ~)."""
     root = os.path.dirname(os.path.dirname(SCRIPT_DIR))
     return (os.path.basename(SCRIPT_DIR) == "linux" and os.path.basename(os.path.dirname(SCRIPT_DIR)) == "installer"
@@ -1719,9 +1719,9 @@ def apply_self_update(data):
 # The one-liner pipes this file into `python3 - install-self`, which puts a
 # copy in ~/.local/bin (the per-user bin folder most distros already have on
 # PATH), makes sure it IS on PATH, and adds an app-menu entry -- after that
-# players just type `civ5-mod-installer`. Self-update keeps that copy current.
+# players just type `civ5-mod`. Self-update keeps that copy current.
 
-APP_CMD = "civ5-mod-installer"
+APP_CMD = "civ5-mod"
 BIN_DIR = os.path.expanduser("~/.local/bin")
 INSTALLED_PATH = os.path.join(BIN_DIR, APP_CMD)
 DESKTOP_PATH = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
@@ -1746,7 +1746,7 @@ def _on_path(folder):
 
 
 def install_self(log):
-    """Returns True when the current shell already finds `civ5-mod-installer`."""
+    """Returns True when the current shell already finds `civ5-mod`."""
     data = None
     if os.path.isfile(SCRIPT_PATH):
         with open(SCRIPT_PATH, "rb") as f:
@@ -1921,7 +1921,7 @@ class Cli:
 
     def require_civ_closed(self):
         if is_civ_running():
-            raise InstallerError("Civilization V is running. Close it first (or `civ5-mod-installer kill`).")
+            raise InstallerError("Civilization V is running. Close it first (or `civ5-mod kill`).")
 
     def releases(self, mods=MODS):
         out = {}
@@ -2201,7 +2201,7 @@ class Cli:
 
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="civ5-mod-installer",
+        prog="civ5-mod",
         description="KEK Mod installer for Civilization V under Steam Proton. Run with no command "
                     "for the full-screen installer.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2210,7 +2210,7 @@ def build_parser():
     p.add_argument("--no-color", action="store_true", help="plain output")
     p.add_argument("--ascii", action="store_true", help="full-screen UI without Unicode box art")
     p.add_argument("-y", "--yes", action="store_true", help="answer yes to confirmations")
-    p.add_argument("--version", action="version", version="civ5-mod-installer " + VERSION)
+    p.add_argument("--version", action="version", version="civ5-mod " + VERSION)
     sub = p.add_subparsers(dest="command", metavar="command")
 
     sub.add_parser("tui", help="full-screen installer (default)")
