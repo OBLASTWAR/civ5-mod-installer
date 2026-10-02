@@ -1,20 +1,24 @@
 #!/usr/bin/env python3
-# kekmod-installer -- Linux (Proton) edition of KekModInstaller.exe.
+# civ5-mod-installer -- Civ V Mod Installer, Linux (Proton) edition of KekModInstaller.exe.
 #
-#   ./kekmod-installer                         full-screen installer (same as `tui`)
-#   ./kekmod-installer status                  what's installed, updates, checks
-#   ./kekmod-installer install kekmod          latest release (also: tournament, lekmod)
-#   ./kekmod-installer install kekmod --version v2.0
-#   ./kekmod-installer uninstall kekmod
-#   ./kekmod-installer versions kekmod         list published releases
-#   ./kekmod-installer eui install [eui|xits]  / eui uninstall
-#   ./kekmod-installer verify                  checks + unrecognized mod folders
-#   ./kekmod-installer clear-cache             shader caches + Civ V's cached DBs
-#   ./kekmod-installer redownload              delete the game, have Steam fetch it
-#   ./kekmod-installer launch | kill | open    start Civ V / force close it / open DLC folder
-#   ./kekmod-installer settings --beta on      persistent settings
-#   ./kekmod-installer self-update
+#   ./civ5-mod-installer                              full-screen installer (same as `tui`)
+#   ./civ5-mod-installer status                       what's installed, updates, checks
+#   ./civ5-mod-installer install kekmod               latest release (also: tournament, lekmod)
+#   ./civ5-mod-installer install kekmod --version v2.0
+#   ./civ5-mod-installer uninstall kekmod
+#   ./civ5-mod-installer versions kekmod              list published releases
+#   ./civ5-mod-installer eui install [eui|xits]       / eui uninstall
+#   ./civ5-mod-installer verify                       checks + unrecognized mod folders
+#   ./civ5-mod-installer clear-cache                  shader caches + Civ V's cached DBs
+#   ./civ5-mod-installer redownload                   delete the game, have Steam fetch it
+#   ./civ5-mod-installer launch | kill | open         start Civ V / force close it / open DLC folder
+#   ./civ5-mod-installer settings --beta on           persistent settings
+#   ./civ5-mod-installer self-update
+#   ./civ5-mod-installer install-self | uninstall-self
 #   (see --help, or `<command> --help`)
+#
+# Players install it with one line; afterwards it's just `civ5-mod-installer`:
+#   curl -fsSL https://raw.githubusercontent.com/OBLASTWAR/kek-mod/main/installer/linux/civ5-mod-installer | python3 - install-self
 #
 # Mirrors installer/*.cs feature for feature: three mutually exclusive mods,
 # each with its bonus map (Fish Map Script / Better Pangaea / Lekmap), the two
@@ -38,7 +42,7 @@
 #     NVIDIA) plus the Windows-side ones inside the prefix.
 #
 # Needs only python3 (3.8+, standard library). Settings live in
-# ~/.config/kekmod-installer, downloads are cached in ~/.cache/kekmod-installer.
+# ~/.config/civ5-mod-installer, downloads are cached in ~/.cache/civ5-mod-installer.
 # Set GITHUB_TOKEN to lift GitHub's 60 requests/hour anonymous limit.
 
 import argparse
@@ -63,7 +67,10 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-VERSION = "1.0"
+# Kept in step with the Windows build (InstallerCore.InstallerVersion in
+# installer/Installer.cs and installer/installer_version.txt): when one
+# bumps, bump this too.
+VERSION = "1.9"
 
 REPO_OWNER = "OBLASTWAR"
 REPO_NAME = "kek-mod"
@@ -71,7 +78,7 @@ REPO_NAME = "kek-mod"
 # release/* branch -- those get deleted once a version ships (same reasoning
 # as InstallerCore.TickerBranch).
 RAW_MAIN = "https://raw.githubusercontent.com/%s/%s/main" % (REPO_OWNER, REPO_NAME)
-SELF_REPO_PATH = "installer/linux/kekmod-installer"
+SELF_REPO_PATH = "installer/linux/civ5-mod-installer"
 EXE_REPO_PATH = "installer/KekModInstaller.exe"
 
 CIV_APPID = "8930"
@@ -86,9 +93,9 @@ DEFAULT_TICKER = ("*** GREETINGS FELLOW CIV ADDICTS ***  FUCK ALL THE HATING ASS
 
 SCRIPT_PATH = os.path.realpath(__file__)
 SCRIPT_DIR = os.path.dirname(SCRIPT_PATH)
-CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "kekmod-installer")
-CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "kekmod-installer")
-USER_AGENT = "KekModInstaller-Linux/" + VERSION
+CONFIG_DIR = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "civ5-mod-installer")
+CACHE_DIR = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "civ5-mod-installer")
+USER_AGENT = "Civ5ModInstaller-Linux/" + VERSION
 
 
 class InstallerError(Exception):
@@ -1684,19 +1691,18 @@ def fetch_latest_self():
 
 
 def in_git_checkout():
-    d = SCRIPT_DIR
-    while True:
-        if os.path.exists(os.path.join(d, ".git")):
-            return True
-        parent = os.path.dirname(d)
-        if parent == d:
-            return False
-        d = parent
+    """True when this is the repo's own installer/linux/civ5-mod-installer --
+    not merely some file under a git work tree (e.g. a dotfiles repo in ~)."""
+    root = os.path.dirname(os.path.dirname(SCRIPT_DIR))
+    return (os.path.basename(SCRIPT_DIR) == "linux" and os.path.basename(os.path.dirname(SCRIPT_DIR)) == "installer"
+            and os.path.exists(os.path.join(root, ".git")))
 
 
 def apply_self_update(data):
     if in_git_checkout():
         raise InstallerError("This copy lives in a git checkout -- update it with `git pull` instead.")
+    if not os.access(SCRIPT_DIR, os.W_OK):
+        raise InstallerError("Can't write to %s -- if a package manager installed this, update it there." % SCRIPT_DIR)
     tmp = SCRIPT_PATH + ".new"
     with open(tmp, "wb") as f:
         f.write(data)
@@ -1709,13 +1715,121 @@ def apply_self_update(data):
         pass
 
 
+# ── Installing this program onto the machine ──────────────────────────────────
+# The one-liner pipes this file into `python3 - install-self`, which puts a
+# copy in ~/.local/bin (the per-user bin folder most distros already have on
+# PATH), makes sure it IS on PATH, and adds an app-menu entry -- after that
+# players just type `civ5-mod-installer`. Self-update keeps that copy current.
+
+APP_CMD = "civ5-mod-installer"
+BIN_DIR = os.path.expanduser("~/.local/bin")
+INSTALLED_PATH = os.path.join(BIN_DIR, APP_CMD)
+DESKTOP_PATH = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"),
+                            "applications", APP_CMD + ".desktop")
+RC_MARKER = "# added by " + APP_CMD
+PATH_LINE = 'export PATH="$HOME/.local/bin:$PATH"  ' + RC_MARKER
+FISH_CONF = os.path.expanduser("~/.config/fish/conf.d/%s.fish" % APP_CMD)
+
+
+def _shell_rc_files():
+    """Startup files to put PATH_LINE in: ~/.bashrc always (bash is the login
+    shell on SteamOS, Fedora, Ubuntu...), ~/.zshrc when zsh is in use."""
+    files = [os.path.expanduser("~/.bashrc")]
+    if os.path.exists(os.path.expanduser("~/.zshrc")) or os.environ.get("SHELL", "").endswith("zsh"):
+        files.append(os.path.expanduser("~/.zshrc"))
+    return files
+
+
+def _on_path(folder):
+    return any(os.path.realpath(p) == os.path.realpath(folder)
+               for p in os.environ.get("PATH", "").split(os.pathsep) if p)
+
+
+def install_self(log):
+    """Returns True when the current shell already finds `civ5-mod-installer`."""
+    data = None
+    if os.path.isfile(SCRIPT_PATH):
+        with open(SCRIPT_PATH, "rb") as f:
+            data = f.read()
+    if not data or b'\nVERSION = "' not in data:
+        log("Downloading the installer from GitHub...")  # piped in: there's no file to copy
+        data = fetch_latest_self()[1]
+    os.makedirs(BIN_DIR, exist_ok=True)
+    if os.path.realpath(SCRIPT_PATH) != os.path.realpath(INSTALLED_PATH):
+        tmp = INSTALLED_PATH + ".new"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, INSTALLED_PATH)
+    log("Installed " + INSTALLED_PATH)
+
+    os.makedirs(os.path.dirname(DESKTOP_PATH), exist_ok=True)
+    with open(DESKTOP_PATH, "w") as f:
+        f.write("[Desktop Entry]\nType=Application\nName=Civ V Mod Installer\n"
+                "Comment=Install KEK Mod, Tournament Mod, Lekmod and EUI for Civilization V (Proton)\n"
+                'Exec="%s"\nTerminal=true\nIcon=applications-games\nCategories=Game;\n' % INSTALLED_PATH)
+    log("Added 'Civ V Mod Installer' to the app menu")
+
+    if _on_path(BIN_DIR):
+        return True
+    for rc in _shell_rc_files():
+        try:
+            with open(rc) as f:
+                if RC_MARKER in f.read():
+                    continue
+        except OSError:
+            pass
+        with open(rc, "a") as f:
+            f.write("\n" + PATH_LINE + "\n")
+        log("Added ~/.local/bin to PATH in " + rc.replace(os.path.expanduser("~"), "~"))
+    if os.path.isdir(os.path.dirname(FISH_CONF)):
+        with open(FISH_CONF, "w") as f:
+            f.write("fish_add_path -g $HOME/.local/bin  %s\n" % RC_MARKER)
+        log("Added ~/.local/bin to PATH for fish")
+    return False
+
+
+def uninstall_self(log):
+    """Removes the program, its menu entry, PATH lines, settings and cache.
+    Mods installed into the game are left alone."""
+    for path in (INSTALLED_PATH, DESKTOP_PATH, FISH_CONF):
+        if os.path.isfile(path):
+            os.unlink(path)
+            log("Removed " + path)
+    for rc in _shell_rc_files():
+        try:
+            with open(rc) as f:
+                lines = f.read().split("\n")
+        except OSError:
+            continue
+        kept = []
+        for l in lines:
+            if RC_MARKER in l:
+                if kept and kept[-1] == "":
+                    kept.pop()  # the blank line install_self put before it
+                continue
+            kept.append(l)
+        if len(kept) != len(lines):
+            with open(rc, "w") as f:
+                f.write("\n".join(kept))
+            log("Removed the PATH line from " + rc.replace(os.path.expanduser("~"), "~"))
+    for d in (CONFIG_DIR, CACHE_DIR):
+        if os.path.isdir(d):
+            shutil.rmtree(d, ignore_errors=True)
+            log("Removed " + d)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 #  Command line
 # ══════════════════════════════════════════════════════════════════════════════
 
 class Out:
-    """Themed plain-terminal output: same green/magenta cracktro palette as
-    the full-screen UI, degrading to plain text when piped or NO_COLOR."""
+    """Themed plain-terminal output: magenta everywhere, green only for what's
+    installed (same as the full-screen UI), plain text when piped or NO_COLOR.
+    Every line starts in magenta and colored spans fall back to it, so
+    uncolored text is never the terminal's default color."""
+
+    BASE = "1;38;5;199"
 
     def __init__(self, color):
         self.color = color
@@ -1723,19 +1837,21 @@ class Out:
         self._bar = False
 
     def c(self, code, s):
-        return "\033[%sm%s\033[0m" % (code, s) if self.color else s
+        return "\033[%sm%s\033[0;%sm" % (code, s, self.BASE) if self.color else s
 
     def g(self, s):
         return self.c("1;38;5;46", s)
 
     def m(self, s):
-        return self.c("1;38;5;199", s)
-
-    def r(self, s):
-        return self.c("1;38;5;203", s)
+        return self.c(self.BASE, s)
 
     def d(self, s):
-        return self.c("38;5;28", s)
+        return self.c("38;5;89", s)
+
+    def _emit(self, s, stream=None):
+        if self.color:
+            s = "\033[%sm%s\033[0m" % (self.BASE, s)
+        print(s, file=stream or sys.stdout)
 
     def _clear_bar(self):
         if self._bar:
@@ -1743,31 +1859,26 @@ class Out:
             self._bar = False
 
     def banner(self):
-        print(self.m("-=[ ") + self.g("CIV V MOD INSTALLER") + self.m(" ]=-") + self.d("  v%s // linux @OBLAST" % VERSION))
+        self._emit("-=[ CIV V MOD INSTALLER ]=-" + self.d("  v%s // linux @OBLAST" % VERSION))
 
     def section(self, title):
-        print(self.m("═[ ") + self.g(title) + self.m(" ]" + "═" * max(3, 50 - len(title))))
+        self._emit("═[ %s ]%s" % (title, "═" * max(3, 50 - len(title))))
 
     def line(self, s):
         self._clear_bar()
-        print(s)
+        self._emit(s)
 
     def log(self, msg):
         self._clear_bar()
-        if msg.startswith("DONE"):
-            print(self.g("  ▸ " + msg))
-        elif "couldn't" in msg.lower() or "warning" in msg.lower() or "failed" in msg.lower():
-            print(self.r("  ▸ ") + msg)
-        else:
-            print(self.m("  ▸ ") + msg)
+        self._emit("  ▸ " + msg)
 
     def progress(self, pct):
         if not self.tty:
             return
         width = 30
         fill = width * pct // 100
-        sys.stdout.write("\r\033[K  " + self.m("[") + self.g("█" * fill) + self.d("░" * (width - fill)) + self.m("]")
-                         + " %3d%%" % pct)
+        bar = "  [" + "█" * fill + self.d("░" * (width - fill)) + "] %3d%%" % pct
+        sys.stdout.write("\r\033[K" + ("\033[%sm%s\033[0m" % (self.BASE, bar) if self.color else bar))
         sys.stdout.flush()
         self._bar = True
 
@@ -1776,10 +1887,10 @@ class Out:
 
     def error(self, msg):
         self._clear_bar()
-        print(self.r("[!!] ") + msg, file=sys.stderr)
+        self._emit("[!!] " + msg, sys.stderr)
 
     def check(self, ok, msg):
-        print("  " + (self.g("[OK]") if ok else self.r("[!!]")) + " " + msg)
+        self._emit("  " + ("[OK]" if ok else "[!!]") + " " + msg)
 
 
 class Cli:
@@ -1810,7 +1921,7 @@ class Cli:
 
     def require_civ_closed(self):
         if is_civ_running():
-            raise InstallerError("Civilization V is running. Close it first (or `kekmod-installer kill`).")
+            raise InstallerError("Civilization V is running. Close it first (or `civ5-mod-installer kill`).")
 
     def releases(self, mods=MODS):
         out = {}
@@ -1835,9 +1946,9 @@ class Cli:
         releases = {} if offline else self.releases()
         state = State(game, releases, self.settings.show_beta)
         self.out.banner()
-        self.out.line(self.out.d(" game   ") + (game.root if game else self.out.r("not found")))
+        self.out.line(self.out.d(" game   ") + (game.root if game else self.out.m("not found")))
         if game:
-            self.out.line(self.out.d(" prefix ") + (game.prefix or self.out.r("none yet -- launch Civ V once under Proton")))
+            self.out.line(self.out.d(" prefix ") + (game.prefix or self.out.m("none yet -- launch Civ V once under Proton")))
         self.out.section("GAME MODS")
         for mod in MODS:
             v = state.mod_version(mod)
@@ -1846,18 +1957,18 @@ class Cli:
             if v:
                 line += self.out.g("  " + v)
             if mod.id in state.updates:
-                line += self.out.r("  » update: " + state.updates[mod.id])
+                line += self.out.g("  » update: " + state.updates[mod.id])
             self.out.line(line)
             if mod.extra:
                 ev = state.extras.get(mod.extra.id)
-                self.out.line("      └─ %s %s" % (self.out.g("●") if ev is not None else self.out.m("○"),
-                                                   (mod.extra.name + ("  " + ev if ev else "")) if ev is not None
+                self.out.line("      %s %s" % (self.out.g("└─ ●") if ev is not None else self.out.m("└─ ○"),
+                                                   self.out.g(mod.extra.name + ("  " + ev if ev else "")) if ev is not None
                                                    else self.out.m(mod.extra.name)))
         self.out.section("INTERFACE MODS")
         for v in EUI_VARIANTS:
             active = state.eui == v.id
             if active and state.eui_match is False:
-                self.out.line("  %s %s" % (self.out.r("!"), self.out.r(v.name + " -- VERSION MISMATCH")))
+                self.out.line("  %s %s" % (self.out.g("!"), self.out.g(v.name + " -- VERSION MISMATCH")))
             else:
                 self.out.line("  %s %s" % (self.out.g("●") if active else self.out.m("○"),
                                            self.out.g(v.label()) if active else self.out.m(v.label())))
@@ -1888,7 +1999,7 @@ class Cli:
             if r.extra:
                 tags.append(r.extra)
             if latest and r.tag == latest.tag:
-                tags.append(self.out.g("« latest"))
+                tags.append(self.out.m("« latest"))
             if current and r.tag.lower() == current.lower():
                 tags.append(self.out.m("« installed"))
             self.out.line("  %-16s %s" % (r.tag, "  ".join(tags)))
@@ -1992,14 +2103,14 @@ class Cli:
         path = validate_game_folder(game)
         size = dir_size(path)
         self.out.section("REDOWNLOAD CIV")
-        self.out.line(self.out.r("  Deletes the ENTIRE game folder:"))
+        self.out.line(self.out.m("  Deletes the ENTIRE game folder:"))
         self.out.line("  " + path)
         self.out.line("  Steam then downloads it again (%s). Every mod and EUI in it is removed." % format_size(size))
         self.out.line("  Saves and settings in the Proton prefix are kept.")
         if self.args.confirm != "DELETE":
             if not sys.stdin.isatty():
                 raise InstallerError("Refusing without confirmation: pass --confirm DELETE.")
-            if input(self.out.r("  Type DELETE to confirm: ")).strip() != "DELETE":
+            if input(self.out.m("  Type DELETE to confirm: ")).strip() != "DELETE":
                 self.out.line("  Cancelled.")
                 return 1
         self.require_civ_closed()
@@ -2052,9 +2163,28 @@ class Cli:
         if changed:
             s.save()
         self.out.section("SETTINGS")
-        self.out.line("  beta builds  " + (self.out.g("on") if s.show_beta else self.out.m("off")))
+        self.out.line("  beta builds  " + (self.out.m("on") if s.show_beta else self.out.m("off")))
         self.out.line("  civ folder   " + (s.civ_dir or self.out.d("auto-detect")))
         self.out.line(self.out.d("  file: " + Settings.PATH))
+        return 0
+
+    def cmd_install_self(self):
+        self.out.section("INSTALLING " + APP_CMD.upper())
+        ready = install_self(self.out.log)
+        self.out.line("")
+        if ready:
+            self.out.line("  Done. Run it any time with:  " + APP_CMD)
+        else:
+            self.out.line("  Done. Open a new terminal, then run:  " + APP_CMD)
+            self.out.line("  (or right now:  ~/.local/bin/" + APP_CMD + ")")
+        self.out.line("  It's also in your app menu as 'Civ V Mod Installer'.")
+        return 0
+
+    def cmd_uninstall_self(self):
+        if not self.confirm("Remove %s from this machine? Mods already installed in Civ V stay." % APP_CMD):
+            return 1
+        self.out.section("REMOVING " + APP_CMD.upper())
+        uninstall_self(self.out.log)
         return 0
 
     def cmd_self_update(self):
@@ -2071,7 +2201,7 @@ class Cli:
 
 def build_parser():
     p = argparse.ArgumentParser(
-        prog="kekmod-installer",
+        prog="civ5-mod-installer",
         description="KEK Mod installer for Civilization V under Steam Proton. Run with no command "
                     "for the full-screen installer.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -2080,7 +2210,7 @@ def build_parser():
     p.add_argument("--no-color", action="store_true", help="plain output")
     p.add_argument("--ascii", action="store_true", help="full-screen UI without Unicode box art")
     p.add_argument("-y", "--yes", action="store_true", help="answer yes to confirmations")
-    p.add_argument("--version", action="version", version="kekmod-installer " + VERSION)
+    p.add_argument("--version", action="version", version="civ5-mod-installer " + VERSION)
     sub = p.add_subparsers(dest="command", metavar="command")
 
     sub.add_parser("tui", help="full-screen installer (default)")
@@ -2111,6 +2241,8 @@ def build_parser():
     s.add_argument("--beta", dest="set_beta", choices=["on", "off"], help="enable beta builds")
     s.add_argument("--civ-dir", dest="set_civ_dir", metavar="DIR|auto", help="remember the Civ V folder")
     sub.add_parser("self-update", help="update this installer from GitHub")
+    sub.add_parser("install-self", help="install this program as the `%s` command + app menu entry" % APP_CMD)
+    sub.add_parser("uninstall-self", help="remove this program from the machine (mods stay)")
     return p
 
 
@@ -2148,15 +2280,17 @@ def main(argv=None):
 # hotkeys) and mouse both work.
 
 LOGO_GLYPHS = {
-    "K": ["██╗  ██╗", "██║ ██╔╝", "█████╔╝ ", "██╔═██╗ ", "██║  ██╗", "╚═╝  ╚═╝"],
-    "E": ["███████╗", "██╔════╝", "█████╗  ", "██╔══╝  ", "███████╗", "╚══════╝"],
-    "M": ["███╗   ███╗", "████╗ ████║", "██╔████╔██║", "██║╚██╔╝██║", "██║ ╚═╝ ██║", "╚═╝     ╚═╝"],
-    "O": [" ██████╗ ", "██╔═══██╗", "██║   ██║", "██║   ██║", "╚██████╔╝", " ╚═════╝ "],
-    "D": ["██████╗ ", "██╔══██╗", "██║  ██║", "██║  ██║", "██████╔╝", "╚═════╝ "],
+    "C": [" ██████╗", "██╔════╝", "██║     ", "██║     ", "╚██████╗", " ╚═════╝"],
+    "I": ["██╗", "██║", "██║", "██║", "██║", "╚═╝"],
+    "V": ["██╗   ██╗", "██║   ██║", "██║   ██║", "╚██╗ ██╔╝", " ╚████╔╝ ", "  ╚═══╝  "],
+    " ": ["   "] * 6,
 }
-LOGO = ["".join(LOGO_GLYPHS[ch][i] for ch in "KEKMOD") for i in range(6)]
-COPPER = [22, 28, 34, 40, 46, 47, 48, 49, 50, 51, 50, 49, 48, 47, 46, 40, 34, 28]
+LOGO = ["".join(LOGO_GLYPHS[ch][i] for ch in "CIV V") for i in range(6)]
+LOGO_WIDTH = len(LOGO[0])
+# Copper-bar cycle for the logo and ticker -- magentas only; green means "installed".
+COPPER = [53, 89, 125, 161, 162, 199, 205, 199, 162, 161, 125, 89]
 SPINNER = "|/-\\"
+TICKER_CHARS_PER_SEC = 8
 
 
 def run_tui(args):
@@ -2237,15 +2371,20 @@ class Tui:
         c.start_color()
         rich = c.COLORS >= 256
         self.rich = rich
-        G, D, M, R, W = (46, 28, 199, 203, 231) if rich else (c.COLOR_GREEN, c.COLOR_GREEN, c.COLOR_MAGENTA, c.COLOR_RED, c.COLOR_WHITE)
+        # Green is reserved for installed mods/maps/EUI; everything else is
+        # magenta. "dim" is a dark magenta for decoration (shadows, empty
+        # progress, key hints). Red is only the UPDATE button, as on Windows.
+        G, D, M, R = (46, 89, 199, 203) if rich else (c.COLOR_GREEN, c.COLOR_MAGENTA, c.COLOR_MAGENTA, c.COLOR_RED)
         K = c.COLOR_BLACK
-        for i, (fg, bg) in enumerate([(G, K), (D, K), (M, K), (R, K), (K, G), (K, M), (K, R), (W, K)], 1):
+        for i, (fg, bg) in enumerate([(G, K), (D, K), (M, K), (K, G), (K, M), (R, K), (K, R)], 1):
             c.init_pair(i, fg, bg)
         self.attr = {
             "grn": c.color_pair(1) | c.A_BOLD, "dim": c.color_pair(2) | (0 if rich else c.A_DIM),
-            "mag": c.color_pair(3) | c.A_BOLD, "red": c.color_pair(4) | c.A_BOLD,
-            "grn_inv": c.color_pair(5) | c.A_BOLD, "mag_inv": c.color_pair(6) | c.A_BOLD,
-            "red_inv": c.color_pair(7) | c.A_BOLD, "wht": c.color_pair(8) | c.A_BOLD,
+            "mag": c.color_pair(3) | c.A_BOLD,
+            "grn_inv": c.color_pair(4) | c.A_BOLD, "mag_inv": c.color_pair(5) | c.A_BOLD,
+            # disabled: same hue as the row's install state, just not bold
+            "grn_off": c.color_pair(1), "mag_off": c.color_pair(3),
+            "red": c.color_pair(6) | c.A_BOLD, "red_inv": c.color_pair(7) | c.A_BOLD, "red_off": c.color_pair(6),
         }
         self.copper = []
         if rich and c.COLOR_PAIRS > 40:
@@ -2255,7 +2394,7 @@ class Tui:
         self.scr.bkgd(" ", c.color_pair(1))
 
     def boot(self):
-        self.log("KEKMOD INSTALLER v%s // LINUX EDITION" % VERSION)
+        self.log("CIV V MOD INSTALLER v%s // LINUX EDITION" % VERSION)
         self.game = find_game(self.settings, self.args.civ_dir)
         if self.game is None:
             self.log("Steam libraries scanned: Civilization V not found.")
@@ -2265,7 +2404,7 @@ class Tui:
             problem = self.game.problem()
             if problem:
                 self.log("ERROR: " + problem)
-                self.msgbox("WRONG GAME BUILD", problem, color="red")
+                self.msgbox("WRONG GAME BUILD", problem, color="mag")
             else:
                 self.log("prefix: " + (self.game.prefix or "none yet (launch Civ V once under Proton)"))
         self.refresh_state()
@@ -2394,7 +2533,7 @@ class Tui:
         a = self.attr[color]
         if fill:
             for i in range(1, h - 1):
-                self.put(y + i, x + 1, " " * (w - 2), self.attr["grn"])
+                self.put(y + i, x + 1, " " * (w - 2), self.attr["mag"])
         if shadow:
             sa = self.attr["dim"]
             for i in range(1, h + 1):
@@ -2407,7 +2546,7 @@ class Tui:
         self.put(y + h - 1, x, self.ch("bl") + self.ch("h") * (w - 2) + self.ch("br"), a)
         if title:
             self.put(y, x + 2, "[ ", a)
-            self.put(y, x + 4, title, self.attr["grn"])
+            self.put(y, x + 4, title, self.attr["mag"])
             self.put(y, x + 4 + len(title), " ]", a)
 
     def button(self, b, y, x, w, registry):
@@ -2416,9 +2555,9 @@ class Tui:
         inner = label[:max(0, w - 2)].center(max(0, w - 2))
         focused = self.focus == b.id and b.enabled
         if not b.enabled:
-            attr = self.attr["dim"]
+            attr = self.attr[b.color + "_off"]
         elif focused:
-            attr = self.attr[b.color + "_inv"] if b.color in ("grn", "mag", "red") else self.attr["grn_inv"]
+            attr = self.attr[b.color + "_inv"]
         else:
             attr = self.attr[b.color]
         if focused:
@@ -2435,7 +2574,7 @@ class Tui:
         h, w = scr.getmaxyx()
         self.buttons = []
         if h < 22 or w < 72:
-            self.put(h // 2, max(0, (w - 34) // 2), "TERMINAL TOO SMALL -- NEED 72x22", self.attr["red"])
+            self.put(h // 2, max(0, (w - 34) // 2), "TERMINAL TOO SMALL -- NEED 72x22", self.attr["mag"])
             self.put(h // 2 + 1, max(0, (w - 20) // 2), "(now %dx%d, Q quits)" % (w, h), self.attr["dim"])
             if refresh:
                 scr.refresh()
@@ -2450,14 +2589,14 @@ class Tui:
         bar_w = W - 8
         fill = bar_w * self.progress // 100
         self.put(y, x0, "[", self.attr["mag"])
-        self.put(y, x0 + 1, self.ch("full") * fill, self.attr["grn"])
+        self.put(y, x0 + 1, self.ch("full") * fill, self.attr["mag"])
         self.put(y, x0 + 1 + fill, self.ch("empty") * (bar_w - fill), self.attr["dim"])
         self.put(y, x0 + 1 + bar_w, "]", self.attr["mag"])
-        self.put(y, x0 + 3 + bar_w, "%3d%%" % self.progress, self.attr["grn"])
+        self.put(y, x0 + 3 + bar_w, "%3d%%" % self.progress, self.attr["mag"])
         y += 1
         cursor = "_" if (self.frame // 12) % 2 == 0 else " "
         spin = (SPINNER[(self.frame // 3) % 4] + " ") if (self.busy or not self.releases_loaded) else ""
-        status_attr = self.attr["red"] if self.status.startswith("FAILED") else self.attr["grn"]
+        status_attr = self.attr["mag"] if self.status.startswith("FAILED") else self.attr["mag"]
         self.put(y, x0, "> " + spin + self.status + cursor, status_attr, maxw=W)
         y += 1
         # log
@@ -2476,23 +2615,22 @@ class Tui:
     def _draw_header(self, x0, W, big):
         btns = []
         if self.latest_self:
-            btns.append(Btn("update", "UPDATE v" + self.latest_self, self.on_self_update, not self.busy, "red", "UPDATE"))
+            btns.append(Btn("update", "UPDATE v" + self.latest_self, self.on_self_update, not self.busy, "mag", "UPDATE"))
         btns.append(Btn("setup", "SETUP", self.on_settings, not self.busy))
         tag = "-=[ v%s // LINUX @OBLAST ]=-" % VERSION
         if big:
             for i, row in enumerate(LOGO):
                 for j, chh in enumerate(row):
                     if chh == "█":
-                        a = self.copper[(i + self.frame // 4) % len(self.copper)] if self.copper else self.attr["grn"]
+                        a = self.copper[(i + self.frame // 4) % len(self.copper)] if self.copper else self.attr["mag"]
                     elif chh == " ":
                         continue
                     else:
                         a = self.attr["mag"]
                     self.put(i, x0 + 1 + j, chh, a)
-            rx = x0 + 56
-            self.put(0, rx, "CIV V MOD INSTALLER", self.attr["grn"])
-            self.put(1, rx, tag, self.attr["mag"])
-            self.put(2, rx, "steam // proton // civ v", self.attr["dim"])
+            rx = x0 + LOGO_WIDTH + 5
+            self.put(0, rx, "M O D   I N S T A L L E R", self.attr["mag"])
+            self.put(2, rx, tag, self.attr["mag"])
             bx = rx
             for b in btns:
                 bw = min(len(b.label) + 4, x0 + W - bx)
@@ -2500,7 +2638,7 @@ class Tui:
                 bx += bw + 1
             y = 6
         else:
-            self.put(0, x0, "CIV V MOD INSTALLER", self.attr["grn"])
+            self.put(0, x0, "CIV V MOD INSTALLER", self.attr["mag"])
             self.put(0, x0 + 21, tag, self.attr["mag"])
             bx = x0 + W
             for b in reversed(btns):
@@ -2542,20 +2680,20 @@ class Tui:
             nx = x0 + 4 + len(name) + 2
             if installed:
                 v = st.mod_version(mod)
-                self.put(ry, nx, v, self.attr["wht"], maxw=bx - nx - 1)
+                self.put(ry, nx, v, a, maxw=bx - nx - 1)
                 nx += len(v) + 2
             if mod.id in st.updates:
-                self.put(ry, nx, "%s %s" % (self.ch("arrow"), st.updates[mod.id]), self.attr["red"], maxw=bx - nx - 1)
+                self.put(ry, nx, "%s %s available" % (self.ch("arrow"), st.updates[mod.id]), a, maxw=bx - nx - 1)
             for b, cx in zip(self._mod_buttons(mod), self._col_x):
                 self.button(b, ry, cx, bw, self.buttons)
             if mod.extra:
                 ev = st.extras.get(mod.extra.id)
                 ea = self.attr["grn"] if ev is not None else self.attr["mag"]
-                self.put(ry + 1, x0 + 4, self.ch("branch"), self.attr["dim"])
+                self.put(ry + 1, x0 + 4, self.ch("branch"), ea)
                 self.put(ry + 1, x0 + 7, self.ch("dot") if ev is not None else self.ch("hol"), ea)
                 self.put(ry + 1, x0 + 9, mod.extra.name + ("  " + ev if ev else ""), ea)
                 if installed and ev is None:
-                    self.put(ry + 1, x0 + 11 + len(mod.extra.name), "missing -- reinstall to add it", self.attr["red"])
+                    self.put(ry + 1, x0 + 11 + len(mod.extra.name), "missing -- reinstall to add it", ea)
         return y + rows + 2
 
     def _draw_eui(self, y, x0, W):
@@ -2567,7 +2705,7 @@ class Tui:
             ry = y + 1 + i
             active = st.eui == v.id
             mismatch = active and st.eui_match is False
-            a = self.attr["red"] if mismatch else (self.attr["grn"] if active else self.attr["mag"])
+            a = self.attr["grn"] if active else self.attr["mag"]
             self.put(ry, x0 + 2, "!" if mismatch else (self.ch("dot") if active else self.ch("hol")), a)
             self.put(ry, x0 + 4, (v.name + " -- VERSION MISMATCH") if mismatch else v.label(), a)
             col = "grn" if active else "mag"
@@ -2583,13 +2721,11 @@ class Tui:
         out = []
         for line in self.log_lines:
             if line.startswith(("ERROR", "FAILED")) or "couldn't" in line.lower() or "warning" in line.lower():
-                a = self.attr["red"]
-            elif line.startswith("DONE") or line.startswith("==="):
-                a = self.attr["wht"]
-            elif line.startswith("KEKMOD"):
+                a = self.attr["mag"]
+            elif line.startswith("CIV V MOD INSTALLER"):
                 a = self.attr["mag"]
             else:
-                a = self.attr["grn"]
+                a = self.attr["mag"]
             for part in (textwrap.wrap(line, width, subsequent_indent="  ") or [""]):
                 out.append((part, a))
         return out
@@ -2611,12 +2747,12 @@ class Tui:
 
     def _draw_bottom(self, y, x0, W):
         ok = not self.busy
-        launch = (Btn("kill", "FORCE CLOSE CIV", self.on_force_close, ok, "red", "FORCE CLOSE") if self.civ_running
-                  else Btn("launch", "LAUNCH CIV", self.on_launch, ok, "grn", "LAUNCH"))
-        btns = [Btn("open", "OPEN DLC FOLDER", self.on_open, True, "grn", "OPEN DLC"),
-                Btn("verify", "VERIFY MODS", self.on_verify, ok, "grn", "VERIFY"),
-                Btn("gfx", "CLEAR GFX CACHE", self.on_clear_gfx, ok, "grn", "CLEAR GFX"),
-                Btn("reset", "REDOWNLOAD CIV", self.on_redownload, ok, "red", "REDOWNLOAD"),
+        launch = (Btn("kill", "FORCE CLOSE CIV", self.on_force_close, ok, "mag", "FORCE CLOSE") if self.civ_running
+                  else Btn("launch", "LAUNCH CIV", self.on_launch, ok, "mag", "LAUNCH"))
+        btns = [Btn("open", "OPEN DLC FOLDER", self.on_open, True, "mag", "OPEN DLC"),
+                Btn("verify", "VERIFY MODS", self.on_verify, ok, "mag", "VERIFY"),
+                Btn("gfx", "CLEAR GFX CACHE", self.on_clear_gfx, ok, "mag", "CLEAR GFX"),
+                Btn("reset", "REDOWNLOAD CIV", self.on_redownload, ok, "mag", "REDOWNLOAD"),
                 launch]
         n = len(btns)
         bw = (W - (n - 1)) // n
@@ -2626,10 +2762,12 @@ class Tui:
 
     def _draw_ticker(self, y, x0, W):
         text = "   " + self.ticker + "   "
-        pos = (self.frame // 2) % len(text)
+        # Clock-based, not per frame: redraws on every keypress would
+        # otherwise speed it up while keys are held.
+        pos = int(time.monotonic() * TICKER_CHARS_PER_SEC) % len(text)
         view = (text * (W // len(text) + 2))[pos:pos + W]
         for i, chh in enumerate(view):
-            a = self.copper[(i + self.frame // 2) % len(self.copper)] if self.copper else self.attr["grn"]
+            a = self.copper[(i + self.frame // 2) % len(self.copper)] if self.copper else self.attr["mag"]
             self.put(y, x0 + i, chh, a)
 
     # ── input ──
@@ -2637,7 +2775,7 @@ class Tui:
         c = self.curses
         if k in (ord("q"), ord("Q"), 27):
             if self.busy and self.msgbox("QUIT", "Something is still being installed. Quit anyway? That can "
-                                         "leave a half-installed mod behind.", ["QUIT", "STAY"], "red", 1, 1) != 0:
+                                         "leave a half-installed mod behind.", ["QUIT", "STAY"], "mag", 1, 1) != 0:
                 return True
             return False
         if k == c.KEY_RESIZE:
@@ -2740,13 +2878,13 @@ class Tui:
                 lines += textwrap.wrap(para, width - 6) or [""]
             y, x, W, H = self._dialog_frame(title, width, len(lines) + 5, color)
             for i, line in enumerate(lines):
-                self.put(y + 2 + i, x + 3, line, self.attr["grn"])
+                self.put(y + 2 + i, x + 3, line, self.attr["mag"])
             labels = list(buttons)
             bws = [len(l) + 4 for l in labels]
             bx = x + W - 2 - sum(bws) - (len(labels) - 1)
             state["btns"] = []
             for i, l in enumerate(labels):
-                b = Btn(i, l, None, True, "red" if color == "red" and i == 0 and len(labels) > 1 else "grn")
+                b = Btn(i, l, None, True, "mag")
                 self.focus = state["focus"]
                 self.button(b, y + H - 2, bx, bws[i], state["btns"])
                 bx += bws[i] + 1
@@ -2790,15 +2928,15 @@ class Tui:
                 lines += textwrap.wrap(para, 66 - 6) or [""]
             y, x, W, H = self._dialog_frame(title, 72, len(lines) + 7, color)
             for i, line in enumerate(lines):
-                self.put(y + 2 + i, x + 3, line, self.attr["grn"])
+                self.put(y + 2 + i, x + 3, line, self.attr["mag"])
             fy = y + 2 + len(lines) + 1
             fw = W - 6
             val = st["value"][-(fw - 2):]
             cur = "_" if (self.frame // 10) % 2 == 0 and st["focus"] == "field" else " "
             self.put(fy, x + 3, "[" + (val + cur).ljust(fw - 2) + "]",
-                     self.attr["red" if confirm_word else "grn"] | (self.curses.A_UNDERLINE if st["focus"] == "field" else 0))
+                     self.attr["mag"] | (self.curses.A_UNDERLINE if st["focus"] == "field" else 0))
             st["btns"] = []
-            labels = [(ok_label, ok_enabled(), "red" if confirm_word else "grn"), ("CANCEL", True, "grn")]
+            labels = [(ok_label, ok_enabled(), "mag"), ("CANCEL", True, "mag")]
             bx = x + W - 2 - sum(len(l) + 4 for l, _e, _c in labels) - 1
             for i, (l, en, col) in enumerate(labels):
                 b = Btn(i, l, None, en, col)
@@ -2860,7 +2998,7 @@ class Tui:
                 if idx >= len(items):
                     break
                 label, an = items[idx]
-                a = self.attr["grn_inv"] if idx == st["sel"] else self.attr[an]
+                a = self.attr["mag_inv"] if idx == st["sel"] else self.attr[an]
                 self.put(y + 2 + i, x + 3, (" " + label).ljust(W - 6)[:W - 6], a)
                 st.setdefault("rows", {})[y + 2 + i] = idx
             self.put(y + H - 2, x + 3, "ENTER install  ESC cancel", self.attr["dim"])
@@ -2899,7 +3037,7 @@ class Tui:
                 return False
         problem = self.game.problem()
         if problem:
-            self.msgbox("WRONG GAME BUILD", problem, color="red")
+            self.msgbox("WRONG GAME BUILD", problem, color="mag")
             return False
         return True
 
@@ -2908,7 +3046,7 @@ class Tui:
             choice = self.msgbox("CIVILIZATION V NOT FOUND",
                                  "Couldn't find Civilization V in any Steam library. Enter its folder "
                                  "(.../steamapps/common/%s) -- it's remembered for next time." % CIV_FOLDER,
-                                 ["ENTER PATH", "CONTINUE" if first_run else "CANCEL"], "red", 0, 1)
+                                 ["ENTER PATH", "CONTINUE" if first_run else "CANCEL"], "mag", 0, 1)
             if choice != 0:
                 return
             path = self.prompt("CIV V FOLDER", "Path to the Civ V install folder:", self.settings.civ_dir or "")
@@ -2916,7 +3054,7 @@ class Tui:
                 return
             g = Game(os.path.expanduser(path))
             if not os.path.isdir(g.root):
-                self.msgbox("NOT FOUND", g.root + " doesn't exist.", color="red")
+                self.msgbox("NOT FOUND", g.root + " doesn't exist.", color="mag")
                 continue
             self.game = g
             self.settings.civ_dir = g.root
@@ -2931,7 +3069,7 @@ class Tui:
         while is_civ_running():
             choice = self.msgbox("CIVILIZATION V IS RUNNING",
                                  "Please close the game before installing or uninstalling mods, then choose Retry.",
-                                 ["RETRY", "FORCE CLOSE", "CANCEL"], "red", 0, 2)
+                                 ["RETRY", "FORCE CLOSE", "CANCEL"], "mag", 0, 2)
             if choice == 2:
                 return False
             if choice == 1:
@@ -2944,17 +3082,17 @@ class Tui:
         inst = st.installed_mods()
         if len(inst) >= 2:
             self.msgbox("CONFLICTING MODS INSTALLED", " and ".join(m.name for m in inst)
-                        + " are both installed. They can't run together -- uninstall one.", color="red")
+                        + " are both installed. They can't run together -- uninstall one.", color="mag")
         missing = st.missing_maps()
         if missing:
             self.msgbox("MISSING BONUS MAP", "\n".join("%s is missing its %s." % (m.name, m.extra.name) for m in missing)
-                        + "\n\nReinstall to add it.", color="red")
+                        + "\n\nReinstall to add it.", color="mag")
         if st.eui == "eui_xits" and TOURNAMENT.id in st.installed:
-            self.msgbox("NOT COMPATIBLE", "Tournament Mod and EUI XITS are not compatible.", color="red")
+            self.msgbox("NOT COMPATIBLE", "Tournament Mod and EUI XITS are not compatible.", color="mag")
 
     def confirm_tm_xits(self):
         return self.msgbox("NOT COMPATIBLE", "Tournament Mod and EUI XITS are not compatible. Install anyway?",
-                           ["INSTALL", "CANCEL"], "red", 1, 1) == 0
+                           ["INSTALL", "CANCEL"], "mag", 1, 1) == 0
 
     def on_install(self, mod, tag=None):
         if self.busy or not self.need_game() or not self.civ_running_dialog():
@@ -2968,7 +3106,7 @@ class Tui:
             if self.msgbox("INSTALL " + mod.name.upper(),
                            "Installing %s will uninstall %s first -- these mods can't run side by side in "
                            "Civilization V. Continue?" % (mod.name, names),
-                           ["CONTINUE", "CANCEL"], "red", 1, 1) != 0:
+                           ["CONTINUE", "CANCEL"], "mag", 1, 1) != 0:
                 return
         game, beta = self.game, self.settings.show_beta
 
@@ -2997,7 +3135,7 @@ class Tui:
         rels = self.releases.get(mod.id) or []
         beta = self.settings.show_beta and mod.beta_optin
         current = (self.state.mod_version(mod) or "").lower()
-        items = [("Latest (auto -- newest, incl. beta)" if beta else "Latest (auto)", "grn")]
+        items = [("Latest (auto -- newest, incl. beta)" if beta else "Latest (auto)", "mag")]
         tags = [None]
         for r in rels:
             if r.prerelease and not self.settings.show_beta:
@@ -3009,7 +3147,7 @@ class Tui:
                 label += "  [beta]" if r.prerelease else "  [stable]"
             if r.tag.lower() == current:
                 label += "  " + ("◄" if self.uni else "<") + " installed"
-            items.append((label, "mag" if r.prerelease else "grn"))
+            items.append((label, "mag"))
             tags.append(r.tag)
         if not rels:
             items.append(("(release list unavailable -- offline?)", "dim"))
@@ -3045,7 +3183,7 @@ class Tui:
 
     def on_open(self):
         if self.game is None:
-            self.msgbox("OPEN DLC FOLDER", "Couldn't find a Civilization V install with Steam.", color="red")
+            self.msgbox("OPEN DLC FOLDER", "Couldn't find a Civilization V install with Steam.", color="mag")
             return
         if open_in_desktop(self.game.dlc):
             self.log("Opened " + self.game.dlc)
@@ -3057,12 +3195,12 @@ class Tui:
             self.log("Asked Steam to launch Civilization V.")
             self._civ_poll = 0
         else:
-            self.msgbox("LAUNCH CIV", "Couldn't reach Steam (no xdg-open or steam command found).", color="red")
+            self.msgbox("LAUNCH CIV", "Couldn't reach Steam (no xdg-open or steam command found).", color="mag")
 
     def on_force_close(self):
         if self.msgbox("FORCE CLOSE CIVILIZATION V",
                        "Civilization V is currently running.\n\nForce-closing it ends the process immediately -- "
-                       "any unsaved game progress will be lost. Continue?", ["FORCE CLOSE", "CANCEL"], "red", 1, 1) == 0:
+                       "any unsaved game progress will be lost. Continue?", ["FORCE CLOSE", "CANCEL"], "mag", 1, 1) == 0:
             self.log("Force closed %d Civ V process(es)." % force_close_civ())
             self._civ_poll = 0
 
@@ -3089,7 +3227,7 @@ class Tui:
         try:
             path = validate_game_folder(self.game)
         except InstallerError as e:
-            self.msgbox("REDOWNLOAD CIV", str(e), color="red")
+            self.msgbox("REDOWNLOAD CIV", str(e), color="mag")
             return
         self.status = "MEASURING GAME FOLDER..."
         self.draw()
@@ -3099,7 +3237,7 @@ class Tui:
                            "Deletes the ENTIRE game folder:\n%s\n\nSteam then downloads it again (%s). Every mod "
                            "and EUI in it is removed. Saves and settings in the Proton prefix are kept.\n\n"
                            "Type DELETE to confirm:" % (path, format_size(size)),
-                           confirm_word="DELETE", ok_label="REDOWNLOAD", color="red")
+                           confirm_word="DELETE", ok_label="REDOWNLOAD", color="mag")
         if word != "DELETE":
             return
         if is_civ_running():
@@ -3138,9 +3276,9 @@ class Tui:
         def draw():
             h, _w = self.scr.getmaxyx()
             H = min(h - 2, len(checks) + max(1, len(extras)) + 11)
-            y, x, W, H = self._dialog_frame("VERIFY MODS", 86, H, "grn" if all_ok else "red")
+            y, x, W, H = self._dialog_frame("VERIFY MODS", 86, H, "mag")
             for i, (ok, msg) in enumerate(checks):
-                self.put(y + 2 + i, x + 3, ("[OK] " if ok else "[!!] ") + msg, self.attr["grn" if ok else "red"], maxw=W - 6)
+                self.put(y + 2 + i, x + 3, ("[OK] " if ok else "[!!] ") + msg, self.attr["mag"], maxw=W - 6)
             yy = y + 3 + len(checks)
             self.put(yy, x + 3, "Unrecognized folders in Assets/DLC + Assets/Maps. Leave a row alone to KEEP it.",
                      self.attr["mag"], maxw=W - 6)
@@ -3165,15 +3303,15 @@ class Tui:
                 e = extras[i]
                 ry = list_y + r
                 self.put(ry, x + 3, "[%s] " % e.where, self.attr["mag"])
-                self.put(ry, x + 10, e.name, self.attr["grn"], maxw=W - 52)
+                self.put(ry, x + 10, e.name, self.attr["mag"], maxw=W - 52)
                 self.put(ry, x + W - 39, format_size(e.size).rjust(9), self.attr["dim"])
-                for kind, label, bx, col in (("archive", "ARCHIVE", x + W - 28, "grn"), ("delete", "DELETE", x + W - 15, "red")):
+                for kind, label, bx, col in (("archive", "ARCHIVE", x + W - 28, "mag"), ("delete", "DELETE", x + W - 15, "mag")):
                     b = Btn((kind, i), label, None, True, col)
                     self.focus = cur
                     self.button(b, ry, bx, 12, st["btns"])
             if len(extras) > rows:
                 self.put(list_y + rows, x + 3, "%d more -- scroll with the arrows" % (len(extras) - rows), self.attr["dim"])
-            b = Btn(("close", None), "CLOSE", None, True, "grn")
+            b = Btn(("close", None), "CLOSE", None, True, "mag")
             self.focus = cur
             self.button(b, y + H - 2, x + W - 12, 9, st["btns"])
 
@@ -3188,12 +3326,12 @@ class Tui:
                     self.log("Archived %s -> %s" % (e.name, zp))
                 else:
                     if self.msgbox("CONFIRM DELETE", 'Permanently delete "%s"? This cannot be undone.' % e.name,
-                                   ["DELETE", "CANCEL"], "red", 1, 1) != 0:
+                                   ["DELETE", "CANCEL"], "mag", 1, 1) != 0:
                         return None
                     remove_tree(e.path)
                     self.log("Deleted " + e.name)
             except OSError as ex:
-                self.msgbox("FAILED", "Couldn't %s %s: %s" % (kind, e.name, ex), color="red")
+                self.msgbox("FAILED", "Couldn't %s %s: %s" % (kind, e.name, ex), color="mag")
                 return None
             extras.pop(i)
             st["focus"] = min(st["focus"], len(focusables()) - 1)
@@ -3228,18 +3366,18 @@ class Tui:
             y, x, W, H = self._dialog_frame("SETTINGS", 72, 11, "mag")
             self.focus = items[st["focus"]]
             mark = "[X]" if st["beta"] else "[ ]"
-            fa = self.attr["grn_inv"] if self.focus == "beta" else self.attr["grn"]
+            fa = self.attr["mag_inv"] if self.focus == "beta" else self.attr["mag"]
             self.put(y + 2, x + 3, mark + " Enable beta builds", fa)
             st["beta_row"] = y + 2
             self.put(y + 4, x + 3, "Civ V folder:", self.attr["mag"])
             self.put(y + 5, x + 5, tail(st["civ"], W - 8) if st["civ"] else "auto-detect (Steam libraries)",
-                     self.attr["grn"])
+                     self.attr["mag"])
             st["btns"] = []
             for bid, label, bx in (("civ", "CHANGE", x + 3), ("auto", "AUTO-DETECT", x + 14)):
-                self.button(Btn(bid, label, None, True, "grn"), y + 6, bx, len(label) + 4, st["btns"])
+                self.button(Btn(bid, label, None, True, "mag"), y + 6, bx, len(label) + 4, st["btns"])
             self.put(y + 7, x + 3, "settings file: " + tail(Settings.PATH, W - 21), self.attr["dim"])
-            self.button(Btn("ok", "OK", None, True, "grn"), y + H - 2, x + W - 22, 6, st["btns"])
-            self.button(Btn("cancel", "CANCEL", None, True, "grn"), y + H - 2, x + W - 14, 10, st["btns"])
+            self.button(Btn("ok", "OK", None, True, "mag"), y + H - 2, x + W - 22, 6, st["btns"])
+            self.button(Btn("cancel", "CANCEL", None, True, "mag"), y + H - 2, x + W - 14, 10, st["btns"])
 
         def act(item):
             if item == "beta":
@@ -3250,7 +3388,7 @@ class Tui:
                 if path:
                     g = Game(os.path.expanduser(path))
                     if g.problem():
-                        self.msgbox("CAN'T USE THAT FOLDER", g.problem(), color="red")
+                        self.msgbox("CAN'T USE THAT FOLDER", g.problem(), color="mag")
                     else:
                         st["civ"] = g.root
             elif item == "auto":
@@ -3302,7 +3440,7 @@ class Tui:
             _v, data = fetch_latest_self()
             apply_self_update(data)
         except InstallerError as e:
-            self.msgbox("UPDATE FAILED", str(e), color="red")
+            self.msgbox("UPDATE FAILED", str(e), color="mag")
             return
         self.curses.endwin()
         os.execv(sys.executable, [sys.executable, SCRIPT_PATH] + sys.argv[1:])
