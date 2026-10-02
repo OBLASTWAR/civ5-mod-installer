@@ -11,7 +11,7 @@
 #   ./civ5-mod verify                  checks + unrecognized mod folders
 #   ./civ5-mod clear-cache             shader caches + Civ V's cached DBs
 #   ./civ5-mod redownload              delete the game, have Steam fetch it
-#   ./civ5-mod launch | kill | open    start Civ V / force close it / open DLC folder
+#   ./civ5-mod kill | open             force close Civ V / open DLC folder
 #   ./civ5-mod settings --beta on      persistent settings
 #   ./civ5-mod self-update
 #   ./civ5-mod install-self | uninstall-self
@@ -2118,15 +2118,6 @@ class Cli:
         self.out.done()
         return 0 if removed else 1
 
-    def cmd_launch(self):
-        if is_civ_running():
-            self.out.line("Civilization V is already running.")
-            return 0
-        if not open_in_desktop("steam://rungameid/" + CIV_APPID):
-            raise InstallerError("Couldn't hand steam://rungameid/%s to Steam (no xdg-open or steam found)." % CIV_APPID)
-        self.out.log("Asked Steam to launch Civilization V.")
-        return 0
-
     def cmd_kill(self):
         if not is_civ_running():
             self.out.line("Civilization V isn't running.")
@@ -2234,7 +2225,6 @@ def build_parser():
     sub.add_parser("clear-cache", help="wipe shader caches + Civ V's cached DBs (black map fix)")
     s = sub.add_parser("redownload", help="delete the whole game folder and have Steam download it again")
     s.add_argument("--confirm", metavar="DELETE", help="skip the typed confirmation")
-    sub.add_parser("launch", help="launch Civ V through Steam")
     sub.add_parser("kill", help="force close a running Civ V")
     sub.add_parser("open", help="open the DLC folder")
     s = sub.add_parser("settings", help="show or change settings")
@@ -2338,8 +2328,6 @@ class Tui:
         self.focus = "mod:%s:install" % MODS[0].id
         self.buttons = []
         self.frame = 0
-        self.civ_running = False
-        self._civ_poll = 0
 
     # ── setup ──
     def main(self, scr):
@@ -2477,10 +2465,6 @@ class Tui:
                 if not self.busy:
                     self.status = "SYSTEM READY"
                 self.refresh_state()
-        self._civ_poll -= 1
-        if self._civ_poll <= 0:
-            self.civ_running = is_civ_running()
-            self._civ_poll = 12
 
     def start_job(self, status, fn):
         self.busy = True
@@ -2747,13 +2731,14 @@ class Tui:
 
     def _draw_bottom(self, y, x0, W):
         ok = not self.busy
-        launch = (Btn("kill", "FORCE CLOSE CIV", self.on_force_close, ok, "mag", "FORCE CLOSE") if self.civ_running
-                  else Btn("launch", "LAUNCH CIV", self.on_launch, ok, "mag", "LAUNCH"))
+        # No LAUNCH CIV button, same as Windows (Installer.cs hides its LAUNCH
+        # DX9/DX11): steam://rungameid starts whichever renderer Steam last
+        # picked, and DX9 draws a black map on some machines. Force close
+        # lives in civ_running_dialog.
         btns = [Btn("open", "OPEN DLC FOLDER", self.on_open, True, "mag", "OPEN DLC"),
                 Btn("verify", "VERIFY MODS", self.on_verify, ok, "mag", "VERIFY"),
                 Btn("gfx", "CLEAR GFX CACHE", self.on_clear_gfx, ok, "mag", "CLEAR GFX"),
-                Btn("reset", "REDOWNLOAD CIV", self.on_redownload, ok, "mag", "REDOWNLOAD"),
-                launch]
+                Btn("reset", "REDOWNLOAD CIV", self.on_redownload, ok, "mag", "REDOWNLOAD")]
         n = len(btns)
         bw = (W - (n - 1)) // n
         for i, b in enumerate(btns):
@@ -3074,7 +3059,6 @@ class Tui:
                 return False
             if choice == 1:
                 self.log("Force closed %d Civ V process(es)." % force_close_civ())
-        self.civ_running = False
         return True
 
     def startup_warnings(self):
@@ -3189,20 +3173,6 @@ class Tui:
             self.log("Opened " + self.game.dlc)
         else:
             self.msgbox("OPEN DLC FOLDER", "No desktop file manager available. The folder is:\n\n" + self.game.dlc)
-
-    def on_launch(self):
-        if open_in_desktop("steam://rungameid/" + CIV_APPID):
-            self.log("Asked Steam to launch Civilization V.")
-            self._civ_poll = 0
-        else:
-            self.msgbox("LAUNCH CIV", "Couldn't reach Steam (no xdg-open or steam command found).", color="mag")
-
-    def on_force_close(self):
-        if self.msgbox("FORCE CLOSE CIVILIZATION V",
-                       "Civilization V is currently running.\n\nForce-closing it ends the process immediately -- "
-                       "any unsaved game progress will be lost. Continue?", ["FORCE CLOSE", "CANCEL"], "mag", 1, 1) == 0:
-            self.log("Force closed %d Civ V process(es)." % force_close_civ())
-            self._civ_poll = 0
 
     def on_clear_gfx(self):
         if is_civ_running():
