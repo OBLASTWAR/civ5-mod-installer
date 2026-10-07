@@ -6,12 +6,14 @@ setlocal
 :: Requires: .NET Framework 4.x (csc.exe) -- ships with Windows,
 :: no extra toolchain needed.
 ::
-:: Builds KekModInstaller.exe from the same Installer.cs. CHANNEL
+:: Builds KekModInstaller.exe from the same Installer.cs (build.sh does
+:: the same on Linux via Proton's wine-mono). CHANNEL
 :: (stable/beta) is available via Settings.
 ::
 :: Self-update: whenever Installer.cs changes and you rebuild+publish a new
 :: KekModInstaller.exe to main, bump InstallerCore.InstallerVersion in
-:: Installer.cs AND installer/installer_version.txt to the same new value.
+:: Installer.cs, installer/installer_version.txt AND VERSION in
+:: installer/linux/civ5-mod to the same new value.
 :: Running copies compare their own baked-in InstallerVersion against
 :: installer_version.txt on main and show an UPDATE button when they differ.
 :: ============================================================
