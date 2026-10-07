@@ -368,6 +368,19 @@ namespace KekModInstaller
         // is only tested against our exact bundled copy, so this matters.
         private bool _installedEuiVersionMismatch;
         private BackgroundWorker _euiWorker;
+
+        // NETWORK MODS section: the civ5-lobby-patch proxy steam_api.dll in
+        // the game's root folder (see LobbyPatchExtra.cs). One box, same
+        // INSTALL/UNINSTALL treatment as the EUI boxes; INSTALL becomes
+        // UPDATE when the startup status check finds a newer release.
+        private Panel _lobbyBox;
+        private Label _lobbyIndicator;
+        private Label _lobbyNameLabel;
+        private RetroButton _lobbyInstallButton;
+        private RetroButton _lobbyRemoveButton;
+        private LobbyPatchState _lobbyState = new LobbyPatchState();
+        private string _lobbyLatestTag; // null until/unless the status check fetched it
+        private BackgroundWorker _lobbyWorker;
         // Per-mod version choice from that mod's own VERSION button/popup --
         // absent (or not in the dictionary) means "Latest (auto)".
         private readonly Dictionary<string, string> _selectedVersionTagByModId = new Dictionary<string, string>();
@@ -613,7 +626,16 @@ namespace KekModInstaller
             Controls.Add(interfaceModsBox);
             UpdateEuiRowStyles();
 
-            int modShift = (interfaceModsY + interfaceModsHeight + 8) - (132 + TopShift);
+            // NETWORK MODS -- the lobby patch, same nested-box treatment.
+            int networkModsY = interfaceModsY + interfaceModsHeight + 8;
+            _lobbyBox = BuildLobbyPatchBox(outerPadSide, outerPadTop, innerWidth);
+            int networkModsHeight = outerPadTop + _lobbyBox.Height + outerPadBottom;
+            var networkModsBox = MakeRetroBox("NETWORK MODS", 12, networkModsY, 532, networkModsHeight);
+            networkModsBox.Controls.Add(_lobbyBox);
+            Controls.Add(networkModsBox);
+            UpdateLobbyRowStyles();
+
+            int modShift = (networkModsY + networkModsHeight + 8) - (132 + TopShift);
 
             // ClientSize, not Width/Height: the latter includes the title bar
             // and borders, which shrinks the usable area every control below
@@ -813,6 +835,12 @@ namespace KekModInstaller
             _euiWorker.ProgressChanged += Worker_ProgressChanged;
             _euiWorker.RunWorkerCompleted += EuiWorker_RunWorkerCompleted;
 
+            _lobbyWorker = new BackgroundWorker();
+            _lobbyWorker.WorkerReportsProgress = true;
+            _lobbyWorker.DoWork += LobbyWorker_DoWork;
+            _lobbyWorker.ProgressChanged += Worker_ProgressChanged;
+            _lobbyWorker.RunWorkerCompleted += LobbyWorker_RunWorkerCompleted;
+
             _resetWorker = new BackgroundWorker();
             _resetWorker.WorkerReportsProgress = true;
             _resetWorker.DoWork += ResetWorker_DoWork;
@@ -998,6 +1026,51 @@ namespace KekModInstaller
             row.NameLabel = nameLabel;
 
             _euiRows.Add(row);
+
+            return box;
+        }
+
+        // The lobby patch's box -- same layout as BuildEuiVariantBox.
+        private Panel BuildLobbyPatchBox(int x, int y, int width)
+        {
+            int boxHeight = 18 + ModRowHeight + 6;
+            var box = MakeRetroBox(LobbyPatch.DisplayName.ToUpperInvariant(), x, y, width, boxHeight,
+                () => _lobbyState.Installed ? ThemeGreen : ThemeMagenta);
+
+            _lobbyIndicator = new Label();
+            _lobbyIndicator.SetBounds(12, 16, 20, 22);
+            _lobbyIndicator.Font = new Font("Consolas", 11F, FontStyle.Bold);
+            _lobbyIndicator.TextAlign = ContentAlignment.MiddleCenter;
+            _lobbyIndicator.BackColor = Color.Black;
+            box.Controls.Add(_lobbyIndicator);
+
+            const int btnW = 68;
+            const int btnH = 22;
+            const int btnGap = 6;
+            int btnsX = width - 12 - (btnW * 2 + btnGap);
+
+            _lobbyInstallButton = new RetroButton();
+            _lobbyInstallButton.Text = "INSTALL";
+            _lobbyInstallButton.Font = new Font("Consolas", 7F, FontStyle.Bold);
+            _lobbyInstallButton.SetBounds(btnsX, 16, btnW, btnH);
+            _lobbyInstallButton.Click += (s, e) => OnLobbyPatchClick(true);
+            box.Controls.Add(_lobbyInstallButton);
+
+            _lobbyRemoveButton = new RetroButton();
+            _lobbyRemoveButton.Text = "UNINSTALL";
+            _lobbyRemoveButton.Font = new Font("Consolas", 7F, FontStyle.Bold);
+            _lobbyRemoveButton.SetBounds(btnsX + (btnW + btnGap), 16, btnW, btnH);
+            _lobbyRemoveButton.Enabled = false;
+            _lobbyRemoveButton.Click += (s, e) => OnLobbyPatchClick(false);
+            box.Controls.Add(_lobbyRemoveButton);
+
+            _lobbyNameLabel = new Label();
+            _lobbyNameLabel.SetBounds(34, 18, btnsX - 8 - 34, 20);
+            _lobbyNameLabel.Text = LobbyPatch.DisplayName;
+            _lobbyNameLabel.Font = new Font("Consolas", 9F, FontStyle.Bold);
+            _lobbyNameLabel.ForeColor = ThemeGreen;
+            _lobbyNameLabel.BackColor = Color.Black;
+            box.Controls.Add(_lobbyNameLabel);
 
             return box;
         }
@@ -1335,6 +1408,44 @@ namespace KekModInstaller
             }
         }
 
+        // Whether the startup status check found a newer lobby patch
+        // release than the installed one. An install with no marker tag
+        // (pre-marker or hand-installed) counts as outdated.
+        private bool IsLobbyPatchUpdateAvailable()
+        {
+            return _lobbyState.Installed && _lobbyLatestTag != null
+                && !string.Equals(_lobbyState.Tag, _lobbyLatestTag, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private void UpdateLobbyRowStyles()
+        {
+            bool installed = _lobbyState.Installed;
+            bool updateAvailable = IsLobbyPatchUpdateAvailable();
+
+            _lobbyIndicator.Text = installed ? "●" : "○";
+            _lobbyIndicator.ForeColor = installed ? ThemeGreen : ThemeMagenta;
+            _lobbyNameLabel.ForeColor = installed ? ThemeGreen : ThemeMagenta;
+            _lobbyNameLabel.Text = installed && _lobbyState.Tag != null
+                ? LobbyPatch.DisplayName + " (" + _lobbyState.Tag + ")"
+                : LobbyPatch.DisplayName;
+
+            _lobbyInstallButton.Text = updateAvailable ? "UPDATE" : (installed ? "REINSTALL" : "INSTALL");
+            if (!_actionInProgress)
+            {
+                _lobbyInstallButton.Enabled = true;
+                _lobbyRemoveButton.Enabled = installed;
+            }
+
+            Color? btnBorder = installed ? ThemeGreen : (Color?)null;
+            Color btnText = installed ? ThemeGreen : ThemeMagenta;
+            _lobbyInstallButton.BorderColor = updateAvailable ? ThemeRed : btnBorder;
+            _lobbyInstallButton.ForeColor = updateAvailable ? ThemeRed : btnText;
+            _lobbyRemoveButton.BorderColor = btnBorder;
+            _lobbyRemoveButton.ForeColor = btnText;
+
+            _lobbyBox.Invalidate();
+        }
+
         private static string EuiBaseLabel(EuiVariant variant)
         {
             return variant.DisplayVersion != null
@@ -1423,7 +1534,18 @@ namespace KekModInstaller
             // StatusWorker_RunWorkerCompleted leaves the UPDATE button hidden.
             string latestInstallerVersion = InstallerCore.TryFetchLatestInstallerVersion();
 
-            e.Result = new object[] { releasesByModId, tickerText, latestInstallerVersion };
+            // Best-effort lobby patch update check; null leaves its INSTALL
+            // button as INSTALL/REINSTALL.
+            string lobbyLatestTag = null;
+            try
+            {
+                lobbyLatestTag = LobbyPatch.FetchLatestTag();
+            }
+            catch (Exception)
+            {
+            }
+
+            e.Result = new object[] { releasesByModId, tickerText, latestInstallerVersion, lobbyLatestTag };
         }
 
         private void StatusWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
@@ -1454,6 +1576,8 @@ namespace KekModInstaller
                 _btnUpdate.Visible = false;
             }
 
+            _lobbyLatestTag = (string)result[3];
+
             RefreshLocalState();
         }
 
@@ -1469,6 +1593,7 @@ namespace KekModInstaller
             DetectInstalledState();
             UpdateModRowStyles();
             UpdateEuiRowStyles();
+            UpdateLobbyRowStyles();
         }
 
         // Fast local disk scan (no network): populates _installedModIds,
@@ -1519,6 +1644,9 @@ namespace KekModInstaller
                     EuiVariant installedVariant = EuiExtra.Variants.First(v => v.Id == _installedEuiVariantId);
                     _installedEuiVersionMismatch = !EuiExtra.IsExactBundledMatch(dlcRoot, installedVariant);
                 }
+
+                string gameFolder = InstallerCore.TryGetCiv5GameFolder();
+                _lobbyState = gameFolder == null ? new LobbyPatchState() : LobbyPatch.Detect(gameFolder);
             }
             catch (Exception)
             {
@@ -1713,6 +1841,10 @@ namespace KekModInstaller
                 .Where(m => _updateAvailableModIds.Contains(m.Id))
                 .Select(m => m.DisplayName)
                 .ToList();
+            if (IsLobbyPatchUpdateAvailable())
+            {
+                updates.Add(LobbyPatch.DisplayName);
+            }
             results.Add(updates.Count > 0
                 ? new CheckResult(false, "Update available for: " + string.Join(", ", updates.ToArray()) + ".")
                 : new CheckResult(true, "All installed mods are up to date."));
@@ -1923,6 +2055,32 @@ namespace KekModInstaller
             _progress.Value = 0;
             SetStatus("REMOVING " + variant.DisplayName.ToUpperInvariant() + "...");
             _euiWorker.RunWorkerAsync(null);
+        }
+
+        // Both buttons go through here. Civ5 must be closed: it holds
+        // steam_api.dll loaded, and on Windows the file can't be replaced
+        // while it is.
+        private void OnLobbyPatchClick(bool install)
+        {
+            if (_actionInProgress)
+            {
+                return;
+            }
+            if (InstallerCore.IsCiv5Running())
+            {
+                MessageBox.Show(
+                    this,
+                    "Civilization V is currently running. Close the game first, then try again.",
+                    LobbyPatch.DisplayName,
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+            _txtLog.Clear();
+            SetControlsEnabled(false);
+            _progress.Value = 0;
+            SetStatus((install ? "INSTALLING " : "REMOVING ") + LobbyPatch.DisplayName.ToUpperInvariant() + "...");
+            _lobbyWorker.RunWorkerAsync(install);
         }
 
         private void StartInstall(ModDefinition mod, InstallOptions options)
@@ -2385,6 +2543,33 @@ namespace KekModInstaller
             }
         }
 
+        private void LobbyWorker_DoWork(object sender, DoWorkEventArgs e)
+        {
+            bool install = (bool)e.Argument;
+            var worker = (BackgroundWorker)sender;
+            Action<string> log = msg => worker.ReportProgress(0, msg);
+
+            string gameFolder = InstallerCore.TryGetCiv5GameFolder();
+            if (gameFolder == null)
+            {
+                throw new InvalidOperationException("Couldn't locate the Civilization V game folder.");
+            }
+            if (install)
+            {
+                LobbyPatch.Install(gameFolder, log);
+            }
+            else
+            {
+                LobbyPatch.Remove(gameFolder, log);
+            }
+        }
+
+        // Same handling as EuiWorker_RunWorkerCompleted.
+        private void LobbyWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
+        {
+            EuiWorker_RunWorkerCompleted(sender, e);
+        }
+
         private void EuiWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
         {
             SetControlsEnabled(true);
@@ -2412,6 +2597,7 @@ namespace KekModInstaller
             {
                 UpdateModRowStyles();
                 UpdateEuiRowStyles();
+                UpdateLobbyRowStyles();
             }
             else
             {
@@ -2426,6 +2612,8 @@ namespace KekModInstaller
                     row.InstallButton.Enabled = false;
                     row.RemoveButton.Enabled = false;
                 }
+                _lobbyInstallButton.Enabled = false;
+                _lobbyRemoveButton.Enabled = false;
             }
         }
     }

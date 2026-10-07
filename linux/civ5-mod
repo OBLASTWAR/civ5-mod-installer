@@ -8,6 +8,7 @@
 #   ./civ5-mod uninstall kekmod
 #   ./civ5-mod versions kekmod         list published releases
 #   ./civ5-mod eui install [eui|xits]  / eui uninstall
+#   ./civ5-mod lobby install | uninstall  civ5-lobby-patch (worldwide lobby list)
 #   ./civ5-mod verify                  checks + unrecognized mod folders
 #   ./civ5-mod clear-cache             shader caches + Civ V's cached DBs
 #   ./civ5-mod redownload              delete the game, have Steam fetch it
@@ -22,7 +23,7 @@
 #
 # Mirrors installer/*.cs feature for feature: three mutually exclusive mods,
 # each with its bonus map (Fish Map Script / Better Pangaea / Lekmap), the two
-# bundled EUI variants, VERIFY MODS, CLEAR GFX CACHE, REDOWNLOAD CIV, the beta
+# bundled EUI variants, the lobby patch, VERIFY MODS, CLEAR GFX CACHE, REDOWNLOAD CIV, the beta
 # setting and self-update. Where Windows and Linux differ:
 #
 #   * The game is found through Steam's libraryfolders.vdf (native, ~/.steam,
@@ -995,6 +996,99 @@ def eui_remove(game, log, progress=lambda p: None):
     log("DONE: EUI removed.")
 
 
+# ── Lobby patch (LobbyPatchExtra.cs) ──────────────────────────────────────────
+# civ5-lobby-patch: a proxy steam_api.dll in the game root that hooks
+# SteamMatchmaking to drop Steam's lobby distance filter, forwarding every
+# other export to the game's own DLL, renamed steam_api_orig.dll. The game's
+# steam_api.dll is a Windows DLL under Proton too, so the same proxy works.
+# "Installed" = the backup exists and differs from steam_api.dll (Steam's
+# verify restores the stock DLL and leaves the backup -- then they're equal).
+
+LOBBY_OWNER, LOBBY_REPO = "OBLASTWAR", "civ5-lobby-patch"
+LOBBY_NAME = "Lobby Patch"
+LOBBY_ASSET = "steam_api.dll"
+LOBBY_ORIG = "steam_api_orig.dll"
+LOBBY_MARKER = "civ5-lobby-patch.txt"  # installed release tag
+
+
+def _lobby_paths(game):
+    return (ci_resolve(os.path.join(game.root, LOBBY_ASSET)),
+            ci_resolve(os.path.join(game.root, LOBBY_ORIG)),
+            ci_resolve(os.path.join(game.root, LOBBY_MARKER)))
+
+
+def _files_equal(a, b):
+    if os.path.getsize(a) != os.path.getsize(b):
+        return False
+    with open(a, "rb") as fa, open(b, "rb") as fb:
+        return fa.read() == fb.read()
+
+
+def lobby_detect(game):
+    """None when not installed, else the installed tag ("" if unknown)."""
+    active, orig, marker = _lobby_paths(game)
+    if not (os.path.isfile(active) and os.path.isfile(orig)) or _files_equal(active, orig):
+        return None
+    try:
+        with open(marker, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def lobby_latest_tag():
+    return GitHubSource(LOBBY_OWNER, LOBBY_REPO, False)._latest()["tag_name"]
+
+
+def lobby_install(game, log, progress=lambda p: None):
+    active, orig, marker = _lobby_paths(game)
+    log("Checking %s/%s for the latest release..." % (LOBBY_OWNER, LOBBY_REPO))
+    rel = GitHubSource(LOBBY_OWNER, LOBBY_REPO, False)._latest()
+    asset = next((a for a in rel.get("assets") or [] if a["name"].lower() == LOBBY_ASSET), None)
+    if asset is None:
+        raise InstallerError("Release %s has no %s." % (rel["tag_name"], LOBBY_ASSET))
+    log("Release: " + rel["tag_name"])
+    log("Downloading %s..." % asset["name"])
+    progress(10)
+    with tempfile.TemporaryDirectory(prefix="civ5-mod-") as tmp:
+        dl = os.path.join(tmp, LOBBY_ASSET)
+        download_to(asset["browser_download_url"], dl, lambda f: progress(10 + int(60 * f)))
+        with open(dl, "rb") as f:
+            if f.read(2) != b"MZ":
+                raise InstallerError("Downloaded %s isn't a Windows DLL." % asset["name"])
+        # Back up the game's own DLL exactly once; with a backup in place,
+        # steam_api.dll is an older proxy or Steam's restored stock copy.
+        if not os.path.isfile(orig):
+            if not os.path.isfile(active):
+                raise InstallerError("%s not found in the game folder -- verify Civ V's files in Steam first."
+                                     % LOBBY_ASSET)
+            if os.path.isfile(marker):
+                # Our marker but no backup: steam_api.dll is probably the
+                # proxy, which would then load itself as _orig.
+                raise InstallerError("%s is missing. Verify Civ V's files in Steam, then install again." % LOBBY_ORIG)
+            log("Backing up %s -> %s" % (LOBBY_ASSET, LOBBY_ORIG))
+            os.rename(active, orig)
+        log("Installing %s..." % LOBBY_ASSET)
+        shutil.copyfile(dl, active)
+    with open(marker, "w", encoding="utf-8") as f:
+        f.write(rel["tag_name"])
+    progress(100)
+    log("DONE: %s %s installed." % (LOBBY_NAME, rel["tag_name"]))
+
+
+def lobby_remove(game, log, progress=lambda p: None):
+    active, orig, marker = _lobby_paths(game)
+    if not os.path.isfile(orig):
+        log("No %s backup -- nothing to restore." % LOBBY_ORIG)
+    else:
+        log("Restoring the game's own %s..." % LOBBY_ASSET)
+        os.replace(orig, active)
+    if os.path.isfile(marker):
+        os.remove(marker)
+    progress(100)
+    log("DONE: %s removed." % LOBBY_NAME)
+
+
 # ── ui_check.bat ──────────────────────────────────────────────────────────────
 
 class _BatchExit(Exception):
@@ -1388,6 +1482,8 @@ class State:
         self.updates = {}     # mod id -> tag auto-install would pick now
         self.eui = None
         self.eui_match = None  # True / False / None (no bundled copy to compare against)
+        self.lobby = None      # installed lobby patch tag ("" if unknown); None = not installed
+        self.lobby_update = None  # newer lobby patch tag, if the release check found one
         if game is None or game.problem():
             return
         for mod in MODS:
@@ -1404,6 +1500,11 @@ class State:
         self.eui = eui_detect(game)
         if self.eui:
             self.eui_match = eui_exact_match(game, self.eui_variant())
+        self.lobby = lobby_detect(game)
+        # releases[LOBBY_REPO] is the latest tag string, not a release list.
+        latest = releases.get(LOBBY_REPO)
+        if self.lobby is not None and latest and latest.lower() != self.lobby.lower():
+            self.lobby_update = latest
 
     def eui_variant(self):
         return next((v for v in EUI_VARIANTS if v.id == self.eui), None)
@@ -1452,7 +1553,7 @@ def run_checks(game, state):
         out.append((state.eui_match, v.label() + (" matches this installer's bundled copy exactly."
                                                    if state.eui_match else
                                                    " doesn't exactly match this installer's bundled copy.")))
-    ups = [m.name for m in MODS if m.id in state.updates]
+    ups = [m.name for m in MODS if m.id in state.updates] + ([LOBBY_NAME] if state.lobby_update else [])
     out.append((not ups, "Update available for: " + ", ".join(ups) + "." if ups else "All installed mods are up to date."))
     return out
 
@@ -1930,6 +2031,10 @@ class Cli:
                 out[m.id] = m.source.list_releases()
             except InstallerError:
                 pass
+        try:
+            out[LOBBY_REPO] = lobby_latest_tag()
+        except InstallerError:
+            pass
         return out
 
     def run_job(self, fn, *a):
@@ -1972,6 +2077,14 @@ class Cli:
             else:
                 self.out.line("  %s %s" % (self.out.g("●") if active else self.out.m("○"),
                                            self.out.g(v.label()) if active else self.out.m(v.label())))
+        self.out.section("NETWORK MODS")
+        if state.lobby is None:
+            self.out.line("  %s %s" % (self.out.m("○"), self.out.m(LOBBY_NAME)))
+        else:
+            line = "  %s %s" % (self.out.g("●"), self.out.g(LOBBY_NAME + ("  " + state.lobby if state.lobby else "")))
+            if state.lobby_update:
+                line += self.out.g("  » update: " + state.lobby_update)
+            self.out.line(line)
         self.out.section("CHECKS")
         checks = run_checks(game, state)
         for ok, msg in checks:
@@ -2051,6 +2164,17 @@ class Cli:
         else:
             self.out.section("REMOVING EUI")
             self.run_job(eui_remove, game)
+        return 0
+
+    def cmd_lobby(self):
+        game = self.game()
+        self.require_civ_closed()
+        if self.args.action == "install":
+            self.out.section("INSTALLING " + LOBBY_NAME.upper())
+            self.run_job(lobby_install, game)
+        else:
+            self.out.section("REMOVING " + LOBBY_NAME.upper())
+            self.run_job(lobby_remove, game)
         return 0
 
     def cmd_verify(self):
@@ -2219,6 +2343,8 @@ def build_parser():
     s = sub.add_parser("eui", help="install/remove EUI")
     s.add_argument("action", choices=["install", "uninstall"])
     s.add_argument("variant", nargs="?", default="eui", help="eui (default) or xits")
+    s = sub.add_parser("lobby", help="install/remove the lobby patch (worldwide lobby list)")
+    s.add_argument("action", choices=["install", "uninstall"])
     s = sub.add_parser("verify", help="run every check and list unrecognized mod folders")
     s.add_argument("--archive", action="append", metavar="NAME", help="zip an unrecognized folder in place")
     s.add_argument("--delete", action="append", metavar="NAME", help="permanently delete an unrecognized folder")
@@ -2409,6 +2535,10 @@ class Tui:
                 rel[mod.id] = mod.source.list_releases()
             except Exception:
                 pass
+        try:
+            rel[LOBBY_REPO] = lobby_latest_tag()
+        except Exception:
+            pass
         ticker = fetch_ticker()
         latest = None
         if not in_git_checkout():  # a checkout updates with git pull
@@ -2460,7 +2590,7 @@ class Tui:
                     self.latest_self = latest
                     self.log("Installer update available: v%s (press U)." % latest)
                 missing = [m.name for m in MODS if m.id not in rel]
-                self.log("Release lists: %d/%d loaded%s." % (len(rel), len(MODS),
+                self.log("Release lists: %d/%d loaded%s." % (len(MODS) - len(missing), len(MODS),
                          "" if not missing else " (offline for " + ", ".join(missing) + ")"))
                 if not self.busy:
                     self.status = "SYSTEM READY"
@@ -2557,8 +2687,8 @@ class Tui:
         scr.erase()
         h, w = scr.getmaxyx()
         self.buttons = []
-        if h < 22 or w < 72:
-            self.put(h // 2, max(0, (w - 34) // 2), "TERMINAL TOO SMALL -- NEED 72x22", self.attr["mag"])
+        if h < 25 or w < 72:
+            self.put(h // 2, max(0, (w - 34) // 2), "TERMINAL TOO SMALL -- NEED 72x25", self.attr["mag"])
             self.put(h // 2 + 1, max(0, (w - 20) // 2), "(now %dx%d, Q quits)" % (w, h), self.attr["dim"])
             if refresh:
                 scr.refresh()
@@ -2569,6 +2699,7 @@ class Tui:
         y = self._draw_header(x0, W, big)
         y = self._draw_mods(y, x0, W)
         y = self._draw_eui(y, x0, W)
+        y = self._draw_lobby(y, x0, W)
         # progress + status
         bar_w = W - 8
         fill = bar_w * self.progress // 100
@@ -2700,6 +2831,28 @@ class Tui:
                              self._col_x):
                 self.button(b, ry, cx, bw, self.buttons)
         return y + n + 2
+
+    def _draw_lobby(self, y, x0, W):
+        self.box(y, x0, 3, W, "NETWORK MODS", "mag")
+        bw = 13
+        st = self.state
+        ry = y + 1
+        installed = st.lobby is not None
+        a = self.attr["grn"] if installed else self.attr["mag"]
+        self.put(ry, x0 + 2, self.ch("dot") if installed else self.ch("hol"), a)
+        label = LOBBY_NAME + ("  " + st.lobby if st.lobby else "")
+        self.put(ry, x0 + 4, label, a, maxw=self._col_x[0] - x0 - 5)
+        if st.lobby_update:
+            nx = x0 + 6 + len(label)
+            self.put(ry, nx, "%s %s available" % (self.ch("arrow"), st.lobby_update), a, maxw=self._col_x[0] - nx - 1)
+        col = "grn" if installed else "mag"
+        ok = not self.busy
+        for b, cx in zip([Btn("lobby:install", "UPDATE" if st.lobby_update else ("REINSTALL" if installed else "INSTALL"),
+                              self.on_lobby_install, ok, "red" if st.lobby_update else col),
+                          Btn("lobby:uninstall", "UNINSTALL", self.on_lobby_remove, ok and installed, col)],
+                         self._col_x):
+            self.button(b, ry, cx, bw, self.buttons)
+        return y + 3
 
     def _wrap_log(self, width):
         out = []
@@ -3164,6 +3317,28 @@ class Tui:
             eui_remove(game, log, progress)
             return "DONE."
         self.start_job("REMOVING EUI...", job)
+
+    def on_lobby_install(self):
+        if self.busy or not self.need_game() or not self.civ_running_dialog():
+            return
+        game = self.game
+
+        def job(log, progress):
+            log("=== INSTALLING %s ===" % LOBBY_NAME.upper())
+            lobby_install(game, log, progress)
+            return "DONE."
+        self.start_job("INSTALLING %s..." % LOBBY_NAME.upper(), job)
+
+    def on_lobby_remove(self):
+        if self.busy or not self.need_game() or not self.civ_running_dialog():
+            return
+        game = self.game
+
+        def job(log, progress):
+            log("=== REMOVING %s ===" % LOBBY_NAME.upper())
+            lobby_remove(game, log, progress)
+            return "DONE."
+        self.start_job("REMOVING %s..." % LOBBY_NAME.upper(), job)
 
     def on_open(self):
         if self.game is None:
