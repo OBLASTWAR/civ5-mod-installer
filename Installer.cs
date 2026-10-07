@@ -125,7 +125,7 @@ namespace KekModInstaller
         // TryFetchLatestInstallerVersion below. Unrelated to the mod's own
         // version (release tags like "v1.5-beta8") -- this is the installer
         // program's own version.
-        private const string InstallerVersion = "2.0";
+        private const string InstallerVersion = "2.1";
 
         public static string GetInstallerVersion()
         {
@@ -551,7 +551,8 @@ namespace KekModInstaller
             _btnUpdate.SetBounds(452, 6, 66, 22);
             _btnUpdate.Text = "UPDATE";
             _btnUpdate.Font = new Font("Consolas", 7.5F, FontStyle.Bold);
-            _btnUpdate.ForeColor = ThemeMagenta;
+            _btnUpdate.ForeColor = ThemeRed;
+            _btnUpdate.BorderColor = ThemeRed;
             _btnUpdate.Visible = false;
             _btnUpdate.Click += BtnUpdate_Click;
 

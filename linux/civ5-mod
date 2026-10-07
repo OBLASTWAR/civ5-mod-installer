@@ -71,7 +71,7 @@ import zipfile
 # Kept in step with the Windows build (InstallerCore.InstallerVersion in
 # installer/Installer.cs and installer/installer_version.txt): when one
 # bumps, bump this too.
-VERSION = "2.0"
+VERSION = "2.1"
 
 REPO_OWNER = "OBLASTWAR"
 REPO_NAME = "kek-mod"
@@ -2487,7 +2487,7 @@ class Tui:
         self.rich = rich
         # Green is reserved for installed mods/maps/EUI; everything else is
         # magenta. "dim" is a dark magenta for decoration (shadows, empty
-        # progress, key hints). Red is only the UPDATE button, as on Windows.
+        # progress, key hints). Red is only for UPDATE buttons, as on Windows.
         G, D, M, R = (46, 89, 199, 203) if rich else (c.COLOR_GREEN, c.COLOR_MAGENTA, c.COLOR_MAGENTA, c.COLOR_RED)
         K = c.COLOR_BLACK
         for i, (fg, bg) in enumerate([(G, K), (D, K), (M, K), (K, G), (K, M), (R, K), (K, R)], 1):
@@ -2730,7 +2730,7 @@ class Tui:
     def _draw_header(self, x0, W, big):
         btns = []
         if self.latest_self:
-            btns.append(Btn("update", "UPDATE v" + self.latest_self, self.on_self_update, not self.busy, "mag", "UPDATE"))
+            btns.append(Btn("update", "UPDATE v" + self.latest_self, self.on_self_update, not self.busy, "red", "UPDATE"))
         btns.append(Btn("setup", "SETUP", self.on_settings, not self.busy))
         tag = "-=[ v%s // LINUX @OBLAST ]=-" % VERSION
         if big:
