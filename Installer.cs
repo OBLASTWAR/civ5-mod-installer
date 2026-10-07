@@ -125,7 +125,7 @@ namespace KekModInstaller
         // TryFetchLatestInstallerVersion below. Unrelated to the mod's own
         // version (release tags like "v1.5-beta8") -- this is the installer
         // program's own version.
-        private const string InstallerVersion = "1.9";
+        private const string InstallerVersion = "2.0";
 
         public static string GetInstallerVersion()
         {
