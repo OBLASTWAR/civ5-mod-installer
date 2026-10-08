@@ -50,25 +50,20 @@ namespace KekModInstaller
         internal const string FolderName = "Lekmap";
 
         // Downloads every file in the repo's Lekmap/ directory into
-        // Assets/Maps/Lekmap if that folder isn't already there. Deliberately
-        // swallows every failure (offline, directory listing empty/changed,
-        // write hiccup): this is a bonus, not part of Lekmod itself, so it
-        // should never fail the main install.
+        // Assets/Maps/Lekmap, replacing an existing copy unless it's already
+        // the upstream version. Deliberately swallows every failure
+        // (offline, directory listing empty/changed, write hiccup): this is
+        // a bonus, not part of Lekmod itself, so it should never fail the
+        // main install.
         public static void EnsureInstalled(string dlcRoot, Action<string> log)
         {
             try
             {
                 string mapsFolder = MapsFolder(dlcRoot);
                 string targetDir = Path.Combine(mapsFolder, FolderName);
-                if (Directory.Exists(targetDir))
-                {
-                    log(FolderName + " already installed, skipping.");
-                    return;
-                }
 
                 log("Checking for Lekmap...");
-                List<GhContentsEntry> entries = FetchDirectoryListing();
-                List<GhContentsEntry> files = entries
+                List<GhContentsEntry> files = FetchDirectoryListing()
                     .Where(en => !string.IsNullOrEmpty(en.DownloadUrl) && (en.Type == null || en.Type == "file"))
                     .ToList();
                 if (files.Count == 0)
@@ -76,17 +71,38 @@ namespace KekModInstaller
                     log(FolderName + ": no files found upstream, skipping.");
                     return;
                 }
-
-                log("Installing " + FolderName + " (" + files.Count + " files)...");
-                Directory.CreateDirectory(targetDir);
-                using (var client = new HttpClient())
+                string upstreamVersion = VersionFromNames(files.Select(en => en.Name));
+                if (Directory.Exists(targetDir)
+                    && (upstreamVersion == null || MapVersion.Same(DetectVersion(targetDir), upstreamVersion)))
                 {
-                    client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                    foreach (GhContentsEntry entry in files)
+                    log(FolderName + (upstreamVersion == null ? "" : " " + upstreamVersion) + " already installed.");
+                    return;
+                }
+
+                log("Installing " + FolderName + (upstreamVersion == null ? "" : " " + upstreamVersion)
+                    + " (" + files.Count + " files)...");
+                string tempDir = Path.Combine(mapsFolder, ".kekmod-" + Guid.NewGuid().ToString("N"));
+                Directory.CreateDirectory(tempDir);
+                try
+                {
+                    using (var client = new HttpClient())
                     {
-                        byte[] data = client.GetByteArrayAsync(entry.DownloadUrl).GetAwaiter().GetResult();
-                        File.WriteAllBytes(Path.Combine(targetDir, entry.Name), data);
+                        client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
+                        foreach (GhContentsEntry entry in files)
+                        {
+                            byte[] data = client.GetByteArrayAsync(entry.DownloadUrl).GetAwaiter().GetResult();
+                            File.WriteAllBytes(Path.Combine(tempDir, entry.Name), data);
+                        }
                     }
+                    if (Directory.Exists(targetDir))
+                    {
+                        Directory.Delete(targetDir, true); // older version
+                    }
+                    Directory.Move(tempDir, targetDir);
+                }
+                finally
+                {
+                    try { if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true); } catch (Exception) { }
                 }
                 log(FolderName + " installed.");
             }
@@ -94,6 +110,13 @@ namespace KekModInstaller
             {
                 log(FolderName + ": couldn't install (" + ex.Message + ")");
             }
+        }
+
+        // Upstream version, e.g. "v6.1" -- same form as DetectVersion. Null
+        // if the flagship file isn't there to read it from.
+        public static string FetchLatestVersion()
+        {
+            return VersionFromNames(FetchDirectoryListing().Select(en => en.Name));
         }
 
         // Removes the Lekmap folder from Assets/Maps if present. Never
@@ -144,18 +167,25 @@ namespace KekModInstaller
         {
             try
             {
-                string file = Directory.GetFiles(targetDir, "LekmapPangaeaFractalv*.lua").FirstOrDefault();
-                if (file == null)
-                {
-                    return null;
-                }
-                Match m = FractalVersionPattern.Match(Path.GetFileName(file));
-                return m.Success ? "v" + m.Groups[1].Value : null;
+                return VersionFromNames(Directory.GetFiles(targetDir, "LekmapPangaeaFractalv*.lua").Select(Path.GetFileName));
             }
             catch (Exception)
             {
                 return null;
             }
+        }
+
+        private static string VersionFromNames(IEnumerable<string> names)
+        {
+            foreach (string name in names)
+            {
+                Match m = FractalVersionPattern.Match(name ?? "");
+                if (m.Success)
+                {
+                    return "v" + m.Groups[1].Value;
+                }
+            }
+            return null;
         }
 
         private static List<GhContentsEntry> FetchDirectoryListing()

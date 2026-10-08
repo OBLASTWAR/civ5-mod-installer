@@ -28,25 +28,25 @@ namespace KekModInstaller
         // sync with the one place this name is actually defined.
         internal const string FolderName = "Fish Map Script";
 
-        // Downloads and drops FolderName into Assets/Maps if it isn't already
-        // there. Deliberately swallows every failure (offline, repo/release
-        // missing, extraction hiccup): this is a bonus, not part of any mod
-        // itself, so it should never fail the main install.
+        // Drops the newest release into Assets/Maps, replacing an existing
+        // copy unless it's already that version. Deliberately swallows every
+        // failure (offline, repo/release missing, extraction hiccup): this is
+        // a bonus, not part of any mod itself, so it should never fail the
+        // main install.
         public static void EnsureInstalled(string dlcRoot, Action<string> log)
         {
             try
             {
                 string mapsFolder = MapsFolder(dlcRoot);
                 string targetDir = Path.Combine(mapsFolder, FolderName);
-                if (Directory.Exists(targetDir))
-                {
-                    log(FolderName + " already installed, skipping.");
-                    return;
-                }
 
-                log("Installing " + FolderName + "...");
                 List<GhRelease> releases = GitHubModSource.FetchReleases(RepoOwner, RepoName);
                 GhRelease release = releases[0]; // newest
+                if (Directory.Exists(targetDir) && MapVersion.Same(DetectVersion(targetDir), release.TagName))
+                {
+                    log(FolderName + " " + release.TagName + " already installed.");
+                    return;
+                }
                 GhAsset asset = release.Assets != null ? release.Assets.FirstOrDefault() : null;
                 if (asset == null)
                 {
@@ -54,7 +54,12 @@ namespace KekModInstaller
                     return;
                 }
 
+                log("Installing " + FolderName + " " + release.TagName + "...");
                 string zipPath = GitHubModSource.DownloadAsset(asset);
+                if (Directory.Exists(targetDir))
+                {
+                    Directory.Delete(targetDir, true); // older version
+                }
                 Directory.CreateDirectory(mapsFolder);
                 ZipFile.ExtractToDirectory(zipPath, mapsFolder);
                 File.Delete(zipPath);
@@ -125,6 +130,12 @@ namespace KekModInstaller
             {
                 return null;
             }
+        }
+
+        // Newest release's tag, e.g. "v1.0" -- same form as DetectVersion.
+        public static string FetchLatestVersion()
+        {
+            return GitHubModSource.FetchReleases(RepoOwner, RepoName)[0].TagName;
         }
 
         private static string MapsFolder(string dlcRoot)

@@ -3,9 +3,10 @@
 #
 #   ./civ5-mod                         full-screen installer (same as `tui`)
 #   ./civ5-mod status                  what's installed, updates, checks
-#   ./civ5-mod install kekmod          latest release (also: tournament, lekmod)
+#   ./civ5-mod install kekmod          latest release (also: tournament, lekmod, snowve)
 #   ./civ5-mod install kekmod --version v2.0
 #   ./civ5-mod uninstall kekmod
+#   ./civ5-mod map snowve              install/update just a mod's bonus map
 #   ./civ5-mod versions kekmod         list published releases
 #   ./civ5-mod eui install [eui|xits]  / eui uninstall
 #   ./civ5-mod lobby install | uninstall  civ5-lobby-patch (worldwide lobby list)
@@ -21,8 +22,8 @@
 # Players install it with one line; afterwards it's just `civ5-mod`:
 #   curl -fsSL https://raw.githubusercontent.com/OBLASTWAR/kek-mod/main/installer/linux/civ5-mod | python3 - install-self
 #
-# Mirrors installer/*.cs feature for feature: three mutually exclusive mods,
-# each with its bonus map (Fish Map Script / Better Pangaea / Lekmap), the two
+# Mirrors installer/*.cs feature for feature: four mutually exclusive mods,
+# each with its bonus map (Fish Map Script / Better Pangaea / Lekmap / Weevee Map), the two
 # bundled EUI variants, the lobby patch, VERIFY MODS, CLEAR GFX CACHE, REDOWNLOAD CIV, the beta
 # setting and self-update. Where Windows and Linux differ:
 #
@@ -35,7 +36,7 @@
 #     from the same bundled zips the Windows build embeds: they're read straight
 #     out of installer/KekModInstaller.exe (this checkout's copy, else the one
 #     on main), so the exact-match check compares against identical bytes.
-#   * Every mod ships a ui_check.bat. BatchScript below runs the small subset
+#   * Every mod but SnowVe ships a ui_check.bat. BatchScript runs the subset
 #     of batch those scripts use (copy/xcopy, del, IF EXIST, FIND/FINDSTR, set,
 #     one PowerShell string replace), sandboxed to Assets/DLC, with Windows'
 #     case-insensitive path lookups.
@@ -71,7 +72,7 @@ import zipfile
 # Kept in step with the Windows build (InstallerCore.InstallerVersion in
 # installer/Installer.cs and installer/installer_version.txt): when one
 # bumps, bump this too.
-VERSION = "2.1"
+VERSION = "2.2"
 
 REPO_OWNER = "OBLASTWAR"
 REPO_NAME = "kek-mod"
@@ -212,6 +213,11 @@ def version_key(raw):
     while len(nums) > 1 and nums[-1] == 0:
         nums.pop()
     return (1, tuple(nums), m.group(2))
+
+
+def same_map_version(a, b):
+    """Bonus-map labels mix "v"/"V" prefixes ("v1.0", "V5.4") -- MapVersion.Same."""
+    return bool(a and b) and a.lstrip("vV").lower() == b.lstrip("vV").lower()
 
 
 def is_newer_version(remote, local):
@@ -539,6 +545,45 @@ class GitHubSource:
         return path
 
 
+class GitLabSource:
+    """GitLab Releases with no assets, installed from each tag's source
+    archive, top-level folder "<repo>-<tag>" (GitLabModSource.cs)."""
+
+    def __init__(self, owner, repo):
+        self.owner, self.repo = owner, repo
+
+    def _fetch(self):
+        path = urllib.parse.quote(self.owner + "/" + self.repo, safe="")
+        rels = json.loads(http_bytes("https://gitlab.com/api/v4/projects/%s/releases?per_page=50" % path).decode("utf-8"))
+        if not rels:
+            raise InstallerError("No releases found for %s/%s." % (self.owner, self.repo))
+        return rels  # newest first (by released_at)
+
+    @staticmethod
+    def _to_release(r):
+        return Release(r["tag_name"], False, (r.get("released_at") or "")[:10] or None, r)
+
+    def list_releases(self):
+        return [self._to_release(r) for r in self._fetch()]
+
+    def resolve(self, tag, want_beta):
+        rels = self._fetch()
+        if tag:
+            for r in rels:
+                if r["tag_name"].lower() == tag.lower():
+                    return self._to_release(r)
+            raise InstallerError("Release %s doesn't exist on GitLab. Pick another version." % tag)
+        return self._to_release(rels[0])
+
+    def download(self, release, dest_dir, log, progress):
+        t = urllib.parse.quote(release.tag, safe="")
+        url = "https://gitlab.com/%s/%s/-/archive/%s/%s-%s.zip" % (self.owner, self.repo, t, self.repo, t)
+        log("Archive: %s-%s.zip (large, this can take a few minutes)" % (self.repo, release.tag))
+        path = os.path.join(dest_dir, "release.zip")
+        download_to(url, path, progress)
+        return path
+
+
 class LekmodSource:
     """Lekmod's versions.json manifest + Google Drive files (LekmodModSource.cs)."""
 
@@ -617,22 +662,36 @@ class FishMapExtra:
                 return "v" + m.group(1)
         return ""
 
+    @staticmethod
+    def _newest():
+        rels = github_api("repos/OBLASTWAR/pangea-stratbal/releases?per_page=50")
+        if not rels:
+            raise InstallerError("no releases found")
+        return rels[0]
+
+    def latest(self):
+        return self._newest()["tag_name"]
+
     def ensure(self, game, log):
+        """Newest release, replacing an existing copy unless it's that version."""
         try:
-            if os.path.isdir(self._dir(game)):
-                log(self.name + " already installed, skipping.")
+            rel = self._newest()
+            d = self._dir(game)
+            if os.path.isdir(d) and same_map_version(self.detect(game), rel["tag_name"]):
+                log("%s %s already installed." % (self.name, rel["tag_name"]))
                 return
-            log("Installing " + self.name + "...")
-            rels = github_api("repos/OBLASTWAR/pangea-stratbal/releases?per_page=50")
-            if not rels or not rels[0].get("assets"):
+            if not rel.get("assets"):
                 log(self.name + ": no release asset found, skipping.")
                 return
+            log("Installing %s %s..." % (self.name, rel["tag_name"]))
             with tempfile.TemporaryDirectory(prefix="kekmod-") as tmp:
                 zp = os.path.join(tmp, "fish.zip")
-                download_to(rels[0]["assets"][0]["browser_download_url"], zp)
+                download_to(rel["assets"][0]["browser_download_url"], zp)
+                if os.path.isdir(d):
+                    remove_tree(d)  # older version
                 os.makedirs(game.maps, exist_ok=True)
                 extract_zip(zp, game.maps)
-            log("%s %s installed." % (self.name, rels[0]["tag_name"]))
+            log("%s %s installed." % (self.name, rel["tag_name"]))
         except Exception as e:
             log("%s: couldn't install (%s)" % (self.name, e))
 
@@ -651,46 +710,58 @@ class BetterPangaeaExtra:
     name = "Better Pangaea"
     pattern = re.compile(r"^Better_Pangaea_V(.+)\.lua$", re.I)
 
-    def _local(self, game):
+    def _locals(self, game):
         try:
-            for f in sorted(os.listdir(game.maps)):
-                if self.pattern.match(f):
-                    return os.path.join(game.maps, f)
+            return [os.path.join(game.maps, f) for f in sorted(os.listdir(game.maps)) if self.pattern.match(f)]
         except OSError:
-            pass
-        return None
+            return []
+
+    def _local(self, game):
+        found = self._locals(game)
+        return found[0] if found else None
+
+    def _upstream(self):
+        best = None
+        for e in github_api("repos/ImmoSS/Civ5-Patch/contents/Maps"):
+            m = self.pattern.match(e.get("name") or "")
+            if m and (best is None or version_key(m.group(1)) > version_key(best[1])):
+                best = (e, m.group(1))
+        return best
+
+    def latest(self):
+        best = self._upstream()
+        return None if best is None else "V" + best[1]
 
     def detect(self, game):
         f = self._local(game)
         return None if f is None else "V" + self.pattern.match(os.path.basename(f)).group(1)
 
     def ensure(self, game, log):
+        """Latest Better_Pangaea_V*.lua, replacing any older one."""
         try:
-            existing = self._local(game)
-            if existing:
-                log(os.path.basename(existing) + " already installed, skipping.")
-                return
             log("Checking for the latest Better Pangaea map...")
-            entries = github_api("repos/ImmoSS/Civ5-Patch/contents/Maps")
-            best = None
-            for e in entries:
-                m = self.pattern.match(e.get("name") or "")
-                if m and (best is None or version_key(m.group(1)) > version_key(best[1])):
-                    best = (e, m.group(1))
+            best = self._upstream()
             if best is None:
                 log("Better Pangaea: no map file found upstream, skipping.")
                 return
-            log("Installing " + best[0]["name"] + "...")
-            os.makedirs(game.maps, exist_ok=True)
-            download_to(best[0]["download_url"], os.path.join(game.maps, best[0]["name"]))
-            log(best[0]["name"] + " installed.")
+            name = best[0]["name"]
+            if any(os.path.basename(f).lower() == name.lower() for f in self._locals(game)):
+                log(name + " already installed.")
+            else:
+                log("Installing " + name + "...")
+                os.makedirs(game.maps, exist_ok=True)
+                download_to(best[0]["download_url"], os.path.join(game.maps, name))
+                log(name + " installed.")
+            for f in self._locals(game):
+                if os.path.basename(f).lower() != name.lower():
+                    log("Removing old " + os.path.basename(f) + "...")
+                    os.unlink(f)
         except Exception as e:
             log("Better Pangaea: couldn't install (%s)" % e)
 
     def remove(self, game, log):
         try:
-            f = self._local(game)
-            if f:
+            for f in self._locals(game):
                 log("Removing " + os.path.basename(f) + "...")
                 os.unlink(f)
         except Exception as e:
@@ -705,32 +776,52 @@ class LekmapExtra:
     def _dir(self, game):
         return ci_resolve(os.path.join(game.maps, self.folder))
 
+    @staticmethod
+    def _version_from(names):
+        for f in sorted(names):
+            m = re.match(r"^LekmapPangaeaFractalv(.+)\.lua$", f, re.I)
+            if m:
+                return "v" + m.group(1)
+        return None
+
+    @staticmethod
+    def _listing():
+        return [e for e in github_api("repos/EnormousApplePie/Lekmod/contents/Lekmap")
+                if e.get("download_url") and e.get("type", "file") == "file"]
+
     def detect(self, game):
         d = self._dir(game)
         if not os.path.isdir(d):
             return None
-        for f in sorted(os.listdir(d)):
-            m = re.match(r"^LekmapPangaeaFractalv(.+)\.lua$", f, re.I)
-            if m:
-                return "v" + m.group(1)
-        return ""
+        return self._version_from(os.listdir(d)) or ""
+
+    def latest(self):
+        return self._version_from(e["name"] for e in self._listing())
 
     def ensure(self, game, log):
+        """Upstream Lekmap/, replacing an existing copy unless it's that version."""
         try:
             target = self._dir(game)
-            if os.path.isdir(target):
-                log(self.folder + " already installed, skipping.")
-                return
             log("Checking for Lekmap...")
-            files = [e for e in github_api("repos/EnormousApplePie/Lekmod/contents/Lekmap")
-                     if e.get("download_url") and e.get("type", "file") == "file"]
+            files = self._listing()
             if not files:
                 log("Lekmap: no files found upstream, skipping.")
                 return
-            log("Installing Lekmap (%d files)..." % len(files))
-            os.makedirs(target, exist_ok=True)
-            for e in files:
-                download_to(e["download_url"], os.path.join(target, os.path.basename(e["name"])))
+            ver = self._version_from(e["name"] for e in files)
+            if os.path.isdir(target) and (ver is None or same_map_version(self.detect(game), ver)):
+                log("Lekmap%s already installed." % (" " + ver if ver else ""))
+                return
+            log("Installing Lekmap%s (%d files)..." % (" " + ver if ver else "", len(files)))
+            os.makedirs(game.maps, exist_ok=True)
+            tmp = tempfile.mkdtemp(prefix=".kekmod-", dir=game.maps)
+            try:
+                for e in files:
+                    download_to(e["download_url"], os.path.join(tmp, os.path.basename(e["name"])))
+                if os.path.isdir(target):
+                    remove_tree(target)  # older version
+                os.rename(tmp, os.path.join(game.maps, self.folder))
+            finally:
+                shutil.rmtree(tmp, ignore_errors=True)
             log("Lekmap installed.")
         except Exception as e:
             log("Lekmap: couldn't install (%s)" % e)
@@ -743,6 +834,95 @@ class LekmapExtra:
                 remove_tree(d)
         except Exception as e:
             log("Lekmap: couldn't remove (%s)" % e)
+
+
+class WeeveeMapExtra:
+    """SnowVe's map (WeeveeMapExtra.cs): addressed by repo ID since the repo
+    is renamed every version; replaced when out of date, other copies
+    removed (DEF*W*.lua include() by name), git working copies left alone."""
+    id = "weeveemap"
+    name = "Weevee Map"
+    REPO_ID = 1354734621
+    MAP_RE = r"^Weevee - v(.+)\.lua$"
+
+    def _version_of(self, d):
+        try:
+            for f in sorted(os.listdir(d)):
+                m = re.match(self.MAP_RE, f, re.I)
+                if m:
+                    return m.group(1)
+        except OSError:
+            pass
+        return None
+
+    def _folders(self, game):
+        return [d for d in ci_dirs_with_prefix(game.maps, "Weevee-v")
+                if re.match(r"^Weevee-v.*-Map", os.path.basename(d), re.I) and self._version_of(d)]
+
+    @staticmethod
+    def _is_git(d):
+        return os.path.exists(os.path.join(d, ".git"))
+
+    def detect(self, game):
+        vers = [v for v in (self._version_of(d) for d in self._folders(game)) if v]
+        if not vers:
+            return None
+        return "v" + max(vers, key=lambda v: [int(x) if x.isdigit() else 0 for x in v.split(".")])
+
+    def _listing(self):
+        return [e for e in github_api("repositories/%d/contents/" % self.REPO_ID)
+                if e.get("download_url") and e.get("type", "file") == "file" and e["name"].lower().endswith(".lua")]
+
+    def _version_from(self, files):
+        return next((re.match(self.MAP_RE, e["name"], re.I).group(1) for e in files
+                     if re.match(self.MAP_RE, e["name"], re.I)), None)
+
+    def latest(self):
+        ver = self._version_from(self._listing())
+        return None if ver is None else "v" + ver
+
+    def ensure(self, game, log):
+        try:
+            log("Checking for Weevee Map...")
+            files = self._listing()
+            ver = self._version_from(files)
+            if ver is None:
+                log('Weevee Map: no "Weevee - v*.lua" found upstream, skipping.')
+                return
+            current = next((d for d in self._folders(game) if (self._version_of(d) or "").lower() == ver.lower()), None)
+            if current:
+                log("Weevee Map v%s already installed (%s)." % (ver, os.path.basename(current)))
+            else:
+                log("Installing Weevee Map v%s (%d files)..." % (ver, len(files)))
+                os.makedirs(game.maps, exist_ok=True)
+                tmp = tempfile.mkdtemp(prefix=".kekmod-", dir=game.maps)
+                try:
+                    for e in files:
+                        download_to(e["download_url"], os.path.join(tmp, os.path.basename(e["name"])))
+                    current = os.path.join(game.maps, "Weevee-v%s-Map-main" % ver)
+                    if os.path.lexists(current):
+                        remove_tree(current)  # same name, wrong contents
+                    os.rename(tmp, current)
+                finally:
+                    shutil.rmtree(tmp, ignore_errors=True)
+                log("Weevee Map v%s installed." % ver)
+            for d in self._folders(game):
+                if os.path.normcase(d) != os.path.normcase(current) and not self._is_git(d):
+                    log("Removing old " + os.path.basename(d) + "...")
+                    remove_tree(d)
+        except Exception as e:
+            log("Weevee Map: couldn't install (%s)" % e)
+
+    def remove(self, game, log):
+        try:
+            for d in self._folders(game):
+                if self._is_git(d):
+                    log("Leaving %s (git working copy)." % os.path.basename(d))
+                    continue
+                log("Removing " + os.path.basename(d) + "...")
+                remove_tree(d)
+        except Exception as e:
+            log("Weevee Map: couldn't remove (%s)" % e)
 
 
 # ── Mod registry (ModCore.cs ModRegistry) ─────────────────────────────────────
@@ -775,6 +955,9 @@ MODS = [
            GitHubSource("catscatsforever", "Civ5-Patch", False), None, False, BetterPangaeaExtra()),
     ModDef("lekmod", "Lekmod", ["lek"], "LEKMOD_",
            LekmodSource(), "LEKMOD", False, LekmapExtra()),
+    # GitLab source archive; its "snowve-<tag>" folder is used as-is (see ModCore.cs).
+    ModDef("snowve", "SnowVe", ["snow"], "snowve-",
+           GitLabSource("megawac1", "snowve"), None, False, WeeveeMapExtra()),
 ]
 TOURNAMENT = MODS[1]
 
@@ -1480,6 +1663,7 @@ class State:
         self.installed = {}   # mod id -> [folder names]
         self.extras = {}      # extra id -> version label ("" if unknown); absent = not installed
         self.updates = {}     # mod id -> tag auto-install would pick now
+        self.extra_updates = {}  # extra id -> newer upstream version of an installed bonus map
         self.eui = None
         self.eui_match = None  # True / False / None (no bundled copy to compare against)
         self.lobby = None      # installed lobby patch tag ("" if unknown); None = not installed
@@ -1497,6 +1681,9 @@ class State:
                 v = mod.extra.detect(game)
                 if v is not None:
                     self.extras[mod.extra.id] = v
+                    latest = releases.get(extra_key(mod.extra))
+                    if v and latest and not same_map_version(v, latest):
+                        self.extra_updates[mod.extra.id] = latest
         self.eui = eui_detect(game)
         if self.eui:
             self.eui_match = eui_exact_match(game, self.eui_variant())
@@ -1518,6 +1705,35 @@ class State:
 
     def missing_maps(self):
         return [m for m in self.installed_mods() if m.extra and m.extra.id not in self.extras]
+
+
+def extra_key(extra):
+    """Where an extra's newest upstream version sits in the releases dict."""
+    return "extra:" + extra.id
+
+
+def fetch_extra_latest(game, out):
+    """Newest upstream version of each INSTALLED bonus map, into out --
+    installed ones only, to keep GitHub API calls down."""
+    if game is None or game.problem():
+        return
+    for m in MODS:
+        if m.extra:
+            try:
+                if m.extra.detect(game) is not None:
+                    v = m.extra.latest()
+                    if v:
+                        out[extra_key(m.extra)] = v
+            except Exception:
+                pass
+
+
+def check_extra_result(game, mod, latest):
+    """After a map-only install/update (whose ensure() swallows errors so a
+    map never fails a mod install), raise if it didn't take."""
+    v = mod.extra.detect(game)
+    if v is None or (v and latest and not same_map_version(v, latest)):
+        raise InstallerError("%s wasn't %s -- see the log." % (mod.extra.name, "installed" if v is None else "updated"))
 
 
 def latest_release(mod, releases, show_beta):
@@ -1553,7 +1769,9 @@ def run_checks(game, state):
         out.append((state.eui_match, v.label() + (" matches this installer's bundled copy exactly."
                                                    if state.eui_match else
                                                    " doesn't exactly match this installer's bundled copy.")))
-    ups = [m.name for m in MODS if m.id in state.updates] + ([LOBBY_NAME] if state.lobby_update else [])
+    ups = [m.name for m in MODS if m.id in state.updates] \
+        + [m.extra.name for m in MODS if m.extra and m.extra.id in state.extra_updates] \
+        + ([LOBBY_NAME] if state.lobby_update else [])
     out.append((not ups, "Update available for: " + ", ".join(ups) + "." if ups else "All installed mods are up to date."))
     return out
 
@@ -1591,7 +1809,8 @@ def scan_extra_folders(game):
     if os.path.isdir(game.maps):
         for name in sorted(os.listdir(game.maps)):
             p = os.path.join(game.maps, name)
-            if os.path.isdir(p) and name.lower() not in ("fish map script", "lekmap"):
+            if os.path.isdir(p) and name.lower() not in ("fish map script", "lekmap") \
+                    and not re.match(r"^Weevee-v.*-Map", name, re.I):
                 found.append(ExtraFolder(p, "Maps"))
     return found
 
@@ -1867,7 +2086,7 @@ def install_self(log):
     os.makedirs(os.path.dirname(DESKTOP_PATH), exist_ok=True)
     with open(DESKTOP_PATH, "w") as f:
         f.write("[Desktop Entry]\nType=Application\nName=Civ V Mod Installer\n"
-                "Comment=Install KEK Mod, Tournament Mod, Lekmod and EUI for Civilization V (Proton)\n"
+                "Comment=Install KEK Mod, Tournament Mod, Lekmod, SnowVe and EUI for Civilization V (Proton)\n"
                 'Exec="%s"\nTerminal=true\nIcon=applications-games\nCategories=Game;\n' % INSTALLED_PATH)
     log("Added 'Civ V Mod Installer' to the app menu")
 
@@ -2024,8 +2243,9 @@ class Cli:
         if is_civ_running():
             raise InstallerError("Civilization V is running. Close it first (or `civ5-mod kill`).")
 
-    def releases(self, mods=MODS):
+    def releases(self, mods=MODS, game=None):
         out = {}
+        fetch_extra_latest(game, out)
         for m in mods:
             try:
                 out[m.id] = m.source.list_releases()
@@ -2048,7 +2268,7 @@ class Cli:
     def cmd_status(self):
         game = self.game(require=False)
         offline = getattr(self.args, "offline", False)
-        releases = {} if offline else self.releases()
+        releases = {} if offline else self.releases(game=game)
         state = State(game, releases, self.settings.show_beta)
         self.out.banner()
         self.out.line(self.out.d(" game   ") + (game.root if game else self.out.m("not found")))
@@ -2068,7 +2288,9 @@ class Cli:
                 ev = state.extras.get(mod.extra.id)
                 self.out.line("      %s %s" % (self.out.g("└─ ●") if ev is not None else self.out.m("└─ ○"),
                                                    self.out.g(mod.extra.name + ("  " + ev if ev else "")) if ev is not None
-                                                   else self.out.m(mod.extra.name)))
+                                                   else self.out.m(mod.extra.name))
+                              + (self.out.g("  » update: " + state.extra_updates[mod.extra.id])
+                                 if mod.extra.id in state.extra_updates else ""))
         self.out.section("INTERFACE MODS")
         for v in EUI_VARIANTS:
             active = state.eui == v.id
@@ -2166,6 +2388,20 @@ class Cli:
             self.run_job(eui_remove, game)
         return 0
 
+    def cmd_map(self):
+        mod = mod_by_name(self.args.mod)
+        if not mod.extra:
+            raise InstallerError("%s has no bonus map." % mod.name)
+        game = self.game()
+        if not installed_folders(game, mod):
+            raise InstallerError("%s isn't installed -- `civ5-mod install %s` brings its %s along."
+                                 % (mod.name, mod.id, mod.extra.name))
+        self.require_civ_closed()
+        self.out.section(mod.extra.name.upper())
+        self.run_job(lambda g, log, progress: mod.extra.ensure(g, log), game)
+        check_extra_result(game, mod, None)
+        return 0
+
     def cmd_lobby(self):
         game = self.game()
         self.require_civ_closed()
@@ -2179,7 +2415,7 @@ class Cli:
 
     def cmd_verify(self):
         game = self.game(require=False)
-        state = State(game, self.releases(), self.settings.show_beta)
+        state = State(game, self.releases(game=game), self.settings.show_beta)
         self.out.section("CHECKS")
         checks = run_checks(game, state)
         for ok, msg in checks:
@@ -2320,7 +2556,7 @@ def build_parser():
         description="KEK Mod installer for Civilization V under Steam Proton. Run with no command "
                     "for the full-screen installer.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="mods: kekmod, tournament, lekmod    eui variants: eui, xits")
+        epilog="mods: kekmod, tournament, lekmod, snowve    eui variants: eui, xits")
     p.add_argument("--civ-dir", metavar="DIR", help="Civ V folder (.../steamapps/common/%s) for this run" % CIV_FOLDER)
     p.add_argument("--no-color", action="store_true", help="plain output")
     p.add_argument("--ascii", action="store_true", help="full-screen UI without Unicode box art")
@@ -2333,10 +2569,12 @@ def build_parser():
     s.add_argument("--offline", action="store_true", help="skip the GitHub update check")
     for name, hlp in (("install", "install or update a mod"), ("uninstall", "remove a mod and its bonus map")):
         s = sub.add_parser(name, help=hlp)
-        s.add_argument("mod", help="kekmod, tournament or lekmod")
+        s.add_argument("mod", help="kekmod, tournament, lekmod or snowve")
         if name == "install":
             s.add_argument("--version", dest="version", metavar="TAG", help="exact release tag (default: latest)")
             s.add_argument("--beta", action="store_true", help="consider beta releases for 'latest'")
+    s = sub.add_parser("map", help="install or update a mod's bonus map only")
+    s.add_argument("mod", help="kekmod, tournament, lekmod or snowve")
     s = sub.add_parser("versions", help="list a mod's releases")
     s.add_argument("mod")
     s.add_argument("--beta", action="store_true", help="include betas")
@@ -2539,6 +2777,7 @@ class Tui:
             rel[LOBBY_REPO] = lobby_latest_tag()
         except Exception:
             pass
+        fetch_extra_latest(self.game, rel)
         ticker = fetch_ticker()
         latest = None
         if not in_git_checkout():  # a checkout updates with git pull
@@ -2687,8 +2926,8 @@ class Tui:
         scr.erase()
         h, w = scr.getmaxyx()
         self.buttons = []
-        if h < 25 or w < 72:
-            self.put(h // 2, max(0, (w - 34) // 2), "TERMINAL TOO SMALL -- NEED 72x25", self.attr["mag"])
+        if h < 27 or w < 72:
+            self.put(h // 2, max(0, (w - 34) // 2), "TERMINAL TOO SMALL -- NEED 72x27", self.attr["mag"])
             self.put(h // 2 + 1, max(0, (w - 20) // 2), "(now %dx%d, Q quits)" % (w, h), self.attr["dim"])
             if refresh:
                 scr.refresh()
@@ -2779,14 +3018,14 @@ class Tui:
                 Btn("mod:%s:version" % mod.id, "VERSION", lambda: self.on_version(mod), ok, col)]
 
     def _draw_mods(self, y, x0, W):
-        rows = 2 * len(MODS)
+        rows = sum(2 if m.extra else 1 for m in MODS)
         self.box(y, x0, rows + 2, W, "GAME MODS", "mag")
         bw = 13
         bx = x0 + W - 2 - (3 * bw + 2)
         self._col_x = [bx, bx + bw + 1, bx + 2 * (bw + 1)]
         st = self.state
-        for i, mod in enumerate(MODS):
-            ry = y + 1 + 2 * i
+        ry = y + 1
+        for mod in MODS:
             installed = mod.id in st.installed
             a = self.attr["grn"] if installed else self.attr["mag"]
             self.put(ry, x0 + 2, self.ch("dot") if installed else self.ch("hol"), a)
@@ -2806,9 +3045,22 @@ class Tui:
                 ea = self.attr["grn"] if ev is not None else self.attr["mag"]
                 self.put(ry + 1, x0 + 4, self.ch("branch"), ea)
                 self.put(ry + 1, x0 + 7, self.ch("dot") if ev is not None else self.ch("hol"), ea)
-                self.put(ry + 1, x0 + 9, mod.extra.name + ("  " + ev if ev else ""), ea)
+                label = mod.extra.name + ("  " + ev if ev else "")
+                upd = st.extra_updates.get(mod.extra.id)
+                has_btn = installed and (ev is None or upd)
+                # The map's own button sits in the rightmost column so the
+                # name + versions fit at 72 columns; text runs up to it.
+                right = self._col_x[2] if has_btn else x0 + W - 2
+                self.put(ry + 1, x0 + 9, label, ea, maxw=right - x0 - 10)
+                room = right - (x0 + 12 + len(label))
                 if installed and ev is None:
-                    self.put(ry + 1, x0 + 11 + len(mod.extra.name), "missing -- reinstall to add it", ea)
+                    self.put(ry + 1, x0 + 11 + len(label), "missing", ea, maxw=room)
+                elif upd:
+                    self.put(ry + 1, x0 + 11 + len(label), "%s %s" % (self.ch("arrow"), upd), ea, maxw=room)
+                if has_btn:
+                    self.button(Btn("map:%s" % mod.id, "UPDATE" if upd else "INSTALL", lambda m=mod: self.on_map(m),
+                                    not self.busy, "red" if upd else "grn"), ry + 1, self._col_x[2], bw, self.buttons)
+            ry += 2 if mod.extra else 1
         return y + rows + 2
 
     def _draw_eui(self, y, x0, W):
@@ -3223,7 +3475,7 @@ class Tui:
         missing = st.missing_maps()
         if missing:
             self.msgbox("MISSING BONUS MAP", "\n".join("%s is missing its %s." % (m.name, m.extra.name) for m in missing)
-                        + "\n\nReinstall to add it.", color="mag")
+                        + "\n\nUse the INSTALL button on its map row to add it.", color="mag")
         if st.eui == "eui_xits" and TOURNAMENT.id in st.installed:
             self.msgbox("NOT COMPATIBLE", "Tournament Mod and EUI XITS are not compatible.", color="mag")
 
@@ -3254,6 +3506,19 @@ class Tui:
             log("=== INSTALLING %s ===" % mod.name.upper())
             return "[INSTALLED] " + install_mod(game, mod, tag, beta, log, progress)
         self.start_job("INSTALLING %s..." % mod.name.upper(), job)
+
+    def on_map(self, mod):
+        """The bonus-map row's own button: just the map, not the mod."""
+        if self.busy or not self.need_game() or not self.civ_running_dialog():
+            return
+        game, latest = self.game, self.releases.get(extra_key(mod.extra))
+
+        def job(log, progress):
+            log("=== %s ===" % mod.extra.name.upper())
+            mod.extra.ensure(game, log)  # best-effort: logs failures, never raises
+            check_extra_result(game, mod, latest)
+            return "DONE."
+        self.start_job("UPDATING %s..." % mod.extra.name.upper(), job)
 
     def on_uninstall(self, mod):
         if self.busy or not self.need_game() or not self.civ_running_dialog():

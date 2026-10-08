@@ -18,6 +18,7 @@ using System.Collections.Generic;
 using System.IO;
 using System.IO.Compression;
 using System.Linq;
+using System.Text.RegularExpressions;
 
 namespace KekModInstaller
 {
@@ -121,9 +122,11 @@ namespace KekModInstaller
 
             // Maps: Tournament Mod's Better Pangaea bonus is a loose .lua
             // file, not a folder (see TournamentMapExtra), so the recognized
-            // folders here are kek-mod's Fish Map Script and Lekmod's Lekmap.
+            // folders here are kek-mod's Fish Map Script, Lekmod's Lekmap and
+            // SnowVe's Weevee Map ("Weevee-v<version>-Map-main").
             return string.Equals(name, MapScriptExtra.FolderName, StringComparison.OrdinalIgnoreCase)
-                || string.Equals(name, LekmapExtra.FolderName, StringComparison.OrdinalIgnoreCase);
+                || string.Equals(name, LekmapExtra.FolderName, StringComparison.OrdinalIgnoreCase)
+                || Regex.IsMatch(name, "^" + Regex.Escape(WeeveeMapExtra.FolderGlob).Replace(@"\*", ".*") + "$", RegexOptions.IgnoreCase);
         }
 
         // Minimal glob support -- every InstalledFolderGlob in ModRegistry is

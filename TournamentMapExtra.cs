@@ -44,24 +44,16 @@ namespace KekModInstaller
         private const string MapsPath = "Maps";
         private static readonly Regex NamePattern = new Regex(@"^Better_Pangaea_V(.+)\.lua$", RegexOptions.IgnoreCase);
 
-        // Downloads and drops the latest Better_Pangaea_V*.lua into
-        // Assets/Maps if no such file is already there. Deliberately
+        // Drops the latest Better_Pangaea_V*.lua into Assets/Maps, replacing
+        // any older Better_Pangaea_V*.lua already there. Deliberately
         // swallows every failure (offline, directory listing empty/changed,
         // write hiccup): this is a bonus, not part of Tournament Mod itself,
-        // so it should never fail the main install. Mirrors MapScriptExtra's
-        // "install once, never auto-update an existing copy" behavior --
-        // whatever version got installed first stays until manually removed.
+        // so it should never fail the main install.
         public static void EnsureInstalled(string dlcRoot, Action<string> log)
         {
             try
             {
                 string mapsFolder = MapsFolder(dlcRoot);
-                string existing = FindLocalFile(mapsFolder);
-                if (existing != null)
-                {
-                    log(Path.GetFileName(existing) + " already installed, skipping.");
-                    return;
-                }
 
                 log("Checking for the latest Better Pangaea map...");
                 GhContentsEntry latest = FindLatestUpstream();
@@ -71,20 +63,44 @@ namespace KekModInstaller
                     return;
                 }
 
-                log("Installing " + latest.Name + "...");
-                using (var client = new HttpClient())
+                if (File.Exists(Path.Combine(mapsFolder, latest.Name)))
                 {
-                    client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                    byte[] data = client.GetByteArrayAsync(latest.DownloadUrl).GetAwaiter().GetResult();
-                    Directory.CreateDirectory(mapsFolder);
-                    File.WriteAllBytes(Path.Combine(mapsFolder, latest.Name), data);
+                    log(latest.Name + " already installed.");
                 }
-                log(latest.Name + " installed.");
+                else
+                {
+                    log("Installing " + latest.Name + "...");
+                    using (var client = new HttpClient())
+                    {
+                        client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
+                        byte[] data = client.GetByteArrayAsync(latest.DownloadUrl).GetAwaiter().GetResult();
+                        Directory.CreateDirectory(mapsFolder);
+                        File.WriteAllBytes(Path.Combine(mapsFolder, latest.Name), data);
+                    }
+                    log(latest.Name + " installed.");
+                }
+
+                foreach (string old in FindLocalFiles(mapsFolder))
+                {
+                    if (!string.Equals(Path.GetFileName(old), latest.Name, StringComparison.OrdinalIgnoreCase))
+                    {
+                        log("Removing old " + Path.GetFileName(old) + "...");
+                        File.Delete(old);
+                    }
+                }
             }
             catch (Exception ex)
             {
                 log("Better Pangaea: couldn't install (" + ex.Message + ")");
             }
+        }
+
+        // Latest upstream version, e.g. "V5.4" -- same form as
+        // DetectInstalled's VersionLabel. Null if none found.
+        public static string FetchLatestVersion()
+        {
+            GhContentsEntry latest = FindLatestUpstream();
+            return latest == null ? null : "V" + NamePattern.Match(latest.Name).Groups[1].Value;
         }
 
         // Removes whichever Better_Pangaea_V*.lua is present in Assets/Maps.
@@ -94,8 +110,7 @@ namespace KekModInstaller
         {
             try
             {
-                string existing = FindLocalFile(MapsFolder(dlcRoot));
-                if (existing != null)
+                foreach (string existing in FindLocalFiles(MapsFolder(dlcRoot)))
                 {
                     log("Removing " + Path.GetFileName(existing) + "...");
                     File.Delete(existing);
@@ -132,11 +147,16 @@ namespace KekModInstaller
         // Remove/DetectInstalled.
         private static string FindLocalFile(string mapsFolder)
         {
+            return FindLocalFiles(mapsFolder).FirstOrDefault();
+        }
+
+        private static string[] FindLocalFiles(string mapsFolder)
+        {
             if (!Directory.Exists(mapsFolder))
             {
-                return null;
+                return new string[0];
             }
-            return Directory.GetFiles(mapsFolder, "Better_Pangaea_V*.lua").FirstOrDefault();
+            return Directory.GetFiles(mapsFolder, "Better_Pangaea_V*.lua");
         }
 
         // Lists the repo's Maps/ directory via the GitHub Contents API and

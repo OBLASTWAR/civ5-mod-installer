@@ -117,6 +117,25 @@ namespace KekModInstaller
         public Action<string, Action<string>> EnsureExtraInstalled; // (dlcRoot, log)
         public Action<string, Action<string>> RemoveExtra;          // (dlcRoot, log)
         public Func<string, DetectedModInstall> DetectExtraInstalled; // (dlcRoot) -> entry or null
+        // Network: the extra's newest upstream version, in the same form as
+        // DetectExtraInstalled's VersionLabel (compare with MapVersion.Same).
+        // Fetched once at startup, only for extras that are installed, to
+        // flag an out-of-date one; EnsureExtraInstalled is what updates it.
+        public Func<string> FetchLatestExtraVersion;
+    }
+
+    // Bonus-map version labels come from file/folder names and tags with
+    // inconsistent "v"/"V" prefixes ("v1.0", "V5.4", "v11.0.16").
+    internal static class MapVersion
+    {
+        public static bool Same(string a, string b)
+        {
+            if (a == null || b == null)
+            {
+                return false;
+            }
+            return string.Equals(a.TrimStart('v', 'V'), b.TrimStart('v', 'V'), StringComparison.OrdinalIgnoreCase);
+        }
     }
 
     internal static class ModRegistry
@@ -138,6 +157,7 @@ namespace KekModInstaller
             EnsureExtraInstalled = MapScriptExtra.EnsureInstalled,
             RemoveExtra = MapScriptExtra.Remove,
             DetectExtraInstalled = MapScriptExtra.DetectInstalled,
+            FetchLatestExtraVersion = MapScriptExtra.FetchLatestVersion,
         };
 
         // Immo's Patch / "Tournament Mod". catscatsforever/Civ5-Patch is the
@@ -171,6 +191,7 @@ namespace KekModInstaller
             EnsureExtraInstalled = TournamentMapExtra.EnsureInstalled,
             RemoveExtra = TournamentMapExtra.Remove,
             DetectExtraInstalled = TournamentMapExtra.DetectInstalled,
+            FetchLatestExtraVersion = TournamentMapExtra.FetchLatestVersion,
         };
 
         // Lekmod. No published GitHub Releases at all -- distributed as a
@@ -204,9 +225,37 @@ namespace KekModInstaller
             EnsureExtraInstalled = LekmapExtra.EnsureInstalled,
             RemoveExtra = LekmapExtra.Remove,
             DetectExtraInstalled = LekmapExtra.DetectInstalled,
+            FetchLatestExtraVersion = LekmapExtra.FetchLatestVersion,
         };
 
-        public static readonly List<ModDefinition> All = new List<ModDefinition> { KekMod, TournamentMod, Lekmod };
+        // SnowVe (megawac1/snowve, "snowve" branch). GitLab Releases with no
+        // uploaded assets -- installed from each tag's source archive (see
+        // GitLabModSource), whose top-level folder "snowve-<tag>" is used
+        // as-is, so a hand-installed copy from the same archive is detected
+        // too. Ships no ui_check.bat. Same MPModsPack.Civ5Pkg GUID as
+        // kek-mod, so it conflicts like the rest. Its map script, Weevee
+        // Map, lives in a separate GitHub repo (see WeeveeMapExtra).
+        public static readonly ModDefinition SnowVe = new ModDefinition
+        {
+            Id = "snowve",
+            DisplayName = "SnowVe",
+            InstalledFolderGlob = "snowve-*",
+            Source = new GitLabModSource("megawac1", "snowve"),
+            MakeFolderName = tag => "snowve-" + tag, // tag "8.1.0" -> "snowve-8.1.0"
+            ZipTopLevelIsFinalFolderName = true,
+            ZipSourceDirPrefix = null,
+            PostExtractStep = null,
+            RunsUiCheck = false,
+            Beta = BetaPolicy.None,
+            ExtraDisplayName = WeeveeMapExtra.DisplayName,
+            ExtraModId = "weeveemap",
+            EnsureExtraInstalled = WeeveeMapExtra.EnsureInstalled,
+            RemoveExtra = WeeveeMapExtra.Remove,
+            DetectExtraInstalled = WeeveeMapExtra.DetectInstalled,
+            FetchLatestExtraVersion = WeeveeMapExtra.FetchLatestVersion,
+        };
+
+        public static readonly List<ModDefinition> All = new List<ModDefinition> { KekMod, TournamentMod, Lekmod, SnowVe };
 
         public static ModDefinition ById(string id)
         {

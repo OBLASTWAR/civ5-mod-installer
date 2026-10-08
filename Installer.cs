@@ -125,7 +125,7 @@ namespace KekModInstaller
         // TryFetchLatestInstallerVersion below. Unrelated to the mod's own
         // version (release tags like "v1.5-beta8") -- this is the installer
         // program's own version.
-        private const string InstallerVersion = "2.1";
+        private const string InstallerVersion = "2.2";
 
         public static string GetInstallerVersion()
         {
@@ -321,6 +321,11 @@ namespace KekModInstaller
             public Label NameLabel;
             public Label ExtraIndicator; // null if this mod has no bonus component
             public Label ExtraNameLabel; // null if this mod has no bonus component
+            // On the bonus component's own row: INSTALL when the mod is
+            // installed but its map isn't, UPDATE when the startup check
+            // found a newer map. Hidden otherwise. Runs only the map step
+            // (EnsureExtraInstalled), never a whole mod reinstall.
+            public RetroButton ExtraButton; // null if this mod has no bonus component
             public RetroButton InstallButton;
             public RetroButton UninstallButton;
             public RetroButton VersionButton;
@@ -346,6 +351,13 @@ namespace KekModInstaller
         // right now (see IsUpdateAvailable) -- turns that mod's INSTALL
         // button into an UPDATE button, see UpdateModRowStyles.
         private readonly HashSet<string> _updateAvailableModIds = new HashSet<string>();
+        // Newest upstream version of each installed bonus component, keyed
+        // by ExtraModId -- fetched once at startup (StatusWorker_DoWork),
+        // same as the mod release lists.
+        private Dictionary<string, string> _latestExtraVersionByExtraId = new Dictionary<string, string>();
+        // ExtraModIds whose installed version differs from that.
+        private readonly HashSet<string> _extraUpdateAvailableIds = new HashSet<string>();
+        private BackgroundWorker _mapWorker;
 
         // EUI section: same per-box-buttons treatment as the mod boxes --
         // each EuiVariant gets its own box with INSTALL/REMOVE buttons (no
@@ -842,6 +854,12 @@ namespace KekModInstaller
             _lobbyWorker.ProgressChanged += Worker_ProgressChanged;
             _lobbyWorker.RunWorkerCompleted += LobbyWorker_RunWorkerCompleted;
 
+            _mapWorker = new BackgroundWorker();
+            _mapWorker.WorkerReportsProgress = true;
+            _mapWorker.DoWork += MapWorker_DoWork;
+            _mapWorker.ProgressChanged += Worker_ProgressChanged;
+            _mapWorker.RunWorkerCompleted += EuiWorker_RunWorkerCompleted;
+
             _resetWorker = new BackgroundWorker();
             _resetWorker.WorkerReportsProgress = true;
             _resetWorker.DoWork += ResetWorker_DoWork;
@@ -952,13 +970,23 @@ namespace KekModInstaller
                 row.ExtraIndicator = extraIndicator;
 
                 var extraLabel = new Label();
-                extraLabel.SetBounds(34, 18 + ModRowHeight, width - 34 - 12, 20);
+                int extraBtnX = btnsX + (btnW + btnGap) * 2; // rightmost column, same as the Linux TUI
+                extraLabel.SetBounds(34, 18 + ModRowHeight, extraBtnX - 4 - 34, 20);
                 extraLabel.Text = mod.ExtraDisplayName;
                 extraLabel.Font = new Font("Consolas", 8.5F);
                 extraLabel.ForeColor = ThemeGreen;
                 extraLabel.BackColor = Color.Black;
                 box.Controls.Add(extraLabel);
                 row.ExtraNameLabel = extraLabel;
+
+                var extraBtn = new RetroButton();
+                extraBtn.Text = "UPDATE";
+                extraBtn.Font = new Font("Consolas", 7F, FontStyle.Bold);
+                extraBtn.SetBounds(extraBtnX, 16 + ModRowHeight, btnW, btnH);
+                extraBtn.Visible = false; // see UpdateModRowStyles
+                extraBtn.Click += (s, e) => OnMapUpdateClick(mod);
+                box.Controls.Add(extraBtn);
+                row.ExtraButton = extraBtn;
             }
 
             _modRows.Add(row);
@@ -1352,6 +1380,28 @@ namespace KekModInstaller
                         && _installedExtraVersionByModId.TryGetValue(mod.ExtraModId, out extraVersion))
                         ? mod.ExtraDisplayName + " (" + extraVersion + ")"
                         : mod.ExtraDisplayName;
+
+                    bool extraUpdate = extraInstalled && _extraUpdateAvailableIds.Contains(mod.ExtraModId);
+                    string latestExtra;
+                    if (extraUpdate && _latestExtraVersionByExtraId.TryGetValue(mod.ExtraModId, out latestExtra))
+                    {
+                        row.ExtraNameLabel.Text += " \u2192 " + latestExtra; // →
+                    }
+                    if (extraUpdate)
+                    {
+                        row.ExtraNameLabel.ForeColor = ThemeRed;
+                    }
+
+                    // Only offered while the mod itself is installed: the map
+                    // belongs to it, and the mod's own INSTALL brings it along.
+                    row.ExtraButton.Visible = installed && (!extraInstalled || extraUpdate);
+                    row.ExtraButton.Text = extraUpdate ? "UPDATE" : "INSTALL";
+                    row.ExtraButton.BorderColor = extraUpdate ? ThemeRed : ThemeGreen;
+                    row.ExtraButton.ForeColor = extraUpdate ? ThemeRed : ThemeGreen;
+                    if (!_actionInProgress)
+                    {
+                        row.ExtraButton.Enabled = true;
+                    }
                 }
 
                 row.Box.Invalidate(); // re-runs the box's borderColor delegate against the (possibly new) install state
@@ -1546,7 +1596,38 @@ namespace KekModInstaller
             {
             }
 
-            e.Result = new object[] { releasesByModId, tickerText, latestInstallerVersion, lobbyLatestTag };
+            // Bonus maps: only the installed ones, to keep the startup
+            // GitHub API calls down (rate limit, see GitHubModSource).
+            var latestExtraVersions = new Dictionary<string, string>();
+            string dlcRoot = InstallerCore.TryGetDlcFolder();
+            if (dlcRoot != null)
+            {
+                foreach (ModDefinition mod in ModRegistry.All)
+                {
+                    if (mod.FetchLatestExtraVersion == null || mod.DetectExtraInstalled == null)
+                    {
+                        continue;
+                    }
+                    try
+                    {
+                        if (mod.DetectExtraInstalled(dlcRoot) == null)
+                        {
+                            continue;
+                        }
+                        string latest = mod.FetchLatestExtraVersion();
+                        if (latest != null)
+                        {
+                            latestExtraVersions[mod.ExtraModId] = latest;
+                        }
+                    }
+                    catch (Exception)
+                    {
+                        // offline/rate-limited -- no update marker for this map
+                    }
+                }
+            }
+
+            e.Result = new object[] { releasesByModId, tickerText, latestInstallerVersion, lobbyLatestTag, latestExtraVersions };
         }
 
         private void StatusWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
@@ -1578,6 +1659,7 @@ namespace KekModInstaller
             }
 
             _lobbyLatestTag = (string)result[3];
+            _latestExtraVersionByExtraId = (Dictionary<string, string>)result[4];
 
             RefreshLocalState();
         }
@@ -1634,6 +1716,17 @@ namespace KekModInstaller
                         // entry -- ExtraModId on whichever mod owns it
                         // matches d.ModId, see UpdateModRowStyles.
                         _installedExtraVersionByModId[d.ModId] = d.VersionLabel;
+                    }
+                }
+
+                _extraUpdateAvailableIds.Clear();
+                foreach (KeyValuePair<string, string> kv in _latestExtraVersionByExtraId)
+                {
+                    string installedExtraVersion;
+                    if (_installedExtraVersionByModId.TryGetValue(kv.Key, out installedExtraVersion)
+                        && !MapVersion.Same(installedExtraVersion, kv.Value))
+                    {
+                        _extraUpdateAvailableIds.Add(kv.Key);
                     }
                 }
 
@@ -1784,7 +1877,7 @@ namespace KekModInstaller
 
             MessageBox.Show(
                 this,
-                string.Join("\n", missing) + ".\n\nReinstall to add it.",
+                string.Join("\n", missing) + ".\n\nUse the INSTALL button on its map row to add it.",
                 "Missing bonus map",
                 MessageBoxButtons.OK,
                 MessageBoxIcon.Warning);
@@ -1842,6 +1935,9 @@ namespace KekModInstaller
                 .Where(m => _updateAvailableModIds.Contains(m.Id))
                 .Select(m => m.DisplayName)
                 .ToList();
+            updates.AddRange(ModRegistry.All
+                .Where(m => m.ExtraModId != null && _extraUpdateAvailableIds.Contains(m.ExtraModId))
+                .Select(m => m.ExtraDisplayName));
             if (IsLobbyPatchUpdateAvailable())
             {
                 updates.Add(LobbyPatch.DisplayName);
@@ -2082,6 +2178,60 @@ namespace KekModInstaller
             _progress.Value = 0;
             SetStatus((install ? "INSTALLING " : "REMOVING ") + LobbyPatch.DisplayName.ToUpperInvariant() + "...");
             _lobbyWorker.RunWorkerAsync(install);
+        }
+
+        // A mod's bonus-map row button: installs the missing map, or
+        // updates an out-of-date one, without touching the mod itself.
+        private void OnMapUpdateClick(ModDefinition mod)
+        {
+            if (_actionInProgress)
+            {
+                return;
+            }
+            if (InstallerCore.IsCiv5Running())
+            {
+                MessageBox.Show(
+                    this,
+                    "Civilization V is currently running. Close the game first, then try again.",
+                    mod.ExtraDisplayName,
+                    MessageBoxButtons.OK,
+                    MessageBoxIcon.Information);
+                return;
+            }
+            _txtLog.Clear();
+            SetControlsEnabled(false);
+            _progress.Value = 0;
+            SetStatus("UPDATING " + mod.ExtraDisplayName.ToUpperInvariant() + "...");
+            string latest;
+            _latestExtraVersionByExtraId.TryGetValue(mod.ExtraModId, out latest);
+            _mapWorker.RunWorkerAsync(new object[] { mod, latest });
+        }
+
+        private void MapWorker_DoWork(object sender, DoWorkEventArgs e)
+        {
+            var args = (object[])e.Argument;
+            var mod = (ModDefinition)args[0];
+            var latest = (string)args[1]; // null if the startup check didn't get it
+            var worker = (BackgroundWorker)sender;
+            Action<string> log = msg => worker.ReportProgress(0, msg);
+
+            string dlcRoot = InstallerCore.TryGetDlcFolder();
+            if (dlcRoot == null)
+            {
+                throw new InvalidOperationException("Couldn't locate the Civilization V DLC folder.");
+            }
+            // Best-effort by design (a map never fails a mod install), so it
+            // only logs failures -- check the result to report this click's.
+            mod.EnsureExtraInstalled(dlcRoot, log);
+            DetectedModInstall now = mod.DetectExtraInstalled(dlcRoot);
+            if (now == null)
+            {
+                throw new InvalidOperationException(mod.ExtraDisplayName + " wasn't installed -- see the log.");
+            }
+            if (latest != null && now.VersionLabel != null && !MapVersion.Same(now.VersionLabel, latest))
+            {
+                throw new InvalidOperationException(mod.ExtraDisplayName + " wasn't updated -- see the log.");
+            }
         }
 
         private void StartInstall(ModDefinition mod, InstallOptions options)
@@ -2607,6 +2757,10 @@ namespace KekModInstaller
                     row.InstallButton.Enabled = false;
                     row.UninstallButton.Enabled = false;
                     row.VersionButton.Enabled = false;
+                    if (row.ExtraButton != null)
+                    {
+                        row.ExtraButton.Enabled = false;
+                    }
                 }
                 foreach (EuiRowControls row in _euiRows)
                 {
