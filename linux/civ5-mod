@@ -72,7 +72,7 @@ import zipfile
 # Kept in step with the Windows build (InstallerCore.InstallerVersion in
 # installer/Installer.cs and installer/installer_version.txt): when one
 # bumps, bump this too.
-VERSION = "2.2"
+VERSION = "2.3"
 
 REPO_OWNER = "OBLASTWAR"
 REPO_NAME = "kek-mod"
@@ -773,8 +773,26 @@ class LekmapExtra:
     name = "Lekmap"
     folder = "Lekmap"
 
-    def _dir(self, game):
-        return ci_resolve(os.path.join(game.maps, self.folder))
+    # Installed as Maps/"Lekmap v6.3" etc., exactly like the Lekmap zip's own
+    # folder (LekmapExtra.cs): Civ identifies the lobby's map by full path, so
+    # any other folder name shows red, the custom map options never arrive and
+    # map generation fails at game start. Plain "Lekmap" (older builds, or
+    # version unknown) is still recognized.
+    @staticmethod
+    def is_folder_name(name):
+        low = name.lower()
+        return low == "lekmap" or low.startswith("lekmap v")
+
+    def _folder_for(self, version):
+        return self.folder + " " + version if version else self.folder
+
+    def _dirs(self, game):
+        try:
+            names = sorted(os.listdir(game.maps))
+        except OSError:
+            return []
+        return [os.path.join(game.maps, n) for n in names
+                if self.is_folder_name(n) and os.path.isdir(os.path.join(game.maps, n))]
 
     @staticmethod
     def _version_from(names):
@@ -789,48 +807,90 @@ class LekmapExtra:
         return [e for e in github_api("repos/EnormousApplePie/Lekmod/contents/Lekmap")
                 if e.get("download_url") and e.get("type", "file") == "file"]
 
+    def _installed_version(self, d):
+        return self._version_from(os.listdir(d))
+
     def detect(self, game):
-        d = self._dir(game)
-        if not os.path.isdir(d):
+        dirs = self._dirs(game)
+        if not dirs:
             return None
-        return self._version_from(os.listdir(d)) or ""
+        ver = self._installed_version(dirs[0])
+        if not ver:
+            return ""
+        # Older builds' installs (plain "Lekmap" folder, LF endings) never
+        # match upstream, so the map row offers an update that repairs them.
+        if len(dirs) > 1 or os.path.basename(dirs[0]) != self._folder_for(ver) \
+                or not self._is_crlf(dirs[0]):
+            return ver + " (needs repair)"
+        return ver
 
     def latest(self):
         return self._version_from(e["name"] for e in self._listing())
 
-    def ensure(self, game, log):
-        """Upstream Lekmap/, replacing an existing copy unless it's that version."""
+    # The repo stores Lekmap with LF endings but the Lekmap zip everyone else
+    # installs has CRLF, and Civ compares map script bytes in the MP lobby --
+    # an LF copy shows red against a zip-installed host. LF -> CRLF reproduces
+    # the zip byte-for-byte (verified against "Lekmap v6.3.zip").
+    @staticmethod
+    def _to_crlf(path):
+        with open(path, "rb") as f:
+            data = f.read()
+        with open(path, "wb") as f:
+            f.write(re.sub(rb"(?<!\r)\n", b"\r\n", data))
+
+    @staticmethod
+    def _is_crlf(d):
+        """False for an install from an older build that kept LF endings."""
         try:
-            target = self._dir(game)
+            flagship = next((f for f in os.listdir(d)
+                             if re.match(r"^LekmapPangaeaFractalv.+\.lua$", f, re.I)), None)
+            if flagship is None:
+                return True
+            with open(os.path.join(d, flagship), "rb") as f:
+                data = f.read()
+            i = data.find(b"\n")
+            return i < 0 or (i > 0 and data[i - 1:i] == b"\r")
+        except OSError:
+            return True
+
+    def ensure(self, game, log):
+        """Upstream Lekmap/ as Maps/"Lekmap <version>", replacing any existing
+        Lekmap folder unless it's already exactly that."""
+        try:
             log("Checking for Lekmap...")
             files = self._listing()
             if not files:
                 log("Lekmap: no files found upstream, skipping.")
                 return
             ver = self._version_from(e["name"] for e in files)
-            if os.path.isdir(target) and (ver is None or same_map_version(self.detect(game), ver)):
-                log("Lekmap%s already installed." % (" " + ver if ver else ""))
+            folder = self._folder_for(ver)
+            existing = self._dirs(game)
+            if len(existing) == 1 and os.path.basename(existing[0]) == folder \
+                    and (ver is None or same_map_version(self._installed_version(existing[0]), ver)) \
+                    and self._is_crlf(existing[0]):
+                log("%s already installed." % folder)
                 return
-            log("Installing Lekmap%s (%d files)..." % (" " + ver if ver else "", len(files)))
+            log("Installing %s (%d files)..." % (folder, len(files)))
             os.makedirs(game.maps, exist_ok=True)
             tmp = tempfile.mkdtemp(prefix=".kekmod-", dir=game.maps)
             try:
                 for e in files:
-                    download_to(e["download_url"], os.path.join(tmp, os.path.basename(e["name"])))
-                if os.path.isdir(target):
-                    remove_tree(target)  # older version
-                os.rename(tmp, os.path.join(game.maps, self.folder))
+                    path = os.path.join(tmp, os.path.basename(e["name"]))
+                    download_to(e["download_url"], path)
+                    self._to_crlf(path)
+                for d in existing:
+                    remove_tree(d)  # older version or folder name
+                os.rename(tmp, os.path.join(game.maps, folder))
             finally:
                 shutil.rmtree(tmp, ignore_errors=True)
-            log("Lekmap installed.")
+            log("%s installed." % folder)
         except Exception as e:
             log("Lekmap: couldn't install (%s)" % e)
 
     def remove(self, game, log):
         try:
-            d = self._dir(game)
-            if os.path.isdir(d):
-                log("Removing Lekmap...")
+            for d in self._dirs(game):
+                log("Removing %s..." % os.path.basename(d))
                 remove_tree(d)
         except Exception as e:
             log("Lekmap: couldn't remove (%s)" % e)
@@ -1809,7 +1869,7 @@ def scan_extra_folders(game):
     if os.path.isdir(game.maps):
         for name in sorted(os.listdir(game.maps)):
             p = os.path.join(game.maps, name)
-            if os.path.isdir(p) and name.lower() not in ("fish map script", "lekmap") \
+            if os.path.isdir(p) and name.lower() != "fish map script" and not LekmapExtra.is_folder_name(name) \
                     and not re.match(r"^Weevee-v.*-Map", name, re.I):
                 found.append(ExtraFolder(p, "Maps"))
     return found

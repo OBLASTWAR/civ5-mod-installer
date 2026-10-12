@@ -44,14 +44,44 @@ namespace KekModInstaller
         private const string RepoOwner = "EnormousApplePie";
         private const string RepoName = "Lekmod";
         private const string DirPath = "Lekmap";
-        // Internal, not private: ExtraModScan reads this directly so its
-        // "is this an extra/unrecognized folder" check never drifts out of
-        // sync with the one place this name is actually defined.
-        internal const string FolderName = "Lekmap";
+        private const string FolderName = "Lekmap";
+
+        // Installed as Assets/Maps/"Lekmap v6.3" etc., exactly like the
+        // Lekmap zip's own folder. Civ identifies the lobby's map by its full
+        // path (Assets\Maps\Lekmap v6.3\LekmapPangaeaFractalv6.3.lua), so a
+        // copy under any other folder name shows up red, its custom map
+        // options never arrive (Map.GetCustomOption returns nil) and map
+        // generation fails at game start. Plain "Lekmap" is only used when
+        // the version can't be read, and is still recognized because older
+        // installer builds wrote it.
+        private static string FolderFor(string version)
+        {
+            return version == null ? FolderName : FolderName + " " + version;
+        }
+
+        // Internal, not private: ExtraModScan uses this so its "is this an
+        // extra/unrecognized folder" check never drifts out of sync with the
+        // names this installer actually writes.
+        internal static bool IsLekmapFolderName(string name)
+        {
+            return string.Equals(name, FolderName, StringComparison.OrdinalIgnoreCase)
+                || (name ?? "").StartsWith(FolderName + " v", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static List<string> InstalledDirs(string mapsFolder)
+        {
+            if (!Directory.Exists(mapsFolder))
+            {
+                return new List<string>();
+            }
+            return Directory.GetDirectories(mapsFolder)
+                .Where(dir => IsLekmapFolderName(Path.GetFileName(dir)))
+                .ToList();
+        }
 
         // Downloads every file in the repo's Lekmap/ directory into
-        // Assets/Maps/Lekmap, replacing an existing copy unless it's already
-        // the upstream version. Deliberately swallows every failure
+        // Assets/Maps/"Lekmap <version>", replacing any existing Lekmap
+        // folder unless it's already exactly that. Deliberately swallows every failure
         // (offline, directory listing empty/changed, write hiccup): this is
         // a bonus, not part of Lekmod itself, so it should never fail the
         // main install.
@@ -60,7 +90,6 @@ namespace KekModInstaller
             try
             {
                 string mapsFolder = MapsFolder(dlcRoot);
-                string targetDir = Path.Combine(mapsFolder, FolderName);
 
                 log("Checking for Lekmap...");
                 List<GhContentsEntry> files = FetchDirectoryListing()
@@ -72,8 +101,12 @@ namespace KekModInstaller
                     return;
                 }
                 string upstreamVersion = VersionFromNames(files.Select(en => en.Name));
-                if (Directory.Exists(targetDir)
-                    && (upstreamVersion == null || MapVersion.Same(DetectVersion(targetDir), upstreamVersion)))
+                string targetDir = Path.Combine(mapsFolder, FolderFor(upstreamVersion));
+                List<string> existing = InstalledDirs(mapsFolder);
+                if (existing.Count == 1
+                    && Path.GetFileName(existing[0]) == Path.GetFileName(targetDir)
+                    && (upstreamVersion == null || MapVersion.Same(DetectVersion(targetDir), upstreamVersion))
+                    && HasCrlfLineEndings(targetDir))
                 {
                     log(FolderName + (upstreamVersion == null ? "" : " " + upstreamVersion) + " already installed.");
                     return;
@@ -91,12 +124,12 @@ namespace KekModInstaller
                         foreach (GhContentsEntry entry in files)
                         {
                             byte[] data = client.GetByteArrayAsync(entry.DownloadUrl).GetAwaiter().GetResult();
-                            File.WriteAllBytes(Path.Combine(tempDir, entry.Name), data);
+                            File.WriteAllBytes(Path.Combine(tempDir, entry.Name), ToCrlf(data));
                         }
                     }
-                    if (Directory.Exists(targetDir))
+                    foreach (string dir in existing)
                     {
-                        Directory.Delete(targetDir, true); // older version
+                        Directory.Delete(dir, true); // older version or folder name
                     }
                     Directory.Move(tempDir, targetDir);
                 }
@@ -104,7 +137,7 @@ namespace KekModInstaller
                 {
                     try { if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true); } catch (Exception) { }
                 }
-                log(FolderName + " installed.");
+                log(Path.GetFileName(targetDir) + " installed.");
             }
             catch (Exception ex)
             {
@@ -119,23 +152,64 @@ namespace KekModInstaller
             return VersionFromNames(FetchDirectoryListing().Select(en => en.Name));
         }
 
-        // Removes the Lekmap folder from Assets/Maps if present. Never
+        // Removes every Lekmap folder from Assets/Maps. Never
         // throws -- a missing folder or locked file shouldn't fail the
         // overall uninstall.
         public static void Remove(string dlcRoot, Action<string> log)
         {
             try
             {
-                string targetDir = Path.Combine(MapsFolder(dlcRoot), FolderName);
-                if (Directory.Exists(targetDir))
+                foreach (string dir in InstalledDirs(MapsFolder(dlcRoot)))
                 {
-                    log("Removing " + FolderName + "...");
-                    Directory.Delete(targetDir, true);
+                    log("Removing " + Path.GetFileName(dir) + "...");
+                    Directory.Delete(dir, true);
                 }
             }
             catch (Exception ex)
             {
                 log(FolderName + ": couldn't remove (" + ex.Message + ")");
+            }
+        }
+
+        // The repo stores Lekmap with LF line endings, but the Lekmap zip
+        // everyone else installs has CRLF. Civ compares map script bytes in
+        // the MP lobby, so an LF copy shows up red against a host with the
+        // zip version even when the content is identical. Converting every
+        // bare LF to CRLF reproduces the zip byte-for-byte (verified against
+        // "Lekmap v6.3.zip": all 22 files match).
+        private static byte[] ToCrlf(byte[] data)
+        {
+            var output = new List<byte>(data.Length + data.Length / 20);
+            for (int i = 0; i < data.Length; i++)
+            {
+                if (data[i] == (byte)'\n' && (i == 0 || data[i - 1] != (byte)'\r'))
+                {
+                    output.Add((byte)'\r');
+                }
+                output.Add(data[i]);
+            }
+            return output.ToArray();
+        }
+
+        // False for an install written by an older installer build that
+        // kept the repo's LF endings (see ToCrlf) -- reinstalls it so the
+        // file finally matches what other players have.
+        private static bool HasCrlfLineEndings(string targetDir)
+        {
+            try
+            {
+                string flagship = Directory.GetFiles(targetDir, "LekmapPangaeaFractalv*.lua").FirstOrDefault();
+                if (flagship == null)
+                {
+                    return true; // nothing to judge by; leave it alone
+                }
+                byte[] data = File.ReadAllBytes(flagship);
+                int lf = Array.IndexOf(data, (byte)'\n');
+                return lf < 0 || (lf > 0 && data[lf - 1] == (byte)'\r');
+            }
+            catch (Exception)
+            {
+                return true;
             }
         }
 
@@ -145,16 +219,25 @@ namespace KekModInstaller
         // same treatment as Fish Map Script/Better Pangaea.
         public static DetectedModInstall DetectInstalled(string dlcRoot)
         {
-            string targetDir = Path.Combine(MapsFolder(dlcRoot), FolderName);
-            if (!Directory.Exists(targetDir))
+            List<string> dirs = InstalledDirs(MapsFolder(dlcRoot));
+            if (dirs.Count == 0)
             {
                 return null;
             }
             var d = new DetectedModInstall();
             d.ModId = "lekmap";
             d.DisplayName = FolderName;
-            d.FolderNames = new List<string> { FolderName };
-            d.VersionLabel = DetectVersion(targetDir);
+            d.FolderNames = dirs.Select(Path.GetFileName).ToList();
+            d.VersionLabel = DetectVersion(dirs[0]);
+            // An install from an older build (plain "Lekmap" folder, LF
+            // endings) is unusable in MP lobbies even at the latest version;
+            // a label that never matches upstream puts the UPDATE button on
+            // the map row so one click reinstalls it properly.
+            if (d.VersionLabel != null
+                && (dirs.Count > 1 || Path.GetFileName(dirs[0]) != FolderFor(d.VersionLabel) || !HasCrlfLineEndings(dirs[0])))
+            {
+                d.VersionLabel += " (needs repair)";
+            }
             return d;
         }
 

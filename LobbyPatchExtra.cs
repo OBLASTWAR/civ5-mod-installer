@@ -34,6 +34,8 @@ namespace KekModInstaller
     internal static class LobbyPatch
     {
         public const string DisplayName = "Lobby Patch";
+        public const string Description = "Allows you to see public lobbies regardless of geography.";
+        public const string ReadmeUrl = "https://github.com/OBLASTWAR/civ5-lobby-patch#readme";
         private const string Owner = "OBLASTWAR";
         private const string Repo = "civ5-lobby-patch";
         private const string AssetName = "steam_api.dll";

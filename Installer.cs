@@ -125,7 +125,7 @@ namespace KekModInstaller
         // TryFetchLatestInstallerVersion below. Unrelated to the mod's own
         // version (release tags like "v1.5-beta8") -- this is the installer
         // program's own version.
-        private const string InstallerVersion = "2.2";
+        private const string InstallerVersion = "2.3";
 
         public static string GetInstallerVersion()
         {
@@ -1096,9 +1096,13 @@ namespace KekModInstaller
             _lobbyNameLabel = new Label();
             _lobbyNameLabel.SetBounds(34, 18, btnsX - 8 - 34, 20);
             _lobbyNameLabel.Text = LobbyPatch.DisplayName;
-            _lobbyNameLabel.Font = new Font("Consolas", 9F, FontStyle.Bold);
+            _lobbyNameLabel.Font = new Font("Consolas", 9F, FontStyle.Bold | FontStyle.Underline);
             _lobbyNameLabel.ForeColor = ThemeGreen;
             _lobbyNameLabel.BackColor = Color.Black;
+            _lobbyNameLabel.AutoSize = true; // so only the text is clickable, not the gap up to the buttons
+            // The name is a link to the patch's README, which says what it does.
+            _lobbyNameLabel.Click += (s, e) => OpenUrl(LobbyPatch.ReadmeUrl);
+            _tooltip.SetToolTip(_lobbyNameLabel, LobbyPatch.Description + " Click for details.");
             box.Controls.Add(_lobbyNameLabel);
 
             return box;
@@ -2283,6 +2287,20 @@ namespace KekModInstaller
             // doesn't change what releases exist upstream, so no need to
             // re-fetch the VERSION dropdown's data.
             RefreshLocalState();
+        }
+
+        // Opens a web page in the default browser. Under Proton/Wine that's
+        // winebrowser, which hands it to the Linux desktop's browser.
+        private void OpenUrl(string url)
+        {
+            try
+            {
+                Process.Start(url);
+            }
+            catch (Exception ex)
+            {
+                _txtLog.AppendText("Couldn't open a browser (" + ex.Message + "). Link: " + url + Environment.NewLine);
+            }
         }
 
         private void BtnOpenFolder_Click(object sender, EventArgs e)
