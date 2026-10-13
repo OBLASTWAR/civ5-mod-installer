@@ -92,10 +92,9 @@ ARGS=(-nologo -noconfig -nostdlib -target:winexe -platform:x64
       -r:System.IO.Compression.FileSystem.dll -r:Microsoft.CSharp.dll
       -r:System.Windows.Forms.dll -r:System.Drawing.dll)
 
-# beat.mp3 and the two EUI zips are gitignored -- embed whichever this
-# machine has, exactly like build.bat. Note the Linux civ5-mod reads the
-# bundled EUI straight out of the installer exe, so publishing a build
-# without the zips breaks EUI installs there too.
+# beat.mp3 is gitignored -- embed it if this machine has it, exactly like
+# build.bat. EUI isn't embedded: both installers download it from the fork
+# releases at install time.
 add_resource() {
     if [[ -f "$HERE/$1" ]]; then
         ARGS+=("-resource:Z:$HERE/$1,KekModInstaller.$1")
@@ -104,8 +103,6 @@ add_resource() {
     fi
 }
 add_resource beat.mp3 "embedded music"
-add_resource UI_bc1.zip "bundled EUI"
-add_resource UI_bc1_xits.zip "bundled EUI XITS"
 
 SOURCES=()
 for f in "$HERE"/*.cs; do SOURCES+=("Z:$f"); done

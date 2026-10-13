@@ -361,8 +361,8 @@ namespace KekModInstaller
 
         // EUI section: same per-box-buttons treatment as the mod boxes --
         // each EuiVariant gets its own box with INSTALL/REMOVE buttons (no
-        // VERSION button: this is a single bundled copy we ship ourselves,
-        // not something with published releases to choose between).
+        // VERSION button: install always takes the fork's latest release,
+        // see EuiExtra).
         private class EuiRowControls
         {
             public Panel Box;
@@ -373,12 +373,13 @@ namespace KekModInstaller
         }
         private readonly List<EuiRowControls> _euiRows = new List<EuiRowControls>();
         private string _installedEuiVariantId; // null if no EUI installed
-        // True if _installedEuiVariantId is set but EuiExtra.IsExactBundledMatch
-        // says what's actually on disk isn't byte-identical to what this
-        // build bundles for that variant -- e.g. the player manually
-        // installed a newer/older/modified EUI themselves. Every mod we ship
-        // is only tested against our exact bundled copy, so this matters.
-        private bool _installedEuiVersionMismatch;
+        // Release tag of the installed EUI (EuiExtra.InstalledTag), null if
+        // it wasn't installed by this installer -- upstream EUI or a hand-
+        // installed copy, which has the unit flag crash.
+        private string _installedEuiTag;
+        // Newest release tag of the installed variant's fork, null until/
+        // unless the status check fetched it.
+        private string _euiLatestTag;
         private BackgroundWorker _euiWorker;
 
         // NETWORK MODS section: the civ5-lobby-patch proxy steam_api.dll in
@@ -1004,7 +1005,7 @@ namespace KekModInstaller
                 () =>
                 {
                     if (variant.Id != _installedEuiVariantId) { return ThemeMagenta; }
-                    return _installedEuiVersionMismatch ? ThemeRed : ThemeGreen;
+                    return IsEuiUpdateAvailable() ? ThemeRed : ThemeGreen;
                 });
 
             var indicator = new Label();
@@ -1042,12 +1043,9 @@ namespace KekModInstaller
 
             var nameLabel = new Label();
             nameLabel.SetBounds(34, 18, btnsX - 8 - 34, 20);
-            // Hand-set version (see EuiVariant.DisplayVersion), not tied to
-            // install state the way mods' version display is -- this
-            // describes what's bundled, so it shows regardless of whether
-            // this particular variant is currently installed. UpdateEuiRowStyles
-            // appends a mismatch warning to this base text when applicable.
-            nameLabel.Text = EuiBaseLabel(variant);
+            // UpdateEuiRowStyles adds the installed release tag, or an
+            // update warning, once install-state detection has run.
+            nameLabel.Text = variant.DisplayName;
             nameLabel.Font = new Font("Consolas", 9F, FontStyle.Bold);
             nameLabel.ForeColor = ThemeGreen;
             nameLabel.BackColor = Color.Black;
@@ -1421,29 +1419,24 @@ namespace KekModInstaller
             {
                 EuiVariant variant = EuiExtra.Variants[i];
                 bool active = variant.Id == _installedEuiVariantId;
-                // Present but NOT byte-identical to what this build bundles
-                // (see EuiExtra.IsExactBundledMatch) -- e.g. the player
-                // manually installed a different EUI version. Every mod we
-                // ship is only tested against our exact bundled copy, so
-                // this gets its own warning treatment, not just "installed".
-                bool mismatch = active && _installedEuiVersionMismatch;
+                // Installed but not by this installer (no marker -- upstream
+                // EUI with the unit flag crash), or an older fork release.
+                bool update = active && IsEuiUpdateAvailable();
+                bool unknown = active && _installedEuiTag == null;
 
-                _euiRows[i].Indicator.Text = !active ? "○" : (mismatch ? "⚠" : "●");
-                _euiRows[i].Indicator.ForeColor = !active ? ThemeMagenta : (mismatch ? ThemeRed : ThemeGreen);
-                _euiRows[i].NameLabel.ForeColor = !active ? ThemeMagenta : (mismatch ? ThemeRed : ThemeGreen);
-                // Mismatch means the installed copy is NOT confirmed to be
-                // DisplayVersion -- showing that version number alongside
-                // "MISMATCH" would misleadingly imply we know what's on disk.
-                _euiRows[i].NameLabel.Text = mismatch
-                    ? variant.DisplayName + " -- VERSION MISMATCH"
-                    : EuiBaseLabel(variant);
+                _euiRows[i].Indicator.Text = !active ? "○" : (unknown ? "⚠" : "●");
+                _euiRows[i].Indicator.ForeColor = !active ? ThemeMagenta : (update ? ThemeRed : ThemeGreen);
+                _euiRows[i].NameLabel.ForeColor = !active ? ThemeMagenta : (update ? ThemeRed : ThemeGreen);
+                _euiRows[i].NameLabel.Text = !active ? variant.DisplayName
+                    : unknown ? variant.DisplayName + " -- OUTDATED, UPDATE"
+                    : variant.DisplayName + " (" + _installedEuiTag + ")";
 
                 // Relabeled rather than disabled once active -- re-running
                 // Install over an already-installed variant is always a
                 // valid (idempotent) action: it's how a mismatched copy gets
                 // fixed, and even a confirmed exact match can be force-
                 // reinstalled if a player suspects local corruption.
-                _euiRows[i].InstallButton.Text = active ? "REINSTALL" : "INSTALL";
+                _euiRows[i].InstallButton.Text = update ? "UPDATE" : (active ? "REINSTALL" : "INSTALL");
                 if (!_actionInProgress)
                 {
                     _euiRows[i].InstallButton.Enabled = true;
@@ -1454,8 +1447,8 @@ namespace KekModInstaller
                 // boxes -- see UpdateModRowStyles.
                 Color? euiBtnBorder = active ? ThemeGreen : (Color?)null;
                 Color euiBtnText = active ? ThemeGreen : ThemeMagenta;
-                _euiRows[i].InstallButton.BorderColor = euiBtnBorder;
-                _euiRows[i].InstallButton.ForeColor = euiBtnText;
+                _euiRows[i].InstallButton.BorderColor = update ? ThemeRed : euiBtnBorder;
+                _euiRows[i].InstallButton.ForeColor = update ? ThemeRed : euiBtnText;
                 _euiRows[i].RemoveButton.BorderColor = euiBtnBorder;
                 _euiRows[i].RemoveButton.ForeColor = euiBtnText;
 
@@ -1501,11 +1494,17 @@ namespace KekModInstaller
             _lobbyBox.Invalidate();
         }
 
-        private static string EuiBaseLabel(EuiVariant variant)
+        // Whether the installed EUI needs replacing: not installed by this
+        // installer at all (no marker -- upstream EUI has the unit flag
+        // crash), or the status check found a newer fork release.
+        private bool IsEuiUpdateAvailable()
         {
-            return variant.DisplayVersion != null
-                ? variant.DisplayName + " (" + variant.DisplayVersion + ")"
-                : variant.DisplayName;
+            if (_installedEuiVariantId == null)
+            {
+                return false;
+            }
+            return _installedEuiTag == null
+                || (_euiLatestTag != null && !string.Equals(_installedEuiTag, _euiLatestTag, StringComparison.OrdinalIgnoreCase));
         }
 
         private void BtnSettings_Click(object sender, EventArgs e)
@@ -1600,6 +1599,23 @@ namespace KekModInstaller
             {
             }
 
+            // Best-effort EUI update check, installed variant only (rate
+            // limit, see GitHubModSource); null leaves it to the marker check.
+            string euiLatestTag = null;
+            try
+            {
+                string euiDlcRoot = InstallerCore.TryGetDlcFolder();
+                EuiVariant installedEui = euiDlcRoot == null ? null
+                    : EuiExtra.ById(EuiExtra.DetectInstalledVariantId(euiDlcRoot));
+                if (installedEui != null)
+                {
+                    euiLatestTag = EuiExtra.FetchLatestTag(installedEui);
+                }
+            }
+            catch (Exception)
+            {
+            }
+
             // Bonus maps: only the installed ones, to keep the startup
             // GitHub API calls down (rate limit, see GitHubModSource).
             var latestExtraVersions = new Dictionary<string, string>();
@@ -1631,7 +1647,7 @@ namespace KekModInstaller
                 }
             }
 
-            e.Result = new object[] { releasesByModId, tickerText, latestInstallerVersion, lobbyLatestTag, latestExtraVersions };
+            e.Result = new object[] { releasesByModId, tickerText, latestInstallerVersion, lobbyLatestTag, latestExtraVersions, euiLatestTag };
         }
 
         private void StatusWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
@@ -1664,6 +1680,7 @@ namespace KekModInstaller
 
             _lobbyLatestTag = (string)result[3];
             _latestExtraVersionByExtraId = (Dictionary<string, string>)result[4];
+            _euiLatestTag = (string)result[5];
 
             RefreshLocalState();
         }
@@ -1736,12 +1753,8 @@ namespace KekModInstaller
 
                 string dlcRoot = InstallerCore.TryGetDlcFolder();
                 _installedEuiVariantId = dlcRoot == null ? null : EuiExtra.DetectInstalledVariantId(dlcRoot);
-                _installedEuiVersionMismatch = false;
-                if (dlcRoot != null && _installedEuiVariantId != null)
-                {
-                    EuiVariant installedVariant = EuiExtra.Variants.First(v => v.Id == _installedEuiVariantId);
-                    _installedEuiVersionMismatch = !EuiExtra.IsExactBundledMatch(dlcRoot, installedVariant);
-                }
+                _installedEuiTag = _installedEuiVariantId == null ? null
+                    : EuiExtra.InstalledTag(dlcRoot, EuiExtra.ById(_installedEuiVariantId));
 
                 string gameFolder = InstallerCore.TryGetCiv5GameFolder();
                 _lobbyState = gameFolder == null ? new LobbyPatchState() : LobbyPatch.Detect(gameFolder);
@@ -1928,11 +1941,18 @@ namespace KekModInstaller
             }
             else
             {
-                EuiVariant installedVariant = EuiExtra.Variants.First(v => v.Id == _installedEuiVariantId);
-                string label = EuiBaseLabel(installedVariant);
-                results.Add(new CheckResult(!_installedEuiVersionMismatch, _installedEuiVersionMismatch
-                    ? label + " doesn't exactly match this installer's bundled copy."
-                    : label + " matches this installer's bundled copy exactly."));
+                string name = EuiExtra.ById(_installedEuiVariantId).DisplayName;
+                if (_installedEuiTag == null)
+                {
+                    results.Add(new CheckResult(false, name
+                        + " wasn't installed by this installer and may have the unit flag crash -- click UPDATE."));
+                }
+                else
+                {
+                    results.Add(new CheckResult(!IsEuiUpdateAvailable(), IsEuiUpdateAvailable()
+                        ? name + " " + _installedEuiTag + " is outdated -- " + _euiLatestTag + " is available."
+                        : name + " " + _installedEuiTag + " installed."));
+                }
             }
 
             List<string> updates = ModRegistry.All
@@ -1945,6 +1965,10 @@ namespace KekModInstaller
             if (IsLobbyPatchUpdateAvailable())
             {
                 updates.Add(LobbyPatch.DisplayName);
+            }
+            if (IsEuiUpdateAvailable())
+            {
+                updates.Add(EuiExtra.ById(_installedEuiVariantId).DisplayName);
             }
             results.Add(updates.Count > 0
                 ? new CheckResult(false, "Update available for: " + string.Join(", ", updates.ToArray()) + ".")
@@ -2683,14 +2707,13 @@ namespace KekModInstaller
                 throw new InvalidOperationException("Couldn't locate the Civilization V DLC folder.");
             }
 
-            bool installedSomething = true;
             if (variant == null)
             {
                 EuiExtra.Remove(dlcRoot, log);
             }
             else
             {
-                installedSomething = EuiExtra.Install(dlcRoot, variant, log);
+                EuiExtra.Install(dlcRoot, variant, log);
             }
 
             // EUI is shared across Assets/DLC, not tied to one specific mod
@@ -2704,12 +2727,8 @@ namespace KekModInstaller
             }
 
             // Same "DONE: ..." format as ModCore.Run/Uninstall's completion
-            // lines -- skipped only for the "isn't bundled" no-op above,
-            // which already logged its own explanation.
-            if (installedSomething)
-            {
-                log(variant == null ? "DONE: EUI removed." : "DONE: " + variant.DisplayName + " installed.");
-            }
+            // lines.
+            log(variant == null ? "DONE: EUI removed." : "DONE: " + variant.DisplayName + " installed.");
         }
 
         private void LobbyWorker_DoWork(object sender, DoWorkEventArgs e)

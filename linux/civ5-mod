@@ -24,7 +24,7 @@
 #
 # Mirrors installer/*.cs feature for feature: four mutually exclusive mods,
 # each with its bonus map (Fish Map Script / Better Pangaea / Lekmap / Weevee Map), the two
-# bundled EUI variants, the lobby patch, VERIFY MODS, CLEAR GFX CACHE, REDOWNLOAD CIV, the beta
+# two EUI variants, the lobby patch, VERIFY MODS, CLEAR GFX CACHE, REDOWNLOAD CIV, the beta
 # setting and self-update. Where Windows and Linux differ:
 #
 #   * The game is found through Steam's libraryfolders.vdf (native, ~/.steam,
@@ -32,10 +32,6 @@
 #     running under Proton -- KEK Mod replaces a Windows DLL.
 #   * Civ V's Documents folder lives inside the Proton prefix
 #     (steamapps/compatdata/8930/pfx/...).
-#   * EUI isn't fetchable from anywhere stable (see EuiExtra.cs), so it comes
-#     from the same bundled zips the Windows build embeds: they're read straight
-#     out of installer/KekModInstaller.exe (this checkout's copy, else the one
-#     on main), so the exact-match check compares against identical bytes.
 #   * Every mod but SnowVe ships a ui_check.bat. BatchScript runs the subset
 #     of batch those scripts use (copy/xcopy, del, IF EXIST, FIND/FINDSTR, set,
 #     one PowerShell string replace), sandboxed to Assets/DLC, with Windows'
@@ -48,7 +44,6 @@
 # Set GITHUB_TOKEN to lift GitHub's 60 requests/hour anonymous limit.
 
 import argparse
-import hashlib
 import http.cookiejar
 import json
 import locale
@@ -57,7 +52,6 @@ import queue
 import re
 import shutil
 import signal
-import struct
 import subprocess
 import sys
 import tempfile
@@ -76,12 +70,11 @@ VERSION = "2.3"
 
 REPO_OWNER = "OBLASTWAR"
 REPO_NAME = "kek-mod"
-# Self-update, ticker and the bundled EUI all come from main, never a
+# Self-update and the ticker come from main, never a
 # release/* branch -- those get deleted once a version ships (same reasoning
 # as InstallerCore.TickerBranch).
 RAW_MAIN = "https://raw.githubusercontent.com/%s/%s/main" % (REPO_OWNER, REPO_NAME)
 SELF_REPO_PATH = "installer/linux/civ5-mod"
-EXE_REPO_PATH = "installer/KekModInstaller.exe"
 
 CIV_APPID = "8930"
 CIV_FOLDER = "Sid Meier's Civilization V"
@@ -1037,124 +1030,28 @@ def installed_folders(game, mod):
             if len(os.path.basename(d)) > len(mod.folder_prefix)]
 
 
-# ── Bundled EUI (read out of KekModInstaller.exe) ─────────────────────────────
+# ── EUI (EuiExtra.cs) ─────────────────────────────────────────────────────────
+# Downloaded from our forks' GitHub Releases, one <folder>.zip asset each. The
+# installed release tag is kept in a marker file inside the EUI folder; an EUI
+# without one is upstream EUI or hand-installed, which has the unit flag
+# crash, so it reads as needing an update.
 
-class Bundle:
-    """The EUI zips the Windows build embeds as .NET manifest resources.
-
-    Looked up in order: loose zips next to the Windows sources (dev machine),
-    this checkout's KekModInstaller.exe, a cached copy of main's exe. The
-    resources blob in a .NET PE is a run of 8-byte-aligned [u32 length][data]
-    entries; zips are told apart by their top-level folder name."""
-
-    def __init__(self):
-        self._zips = None
-
-    def _exe_candidates(self):
-        return [os.path.join(os.path.dirname(SCRIPT_DIR), "KekModInstaller.exe"),
-                os.path.join(SCRIPT_DIR, "KekModInstaller.exe"),
-                os.path.join(CACHE_DIR, "KekModInstaller.exe")]
-
-    def local_exe(self):
-        return next((p for p in self._exe_candidates() if os.path.isfile(p)), None)
-
-    def fetch_exe(self, log=None):
-        """Downloads main's KekModInstaller.exe into the cache (~6 MB)."""
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        dest = os.path.join(CACHE_DIR, "KekModInstaller.exe")
-        if log:
-            log("Fetching bundled EUI (KekModInstaller.exe from GitHub)...")
-        tmp = dest + ".part"
-        download_to(RAW_MAIN + "/" + EXE_REPO_PATH, tmp)
-        os.replace(tmp, dest)
-        self._zips = None
-        return dest
-
-    @staticmethod
-    def _resources(exe_bytes):
-        d = exe_bytes
-        pe = struct.unpack_from("<I", d, 0x3C)[0]
-        nsec = struct.unpack_from("<H", d, pe + 6)[0]
-        optsz = struct.unpack_from("<H", d, pe + 20)[0]
-        opt = pe + 24
-        datadirs = opt + (112 if struct.unpack_from("<H", d, opt)[0] == 0x20B else 96)
-        sections = []
-        for i in range(nsec):
-            s = opt + optsz + 40 * i
-            vsize, va = struct.unpack_from("<II", d, s + 8)
-            sections.append((va, vsize, struct.unpack_from("<I", d, s + 20)[0]))
-
-        def offset(rva):
-            for va, vsize, raw in sections:
-                if va <= rva < va + vsize:
-                    return rva - va + raw
-            raise ValueError("RVA outside sections")
-
-        cli = offset(struct.unpack_from("<I", d, datadirs + 14 * 8)[0])  # CLR runtime header
-        res_rva, res_size = struct.unpack_from("<II", d, cli + 24)
-        base, pos = offset(res_rva), 0
-        while pos + 4 <= res_size:
-            n = struct.unpack_from("<I", d, base + pos)[0]
-            yield d[base + pos + 4:base + pos + 4 + n]
-            pos = (pos + 4 + n + 7) & ~7
-
-    def zips(self):
-        """{"UI_bc1": path, "UI_bc1_xits": path} for whatever is available
-        without network access."""
-        if self._zips is not None:
-            return self._zips
-        found = {}
-        for name in ("UI_bc1", "UI_bc1_xits"):
-            loose = os.path.join(os.path.dirname(SCRIPT_DIR), name + ".zip")
-            if os.path.isfile(loose):
-                found[name] = loose
-        exe = self.local_exe()
-        if exe and len(found) < 2:
-            try:
-                with open(exe, "rb") as f:
-                    data = f.read()
-                outdir = os.path.join(CACHE_DIR, "bundle-" + hashlib.sha256(data).hexdigest()[:12])
-                for blob in self._resources(data):
-                    if not blob.startswith(b"PK\x03\x04"):
-                        continue
-                    path = os.path.join(outdir, "eui.zip.part")
-                    os.makedirs(outdir, exist_ok=True)
-                    with open(path, "wb") as f:
-                        f.write(blob)
-                    tops = zip_top_dirs(path)
-                    if len(tops) == 1 and tops[0] in ("UI_bc1", "UI_bc1_xits") and tops[0] not in found:
-                        final = os.path.join(outdir, tops[0] + ".zip")
-                        os.replace(path, final)
-                        found[tops[0]] = final
-                    else:
-                        os.unlink(path)
-            except (OSError, ValueError, struct.error, zipfile.BadZipFile):
-                pass
-        self._zips = found
-        return found
-
-    def zip_for(self, folder, log=None):
-        z = self.zips().get(folder)
-        if z is None and not os.path.isfile(os.path.join(CACHE_DIR, "KekModInstaller.exe")):
-            self.fetch_exe(log)
-            z = self.zips().get(folder)
-        return z
-
-
-BUNDLE = Bundle()
+EUI_OWNER = "OBLASTWAR"
+EUI_MARKER = "kekmod-eui-version.txt"
+EUI_LATEST_KEY = "eui-latest"  # releases dict: latest tag of the installed variant's fork
 
 
 class EuiVariant:
-    def __init__(self, id, name, folder, version):
-        self.id, self.name, self.folder, self.version = id, name, folder, version
+    def __init__(self, id, name, folder, repo):
+        self.id, self.name, self.folder, self.repo = id, name, folder, repo
 
     def label(self):
-        return "%s (%s)" % (self.name, self.version) if self.version else self.name
+        return self.name
 
 
 EUI_VARIANTS = [
-    EuiVariant("eui", "EUI", "UI_bc1", "v1.28g"),
-    EuiVariant("eui_xits", "EUI XITS", "UI_bc1_xits", None),
+    EuiVariant("eui", "EUI", "UI_bc1", "enhanced-user-interface"),
+    EuiVariant("eui_xits", "EUI XITS", "UI_bc1_xits", "enhanced-user-interface-xits"),
 ]
 
 
@@ -1177,47 +1074,59 @@ def eui_detect(game):
     return None
 
 
-def eui_exact_match(game, variant):
-    """True when every file of the bundled copy is on disk byte-for-byte; None
-    when there's no bundled copy to compare with (offline, nothing cached)."""
-    zp = BUNDLE.zips().get(variant.folder)
-    if zp is None:
-        return None
-    target = ci_resolve(os.path.join(game.dlc, variant.folder))
-    if not os.path.isdir(target):
-        return False
+def eui_installed_tag(game, variant):
+    """Release tag this installer wrote into variant's folder, or None."""
     try:
-        with zipfile.ZipFile(zp) as zf:
-            for info in zf.infolist():
-                name = info.filename.replace("\\", "/")
-                if name.endswith("/"):
-                    continue
-                rel = name.split("/", 1)[1] if "/" in name else name
-                disk = ci_resolve(os.path.join(target, rel))
-                if not os.path.isfile(disk):
-                    return False
-                h = hashlib.sha256()
-                with open(disk, "rb") as f:
-                    for chunk in iter(lambda: f.read(1 << 16), b""):
-                        h.update(chunk)
-                if h.digest() != hashlib.sha256(zf.read(info)).digest():
-                    return False
-        return True
-    except (OSError, zipfile.BadZipFile):
-        return False
+        with open(ci_resolve(os.path.join(game.dlc, variant.folder, EUI_MARKER)), encoding="utf-8") as f:
+            return f.read().strip() or None
+    except OSError:
+        return None
+
+
+def eui_latest_tag(variant):
+    return GitHubSource(EUI_OWNER, variant.repo, False)._latest()["tag_name"]
+
+
+def fetch_eui_latest(game, out):
+    """Latest release tag of the INSTALLED variant's fork, into out."""
+    if game is None or game.problem():
+        return
+    v = next((v for v in EUI_VARIANTS if v.id == eui_detect(game)), None)
+    if v:
+        try:
+            out[EUI_LATEST_KEY] = eui_latest_tag(v)
+        except Exception:
+            pass
 
 
 def eui_install(game, variant, log, progress=lambda p: None):
-    zp = BUNDLE.zip_for(variant.folder, log)
-    if zp is None:
-        raise InstallerError(variant.name + " isn't in the bundled KekModInstaller.exe -- nothing to install.")
-    progress(20)
-    for d in ci_dirs_with_prefix(game.dlc, "UI"):  # only one EUI may be active
-        log("Removing " + os.path.basename(d) + "...")
-        remove_tree(d)
-    progress(40)
-    log("Installing " + variant.name + "...")
-    extract_zip(zp, game.dlc)
+    log("Checking %s/%s for the latest release..." % (EUI_OWNER, variant.repo))
+    rel = GitHubSource(EUI_OWNER, variant.repo, False)._latest()
+    asset_name = variant.folder + ".zip"
+    asset = next((a for a in rel.get("assets") or [] if a["name"].lower() == asset_name.lower()), None)
+    if asset is None:
+        raise InstallerError("Release %s has no %s." % (rel["tag_name"], asset_name))
+    log("Release: " + rel["tag_name"])
+    log("Downloading %s..." % asset["name"])
+    progress(10)
+    with tempfile.TemporaryDirectory(prefix="civ5-mod-") as tmp:
+        zp = os.path.join(tmp, asset_name)
+        download_to(asset["browser_download_url"], zp, lambda f: progress(10 + int(30 * f)))
+        try:
+            ok = zip_top_dirs(zp) == [variant.folder]
+        except zipfile.BadZipFile:
+            ok = False
+        if not ok:
+            raise InstallerError("Downloaded %s doesn't contain a single %s folder." % (asset_name, variant.folder))
+        progress(40)
+        for d in ci_dirs_with_prefix(game.dlc, "UI"):  # only one EUI may be active
+            log("Removing " + os.path.basename(d) + "...")
+            remove_tree(d)
+        progress(50)
+        log("Installing %s %s..." % (variant.name, rel["tag_name"]))
+        extract_zip(zp, game.dlc)
+    with open(os.path.join(ci_resolve(os.path.join(game.dlc, variant.folder)), EUI_MARKER), "w", encoding="utf-8") as f:
+        f.write(rel["tag_name"])
     progress(70)
     rerun_ui_checks(game, log)
     clear_civ_db_cache(game, log)
@@ -1725,7 +1634,8 @@ class State:
         self.updates = {}     # mod id -> tag auto-install would pick now
         self.extra_updates = {}  # extra id -> newer upstream version of an installed bonus map
         self.eui = None
-        self.eui_match = None  # True / False / None (no bundled copy to compare against)
+        self.eui_tag = None    # installed EUI release tag; None = not installed by this installer
+        self.eui_update = None  # newer EUI release tag, "" if the installed one has no tag, None if current
         self.lobby = None      # installed lobby patch tag ("" if unknown); None = not installed
         self.lobby_update = None  # newer lobby patch tag, if the release check found one
         if game is None or game.problem():
@@ -1746,7 +1656,12 @@ class State:
                         self.extra_updates[mod.extra.id] = latest
         self.eui = eui_detect(game)
         if self.eui:
-            self.eui_match = eui_exact_match(game, self.eui_variant())
+            self.eui_tag = eui_installed_tag(game, self.eui_variant())
+            latest = releases.get(EUI_LATEST_KEY)
+            if self.eui_tag is None:
+                self.eui_update = latest or ""
+            elif latest and latest.lower() != self.eui_tag.lower():
+                self.eui_update = latest
         self.lobby = lobby_detect(game)
         # releases[LOBBY_REPO] is the latest tag string, not a release list.
         latest = releases.get(LOBBY_REPO)
@@ -1823,15 +1738,17 @@ def run_checks(game, state):
     v = state.eui_variant()
     if v is None:
         out.append((True, "No EUI variant installed."))
-    elif state.eui_match is None:
-        out.append((True, v.label() + " installed (bundled copy not available to compare)."))
+    elif state.eui_tag is None:
+        out.append((False, v.name + " wasn't installed by this installer and may have the unit flag crash"
+                    " -- update it."))
+    elif state.eui_update:
+        out.append((False, "%s %s is outdated -- %s is available." % (v.name, state.eui_tag, state.eui_update)))
     else:
-        out.append((state.eui_match, v.label() + (" matches this installer's bundled copy exactly."
-                                                   if state.eui_match else
-                                                   " doesn't exactly match this installer's bundled copy.")))
+        out.append((True, "%s %s installed." % (v.name, state.eui_tag)))
     ups = [m.name for m in MODS if m.id in state.updates] \
         + [m.extra.name for m in MODS if m.extra and m.extra.id in state.extra_updates] \
-        + ([LOBBY_NAME] if state.lobby_update else [])
+        + ([LOBBY_NAME] if state.lobby_update else []) \
+        + ([v.name] if v is not None and state.eui_update is not None else [])
     out.append((not ups, "Update available for: " + ", ".join(ups) + "." if ups else "All installed mods are up to date."))
     return out
 
@@ -2088,11 +2005,6 @@ def apply_self_update(data):
         f.write(data)
     os.chmod(tmp, os.stat(SCRIPT_PATH).st_mode)
     os.replace(tmp, SCRIPT_PATH)
-    # The cached EUI bundle tracks main too -- refresh it alongside.
-    try:
-        os.unlink(os.path.join(CACHE_DIR, "KekModInstaller.exe"))
-    except OSError:
-        pass
 
 
 # ── Installing this program onto the machine ──────────────────────────────────
@@ -2315,6 +2227,7 @@ class Cli:
             out[LOBBY_REPO] = lobby_latest_tag()
         except InstallerError:
             pass
+        fetch_eui_latest(game, out)
         return out
 
     def run_job(self, fn, *a):
@@ -2354,11 +2267,15 @@ class Cli:
         self.out.section("INTERFACE MODS")
         for v in EUI_VARIANTS:
             active = state.eui == v.id
-            if active and state.eui_match is False:
-                self.out.line("  %s %s" % (self.out.g("!"), self.out.g(v.name + " -- VERSION MISMATCH")))
+            if active and state.eui_tag is None:
+                self.out.line("  %s %s" % (self.out.g("!"), self.out.g(v.name + " -- OUTDATED, UPDATE")))
             else:
-                self.out.line("  %s %s" % (self.out.g("●") if active else self.out.m("○"),
-                                           self.out.g(v.label()) if active else self.out.m(v.label())))
+                label = v.name + ("  " + state.eui_tag if active else "")
+                line = "  %s %s" % (self.out.g("●") if active else self.out.m("○"),
+                                    self.out.g(label) if active else self.out.m(label))
+                if active and state.eui_update:
+                    line += self.out.g("  » update: " + state.eui_update)
+                self.out.line(line)
         self.out.section("NETWORK MODS")
         if state.lobby is None:
             self.out.line("  %s %s" % (self.out.m("○"), self.out.m(LOBBY_NAME)))
@@ -2838,17 +2755,12 @@ class Tui:
         except Exception:
             pass
         fetch_extra_latest(self.game, rel)
+        fetch_eui_latest(self.game, rel)
         ticker = fetch_ticker()
         latest = None
         if not in_git_checkout():  # a checkout updates with git pull
             try:
                 latest = fetch_latest_self()[0]
-            except Exception:
-                pass
-        # Make sure the exact-match check has the bundled EUI to compare with.
-        if not BUNDLE.zips():
-            try:
-                BUNDLE.fetch_exe()
             except Exception:
                 pass
         self.q.put(("fetched", (rel, ticker, latest)))
@@ -3131,14 +3043,19 @@ class Tui:
         for i, v in enumerate(EUI_VARIANTS):
             ry = y + 1 + i
             active = st.eui == v.id
-            mismatch = active and st.eui_match is False
+            unknown = active and st.eui_tag is None
+            update = active and st.eui_update is not None
             a = self.attr["grn"] if active else self.attr["mag"]
-            self.put(ry, x0 + 2, "!" if mismatch else (self.ch("dot") if active else self.ch("hol")), a)
-            self.put(ry, x0 + 4, (v.name + " -- VERSION MISMATCH") if mismatch else v.label(), a)
+            self.put(ry, x0 + 2, "!" if unknown else (self.ch("dot") if active else self.ch("hol")), a)
+            label = (v.name + " -- OUTDATED, UPDATE") if unknown else (v.name + ("  " + st.eui_tag if active else ""))
+            self.put(ry, x0 + 4, label, a, maxw=self._col_x[0] - x0 - 5)
+            if update and st.eui_update:
+                nx = x0 + 6 + len(label)
+                self.put(ry, nx, "%s %s available" % (self.ch("arrow"), st.eui_update), a, maxw=self._col_x[0] - nx - 1)
             col = "grn" if active else "mag"
             ok = not self.busy
-            for b, cx in zip([Btn("eui:%s:install" % v.id, "REINSTALL" if active else "INSTALL",
-                                  lambda v=v: self.on_eui_install(v), ok, col),
+            for b, cx in zip([Btn("eui:%s:install" % v.id, "UPDATE" if update else ("REINSTALL" if active else "INSTALL"),
+                                  lambda v=v: self.on_eui_install(v), ok, "red" if update else col),
                               Btn("eui:%s:uninstall" % v.id, "UNINSTALL", self.on_eui_remove, ok and active, col)],
                              self._col_x):
                 self.button(b, ry, cx, bw, self.buttons)
