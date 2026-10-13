@@ -4,9 +4,9 @@
 //
 // Split across a few files: this one (Installer.cs) is the installer PROGRAM
 // itself -- UI (MainForm/SettingsForm), retro theme/audio, and the
-// installer's own self-update + greetz-ticker fetch (both pinned to
-// OBLASTWAR/kek-mod's main branch regardless of which mod is selected, since
-// that's just where this installer program is hosted). Everything about the
+// installer's own self-update + greetz-ticker fetch (both from
+// OBLASTWAR/civ5-mod-installer regardless of which mod is selected, since
+// that's where this installer program is hosted). Everything about the
 // MODS it can install -- the ModDefinition/IModSource abstraction, and where
 // Civ5 itself lives on disk -- is in ModCore.cs, GitHubModSource.cs, and
 // MapScriptExtra.cs. InstallerCore is declared `partial` and split across
@@ -85,9 +85,16 @@ namespace KekModInstaller
     {
         // Repo this installer program itself is published from -- used only
         // for the self-update and ticker fetches below, NOT for fetching any
-        // mod's own releases (see GitHubModSource for that).
+        // mod's own releases (see GitHubModSource for that). Each installer
+        // version is a GitHub release with CivVModInstaller.exe, civ5-mod and
+        // version.txt as assets; releases/latest/download/<asset> always
+        // resolves to the newest one without touching the rate-limited API.
+        // Up to 2.3 the installer lived in OBLASTWAR/kek-mod/installer --
+        // that repo keeps a frozen 2.4 there so older copies bridge over.
         private const string RepoOwner = "OBLASTWAR";
-        private const string RepoName = "kek-mod";
+        private const string RepoName = "civ5-mod-installer";
+        private const string LatestReleaseUrl = "https://github.com/" + RepoOwner + "/" + RepoName
+            + "/releases/latest/download/";
 
         // Branch the scrolling greetz ticker is read from at startup, so the
         // message can be edited on GitHub without shipping a new installer
@@ -102,7 +109,7 @@ namespace KekModInstaller
         public static string TryFetchTickerText()
         {
             string url = "https://raw.githubusercontent.com/" + RepoOwner + "/" + RepoName
-                + "/" + TickerBranch + "/installer/ticker.txt";
+                + "/" + TickerBranch + "/ticker.txt";
             try
             {
                 using (var client = new HttpClient())
@@ -119,13 +126,13 @@ namespace KekModInstaller
             }
         }
 
-        // This build's own version -- bump alongside installer/installer_version.txt
-        // (main branch) whenever KekModInstaller.exe is rebuilt for a release, so
-        // running copies out in the wild notice the newer one via
-        // TryFetchLatestInstallerVersion below. Unrelated to the mod's own
+        // This build's own version -- bump (with VERSION in linux/civ5-mod)
+        // for every installer release; release.sh publishes it as the
+        // release's version.txt, so running copies out in the wild notice the
+        // newer one via TryFetchLatestInstallerVersion below. Unrelated to the mod's own
         // version (release tags like "v1.5-beta8") -- this is the installer
         // program's own version.
-        private const string InstallerVersion = "2.3";
+        private const string InstallerVersion = "2.4";
 
         public static string GetInstallerVersion()
         {
@@ -137,8 +144,7 @@ namespace KekModInstaller
         // should leave the UPDATE button hidden.
         public static string TryFetchLatestInstallerVersion()
         {
-            string url = "https://raw.githubusercontent.com/" + RepoOwner + "/" + RepoName
-                + "/" + TickerBranch + "/installer/installer_version.txt";
+            string url = LatestReleaseUrl + "version.txt";
             try
             {
                 using (var client = new HttpClient())
@@ -177,8 +183,8 @@ namespace KekModInstaller
             return v.IndexOf('.') < 0 ? v + ".0" : v;
         }
 
-        // Downloads the published exe -- always "installer/CivVModInstaller.exe",
-        // NOT the running file's own name: players get it renamed (GDR's
+        // Downloads the latest release's CivVModInstaller.exe -- always that
+        // name, NOT the running file's own name: players get it renamed (GDR's
         // Discord upload, browsers' "(1)" suffix), and building the URL from
         // that 404'd -- and replaces the running copy in place, whatever it's
         // called, then relaunches. A running Windows
@@ -191,8 +197,7 @@ namespace KekModInstaller
         public static void DownloadAndApplySelfUpdate()
         {
             string exePath = Assembly.GetExecutingAssembly().Location;
-            string url = "https://raw.githubusercontent.com/" + RepoOwner + "/" + RepoName
-                + "/" + TickerBranch + "/installer/CivVModInstaller.exe";
+            string url = LatestReleaseUrl + "CivVModInstaller.exe";
 
             string newExePath = Path.Combine(Path.GetTempPath(), "kekmod_installer_update_" + Guid.NewGuid().ToString("N") + ".exe");
             using (var client = new HttpClient())
@@ -557,7 +562,7 @@ namespace KekModInstaller
             _btnSettings.Click += BtnSettings_Click;
 
             // Hidden until the startup status check finds a newer
-            // installer_version.txt on GitHub than InstallerCore.InstallerVersion
+            // release version.txt on GitHub than InstallerCore.InstallerVersion
             // -- see StatusWorker_DoWork/RunWorkerCompleted. Sits just left of
             // the gear so it doesn't need its own row.
             _btnUpdate = new RetroButton();
@@ -781,7 +786,7 @@ namespace KekModInstaller
             _tickerViewport.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
 
             // Default/fallback text -- shown until (and unless) the startup
-            // status check pulls a fresher copy from installer/ticker.txt on
+            // status check pulls a fresher copy from ticker.txt on
             // GitHub (see InstallerCore.TryFetchTickerText).
             _lblTicker = new Label();
             _lblTicker.AutoSize = true;

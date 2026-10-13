@@ -1,29 +1,25 @@
 #!/usr/bin/env bash
 # ============================================================
-# KekModInstaller build script -- Linux edition of build.bat.
+# CivVModInstaller build script -- Linux edition of build.bat.
 #
-# Builds the same CivVModInstaller.exe (plus its KekModInstaller.exe
-# alias, see build.bat) from the same *.cs, with no .NET or
+# Builds the same CivVModInstaller.exe from the same *.cs, with no .NET or
 # Mono install needed: it borrows Proton's bundled wine-mono, which ships
 # the real Roslyn csc.exe and the .NET Framework 4.8 reference assemblies.
 # Any Steam Proton install works (Experimental, 10.0, 9.0, ...).
 #
-#   installer/build.sh
-#   PROTON_DIR=".../steamapps/common/Proton 10.0" installer/build.sh
+#   ./build.sh
+#   PROTON_DIR=".../steamapps/common/Proton 10.0" ./build.sh
 #
 # csc runs in a throwaway Wine prefix under ~/.cache/kekmod-build, never
 # the Civ V prefix.
 #
-# Self-update: same rule as build.bat -- when publishing a new
-# CivVModInstaller.exe to main, bump InstallerCore.InstallerVersion in
-# Installer.cs, installer/installer_version.txt AND VERSION in
-# installer/linux/civ5-mod to the same new value.
+# Publishing: same rule as build.bat -- bump the version in Installer.cs
+# and linux/civ5-mod, build, then run release.sh.
 # ============================================================
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OUT="$HERE/CivVModInstaller.exe"
-LEGACY_OUT="$HERE/KekModInstaller.exe"
 
 steam_roots() {
     local d
@@ -121,9 +117,7 @@ if [[ $status -ne 0 || ! -f "$OUT.tmp" ]]; then
     exit 1
 fi
 mv -f "$OUT.tmp" "$OUT"
-cp -f "$OUT" "$LEGACY_OUT"
 
 echo
 echo "BUILD SUCCEEDED"
 echo "  $OUT"
-echo "  $LEGACY_OUT (legacy self-update alias)"

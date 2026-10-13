@@ -2,7 +2,7 @@
 setlocal
 
 :: ============================================================
-:: KekModInstaller build script
+:: CivVModInstaller build script
 :: Requires: .NET Framework 4.x (csc.exe) -- ships with Windows,
 :: no extra toolchain needed.
 ::
@@ -10,18 +10,10 @@ setlocal
 :: the same on Linux via Proton's wine-mono). CHANNEL
 :: (stable/beta) is available via Settings.
 ::
-:: Output: CivVModInstaller.exe, plus a byte-identical KekModInstaller.exe.
-:: Publish BOTH to main. Pre-2.3 installers self-update by fetching
-:: installer/<their own filename>, and copies are out there under both
-:: names (GDR's Discord upload has been CivVModInstaller.exe since 2.0;
-:: GitHub/README downloads were KekModInstaller.exe).
-::
-:: Self-update: whenever Installer.cs changes and you rebuild+publish a new
-:: CivVModInstaller.exe to main, bump InstallerCore.InstallerVersion in
-:: Installer.cs, installer/installer_version.txt AND VERSION in
-:: installer/linux/civ5-mod to the same new value.
-:: Running copies compare their own baked-in InstallerVersion against
-:: installer_version.txt on main and show an UPDATE button when they differ.
+:: Publishing: bump InstallerCore.InstallerVersion in Installer.cs AND
+:: VERSION in linux/civ5-mod to the same new value, build, then run
+:: release.sh (see there). Running copies compare their baked-in version
+:: against the latest release's version.txt and show an UPDATE button.
 :: ============================================================
 
 set CSC=%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
@@ -58,10 +50,7 @@ if %ERRORLEVEL% neq 0 (
     exit /b %ERRORLEVEL%
 )
 
-copy /y "%~dp0CivVModInstaller.exe" "%~dp0KekModInstaller.exe" >nul
-
 echo.
 echo BUILD SUCCEEDED
 echo   %~dp0CivVModInstaller.exe
-echo   %~dp0KekModInstaller.exe ^(legacy self-update alias^)
 exit /b 0

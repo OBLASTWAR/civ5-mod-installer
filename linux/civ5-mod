@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# civ5-mod -- Civ V Mod Installer, Linux (Proton) edition of KekModInstaller.exe.
+# civ5-mod -- Civ V Mod Installer, Linux (Proton) edition of CivVModInstaller.exe.
 #
 #   ./civ5-mod                         full-screen installer (same as `tui`)
 #   ./civ5-mod status                  what's installed, updates, checks
@@ -20,9 +20,9 @@
 #   (see --help, or `<command> --help`)
 #
 # Players install it with one line; afterwards it's just `civ5-mod`:
-#   curl -fsSL https://raw.githubusercontent.com/OBLASTWAR/kek-mod/main/installer/linux/civ5-mod | python3 - install-self
+#   curl -fsSL https://github.com/OBLASTWAR/civ5-mod-installer/releases/latest/download/civ5-mod | python3 - install-self
 #
-# Mirrors installer/*.cs feature for feature: four mutually exclusive mods,
+# Mirrors the Windows *.cs feature for feature: four mutually exclusive mods,
 # each with its bonus map (Fish Map Script / Better Pangaea / Lekmap / Weevee Map), the two
 # two EUI variants, the lobby patch, VERIFY MODS, CLEAR GFX CACHE, REDOWNLOAD CIV, the beta
 # setting and self-update. Where Windows and Linux differ:
@@ -64,17 +64,17 @@ import urllib.request
 import zipfile
 
 # Kept in step with the Windows build (InstallerCore.InstallerVersion in
-# installer/Installer.cs and installer/installer_version.txt): when one
-# bumps, bump this too.
-VERSION = "2.3"
+# Installer.cs): when one bumps, bump this too.
+VERSION = "2.4"
 
+# Self-update comes from the latest GitHub release's civ5-mod asset (no API
+# call, so no rate limit); the ticker from main. Up to 2.3 this lived in
+# OBLASTWAR/kek-mod/installer/linux -- that repo keeps a frozen 2.4 there so
+# older copies bridge over.
 REPO_OWNER = "OBLASTWAR"
-REPO_NAME = "kek-mod"
-# Self-update and the ticker come from main, never a
-# release/* branch -- those get deleted once a version ships (same reasoning
-# as InstallerCore.TickerBranch).
+REPO_NAME = "civ5-mod-installer"
 RAW_MAIN = "https://raw.githubusercontent.com/%s/%s/main" % (REPO_OWNER, REPO_NAME)
-SELF_REPO_PATH = "installer/linux/civ5-mod"
+LATEST_RELEASE = "https://github.com/%s/%s/releases/latest/download/" % (REPO_OWNER, REPO_NAME)
 
 CIV_APPID = "8930"
 CIV_FOLDER = "Sid Meier's Civilization V"
@@ -1967,19 +1967,19 @@ def redownload_game(game, log, progress):
 
 def fetch_ticker():
     try:
-        text = http_bytes(RAW_MAIN + "/installer/ticker.txt", timeout=15).decode("utf-8", "replace").strip()
+        text = http_bytes(RAW_MAIN + "/ticker.txt", timeout=15).decode("utf-8", "replace").strip()
         return " ".join(text.split()) or None
     except InstallerError:
         return None
 
 
 def fetch_latest_self():
-    """(version, script bytes) of the copy on main."""
+    """(version, script bytes) of the latest release's copy."""
     try:
-        data = http_bytes(RAW_MAIN + "/" + SELF_REPO_PATH, timeout=30)
+        data = http_bytes(LATEST_RELEASE + "civ5-mod", timeout=30)
     except InstallerError as e:
         if "404" in str(e):
-            raise InstallerError("No Linux installer is published on main yet.") from None
+            raise InstallerError("No Linux installer is published yet.") from None
         raise
     m = re.search(rb'^VERSION = "([^"]+)"', data, re.M)
     if not m:
@@ -1988,10 +1988,10 @@ def fetch_latest_self():
 
 
 def in_git_checkout():
-    """True when this is the repo's own installer/linux/civ5-mod --
+    """True when this is the repo's own linux/civ5-mod --
     not merely some file under a git work tree (e.g. a dotfiles repo in ~)."""
-    root = os.path.dirname(os.path.dirname(SCRIPT_DIR))
-    return (os.path.basename(SCRIPT_DIR) == "linux" and os.path.basename(os.path.dirname(SCRIPT_DIR)) == "installer"
+    root = os.path.dirname(SCRIPT_DIR)
+    return (os.path.basename(SCRIPT_DIR) == "linux" and os.path.exists(os.path.join(root, "Installer.cs"))
             and os.path.exists(os.path.join(root, ".git")))
 
 

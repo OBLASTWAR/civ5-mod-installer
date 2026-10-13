@@ -1,0 +1,9 @@
+# Build outputs -- published as GitHub release assets (release.sh), never committed.
+*.exe
+*.exe.tmp
+
+# Installer background track -- large binary asset, kept local only.
+beat.mp3
+
+# Python bytecode from running linux/civ5-mod out of a checkout.
+__pycache__/
