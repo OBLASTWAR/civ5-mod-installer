@@ -3111,7 +3111,7 @@ class Tui:
                 self.put(ry, nx, v, a, maxw=bx - nx - 1)
                 nx += len(v) + 2
             if mod.id in st.updates:
-                self.put(ry, nx, "%s %s available" % (self.ch("arrow"), st.updates[mod.id]), a, maxw=bx - nx - 1)
+                self.put(ry, nx, "%s %s available" % (self.ch("arrow"), st.updates[mod.id]), self.attr["red"], maxw=bx - nx - 1)
             for b, cx in zip(self._mod_buttons(mod), self._col_x):
                 self.button(b, ry, cx, bw, self.buttons)
             if mod.extra:
@@ -3130,7 +3130,7 @@ class Tui:
                 if installed and ev is None:
                     self.put(ry + 1, x0 + 11 + len(label), "missing", ea, maxw=room)
                 elif upd:
-                    self.put(ry + 1, x0 + 11 + len(label), "%s %s" % (self.ch("arrow"), upd), ea, maxw=room)
+                    self.put(ry + 1, x0 + 11 + len(label), "%s %s" % (self.ch("arrow"), upd), self.attr["red"], maxw=room)
                 if has_btn:
                     self.button(Btn("map:%s" % mod.id, "UPDATE" if upd else "INSTALL", lambda m=mod: self.on_map(m),
                                     not self.busy, "red" if upd else "grn"), ry + 1, self._col_x[2], bw, self.buttons)
