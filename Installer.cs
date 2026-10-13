@@ -3262,6 +3262,7 @@ namespace KekModInstaller
     {
         private readonly Panel _listPanel;
         private readonly Label _lblEmpty;
+        private readonly Label _lblHint;
 
         public ExtraModsForm(List<CheckResult> checks, List<ExtraFolderInfo> items)
         {
@@ -3298,12 +3299,13 @@ namespace KekModInstaller
             }
 
             int hintY = 10 + checksHeight + 10;
-            var lblHint = new Label();
-            lblHint.SetBounds(12, hintY, 496, 18);
-            lblHint.Text = "Folders in Assets/DLC and Assets/Maps this installer doesn't recognize:";
-            lblHint.Font = new Font("Consolas", 7.5F);
-            lblHint.ForeColor = MainForm.ThemeMagenta;
-            lblHint.BackColor = Color.Black;
+            _lblHint = new Label();
+            _lblHint.SetBounds(12, hintY, 496, 18);
+            _lblHint.Text = "Folders in Assets/DLC and Assets/Maps this installer doesn't recognize:";
+            _lblHint.Font = new Font("Consolas", 7.5F);
+            _lblHint.ForeColor = MainForm.ThemeMagenta;
+            _lblHint.BackColor = Color.Black;
+            _lblHint.Visible = items.Count > 0;
 
             int listY = hintY + 22;
             _listPanel = new Panel();
@@ -3314,9 +3316,9 @@ namespace KekModInstaller
 
             _lblEmpty = new Label();
             _lblEmpty.SetBounds(8, 8, 400, 20);
-            _lblEmpty.Text = "Nothing left -- everything's been kept, archived, or deleted.";
-            _lblEmpty.Font = new Font("Consolas", 8.5F);
-            _lblEmpty.ForeColor = MainForm.ThemeDim;
+            _lblEmpty.Text = "[OK] No unrecognized folders.";
+            _lblEmpty.Font = new Font("Consolas", 8.5F, FontStyle.Bold);
+            _lblEmpty.ForeColor = MainForm.ThemeGreen;
             _lblEmpty.BackColor = Color.Black;
             _lblEmpty.Visible = items.Count == 0;
             _listPanel.Controls.Add(_lblEmpty);
@@ -3333,7 +3335,7 @@ namespace KekModInstaller
             btnClose.Click += (s, e) => { DialogResult = DialogResult.Cancel; Close(); };
 
             Controls.Add(checksBox);
-            Controls.Add(lblHint);
+            Controls.Add(_lblHint);
             Controls.Add(_listPanel);
             Controls.Add(btnClose);
         }
@@ -3423,7 +3425,8 @@ namespace KekModInstaller
         private void RemoveRow(Panel row)
         {
             _listPanel.Controls.Remove(row);
-            _lblEmpty.Visible = _listPanel.Controls.Count == 0;
+            _lblEmpty.Visible = _listPanel.Controls.Count == 1; // only _lblEmpty left
+            _lblHint.Visible = !_lblEmpty.Visible;
             RelayoutRows();
         }
 

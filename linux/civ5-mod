@@ -3765,13 +3765,16 @@ class Tui:
 
         def draw():
             h, _w = self.scr.getmaxyx()
-            H = min(h - 2, len(shown) + max(1, len(extras)) + 10)
+            H = min(h - 2, len(shown) + len(extras) + 10)
             y, x, W, H = self._dialog_frame("VERIFY MODS", 86, H, "mag")
             for i, (ok, msg) in enumerate(shown):
                 self.put(y + 2 + i, x + 3, ("[OK] " if ok else "[!!] ") + msg,
                          self.attr["grn" if ok else "red"], maxw=W - 6)
             yy = y + 3 + len(shown)
-            self.put(yy, x + 3, "Unrecognized folders in Assets/DLC + Assets/Maps:", self.attr["mag"], maxw=W - 6)
+            if extras:
+                self.put(yy, x + 3, "Unrecognized folders in Assets/DLC + Assets/Maps:", self.attr["mag"], maxw=W - 6)
+            else:
+                self.put(yy, x + 3, "[OK] No unrecognized folders.", self.attr["grn"], maxw=W - 6)
             list_y = yy + 1
             rows = max(1, H - (list_y - y) - 3)
             fl = focusables()
@@ -3782,8 +3785,6 @@ class Tui:
                 if cur[1] >= st["top"] + rows:
                     st["top"] = cur[1] - rows + 1
             st["btns"] = []
-            if not extras:
-                self.put(list_y, x + 3, "Nothing here -- everything's been kept, archived, or deleted.", self.attr["dim"])
             for r in range(rows):
                 i = st["top"] + r
                 if i >= len(extras):
