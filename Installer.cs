@@ -126,13 +126,14 @@ namespace KekModInstaller
             }
         }
 
-        // This build's own version -- bump (with VERSION in linux/civ5-mod)
-        // for every installer release; release.sh publishes it as the
-        // release's version.txt, so running copies out in the wild notice the
-        // newer one via TryFetchLatestInstallerVersion below. Unrelated to the mod's own
+        // This build's own version. "dev" in the repo: the release build
+        // stamps the release version here and in linux/civ5-mod, and
+        // publishes it as the release's version.txt, so running copies out in
+        // the wild notice the newer one via TryFetchLatestInstallerVersion
+        // below. A local build stays "dev" and always offers the update. Unrelated to the mod's own
         // version (release tags like "v1.5-beta8") -- this is the installer
         // program's own version.
-        private const string InstallerVersion = "2.4";
+        private const string InstallerVersion = "dev";
 
         public static string GetInstallerVersion()
         {

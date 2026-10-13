@@ -63,9 +63,9 @@ import urllib.parse
 import urllib.request
 import zipfile
 
-# Kept in step with the Windows build (InstallerCore.InstallerVersion in
-# Installer.cs): when one bumps, bump this too.
-VERSION = "2.4"
+# "dev" in the repo; the release build stamps the release version
+# here and in Installer.cs.
+VERSION = "dev"
 
 # Self-update comes from the latest GitHub release's civ5-mod asset (no API
 # call, so no rate limit); the ticker from main. Up to 2.3 this lived in

@@ -13,8 +13,7 @@
 # csc runs in a throwaway Wine prefix under ~/.cache/kekmod-build, never
 # the Civ V prefix.
 #
-# Publishing: same rule as build.bat -- bump the version in Installer.cs
-# and linux/civ5-mod, build, then run release.sh.
+# Releases are built by Jenkins, not by hand -- see build.bat.
 # ============================================================
 set -euo pipefail
 

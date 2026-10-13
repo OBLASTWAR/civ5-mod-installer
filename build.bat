@@ -10,10 +10,9 @@ setlocal
 :: the same on Linux via Proton's wine-mono). CHANNEL
 :: (stable/beta) is available via Settings.
 ::
-:: Publishing: bump InstallerCore.InstallerVersion in Installer.cs AND
-:: VERSION in linux/civ5-mod to the same new value, build, then run
-:: release.sh (see there). Running copies compare their baked-in version
-:: against the latest release's version.txt and show an UPDATE button.
+:: Releases are built by Jenkins, not by hand: a push to main publishes
+:: the next stable (see Jenkinsfile). A local build reports
+:: version "dev".
 :: ============================================================
 
 set CSC=%SystemRoot%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
