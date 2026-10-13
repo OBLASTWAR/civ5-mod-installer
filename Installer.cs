@@ -416,6 +416,10 @@ namespace KekModInstaller
         // "cracktro" theme: black background, neon green terminal text,
         // magenta box-art borders -- see MakeRetroBox/RetroButton.
         private const int TopShift = 60;
+        // Two columns of 532px boxes: GAME MODS on the left, everything else
+        // on the right (see the MainForm constructor).
+        private const int RightColumnX = 12 + 532 + 12;
+        private const int FormWidth = RightColumnX + 532 + 12;
         private const int BottomStrip = 30;
         // Internal, not private: SettingsForm reuses the same palette and
         // chrome (MakeRetroBox, RetroButton) so the settings page reads as
@@ -506,8 +510,9 @@ namespace KekModInstaller
         {
             Text = "CIV V MOD INSTALLER";
             StartPosition = FormStartPosition.CenterScreen;
-            FormBorderStyle = FormBorderStyle.FixedSingle;
-            MaximizeBox = false;
+            // Resizable: the log takes up whatever the window grows by (see
+            // the layout below); the size it opens at is also the minimum.
+            FormBorderStyle = FormBorderStyle.Sizable;
             BackColor = Color.Black;
 
             _tooltip = new ToolTip();
@@ -549,15 +554,17 @@ namespace KekModInstaller
                 _lblTitle.Top + (_lblTitle.Height - _lblTitleTag.PreferredSize.Height) / 2);
 
             _dividerLine = new Panel();
-            _dividerLine.SetBounds(0, 44, 560, 2);
+            _dividerLine.SetBounds(0, 44, FormWidth, 2);
             _dividerLine.BackColor = ThemeMagenta;
+            _dividerLine.Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right;
 
             // Gear icon, top-right of the title bar -- the only way into
             // Settings (beta opt-in -- see SettingsForm). Deliberately not
             // labelled "BETA" or anything that would advertise the option
             // to players who haven't gone looking for it.
             _btnSettings = new RetroButton();
-            _btnSettings.SetBounds(522, 6, 26, 22);
+            _btnSettings.SetBounds(FormWidth - 38, 6, 26, 22);
+            _btnSettings.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             _btnSettings.Text = "⚙"; // gear
             _btnSettings.Font = new Font("Segoe UI", 10F, FontStyle.Bold);
             _btnSettings.TextOffsetY = -2; // see RetroButton.TextOffsetY
@@ -568,7 +575,8 @@ namespace KekModInstaller
             // -- see StatusWorker_DoWork/RunWorkerCompleted. Sits just left of
             // the gear so it doesn't need its own row.
             _btnUpdate = new RetroButton();
-            _btnUpdate.SetBounds(452, 6, 66, 22);
+            _btnUpdate.SetBounds(FormWidth - 108, 6, 66, 22);
+            _btnUpdate.Anchor = AnchorStyles.Top | AnchorStyles.Right;
             _btnUpdate.Text = "UPDATE";
             _btnUpdate.Font = new Font("Consolas", 7.5F, FontStyle.Bold);
             _btnUpdate.ForeColor = ThemeRed;
@@ -583,10 +591,8 @@ namespace KekModInstaller
             // sub-row for its bonus component (if any -- e.g. kek-mod's Fish
             // Map Script) with its own indicator. Separate boxes (rather than
             // one shared "MOD" box with plain rows) so a mod's sub-items
-            // visually belong to it. Boxes stack starting where the old MOD
-            // dropdown used to sit; modShift (how far everything below it
-            // gets pushed down) is however much vertical space this stack
-            // ends up needing, computed as a side effect of building it.
+            // visually belong to it. They stack down the left-hand column;
+            // the log starts under whichever column ends lower.
             //
             // A fast local detection pass (no network) seeds _installedModIds
             // / _installedVersionByModId / _installedEuiVariantId (and
@@ -628,11 +634,12 @@ namespace KekModInstaller
             Controls.Add(gameModsBox);
             UpdateModRowStyles();
 
-            // INTERFACE MODS -- same nested-box treatment for EUI/EUI XITS.
+            // INTERFACE MODS -- same nested-box treatment for EUI/EUI XITS,
+            // top of the right-hand column (RightColumnX).
             // Clicking a variant's box installs it (replacing the other, if
             // present -- both share Assets/DLC/UI_bc1) or removes EUI
             // entirely if that box is already the active one.
-            int interfaceModsY = gameModsY + gameModsHeight + 8;
+            int interfaceModsY = gameModsY;
             innerY = outerPadTop;
             var euiBoxes = new List<Panel>();
             for (int i = 0; i < EuiExtra.Variants.Count; i++)
@@ -642,7 +649,7 @@ namespace KekModInstaller
                 innerY += box.Height + 8;
             }
             int interfaceModsHeight = innerY - 8 + outerPadBottom;
-            var interfaceModsBox = MakeRetroBox("INTERFACE MODS", 12, interfaceModsY, 532, interfaceModsHeight);
+            var interfaceModsBox = MakeRetroBox("INTERFACE MODS", RightColumnX, interfaceModsY, 532, interfaceModsHeight);
             foreach (Panel box in euiBoxes) { interfaceModsBox.Controls.Add(box); }
             Controls.Add(interfaceModsBox);
             UpdateEuiRowStyles();
@@ -651,30 +658,58 @@ namespace KekModInstaller
             int networkModsY = interfaceModsY + interfaceModsHeight + 8;
             _lobbyBox = BuildLobbyPatchBox(outerPadSide, outerPadTop, innerWidth);
             int networkModsHeight = outerPadTop + _lobbyBox.Height + outerPadBottom;
-            var networkModsBox = MakeRetroBox("NETWORK MODS", 12, networkModsY, 532, networkModsHeight);
+            var networkModsBox = MakeRetroBox("NETWORK MODS", RightColumnX, networkModsY, 532, networkModsHeight);
             networkModsBox.Controls.Add(_lobbyBox);
             Controls.Add(networkModsBox);
             UpdateLobbyRowStyles();
 
-            int modShift = (networkModsY + networkModsHeight + 8) - (132 + TopShift);
+            // Right column, under NETWORK MODS: the four tool buttons as a
+            // 2x2 grid, then progress + status. Left column: GAME MODS. The
+            // log spans the full width underneath both, then the ticker.
+            const int toolBtnHeight = 28;
+            const int rowGap = 4;
+            int toolBtnWidth = (532 - rowGap) / 2;
+            int toolsY = networkModsY + networkModsHeight + 8;
 
-            // ClientSize, not Width/Height: the latter includes the title bar
-            // and borders, which shrinks the usable area every control below
-            // is positioned against and clips the bottom row. Set here, not
-            // at the top of the constructor, since it depends on modShift.
-            // "476" (was "572") accounts for the shared VERSION box + shared
-            // INSTALL/UNINSTALL row no longer existing -- every mod/EUI
-            // variant now carries its own action buttons directly on its box
-            // instead, so progress/status/log start right after INTERFACE
-            // MODS with no extra shared row in between.
-            ClientSize = new Size(560, 476 + TopShift + BottomStrip + modShift);
+            _btnOpenFolder = new RetroButton();
+            _btnOpenFolder.Text = "OPEN DLC FOLDER";
+            _btnOpenFolder.SetBounds(RightColumnX, toolsY, toolBtnWidth, toolBtnHeight);
+            _btnOpenFolder.Click += BtnOpenFolder_Click;
+
+            // Scans Assets/DLC and Assets/Maps for folders this installer
+            // doesn't recognize (see ExtraModScan) -- players who've picked
+            // up a pile of half-remembered manually-installed mods over the
+            // years can review and Keep/Archive/Delete each one.
+            _btnScanExtras = new RetroButton();
+            _btnScanExtras.Text = "VERIFY MODS";
+            _btnScanExtras.SetBounds(RightColumnX + toolBtnWidth + rowGap, toolsY, 532 - toolBtnWidth - rowGap, toolBtnHeight);
+            _btnScanExtras.Click += BtnScanExtras_Click;
+
+            // Wipes GPU shader caches + Civ5's cached DBs -- the fix for
+            // the "black map with smearing icons" bug (see
+            // GraphicsCacheExtra.cs for the story).
+            _btnClearGfx = new RetroButton();
+            _btnClearGfx.Text = "CLEAR GFX CACHE";
+            _btnClearGfx.SetBounds(RightColumnX, toolsY + toolBtnHeight + rowGap, toolBtnWidth, toolBtnHeight);
+            _btnClearGfx.Click += BtnClearGfx_Click;
+
+            // Last resort: deletes the whole game folder so Steam downloads
+            // it again (see GameResetExtra.cs). Red, like FORCE CLOSE --
+            // the one button here that can't be undone.
+            _btnResetGame = new RetroButton();
+            _btnResetGame.Text = "REDOWNLOAD CIV";
+            _btnResetGame.ForeColor = ThemeRed;
+            _btnResetGame.SetBounds(RightColumnX + toolBtnWidth + rowGap, toolsY + toolBtnHeight + rowGap,
+                532 - toolBtnWidth - rowGap, toolBtnHeight);
+            _btnResetGame.Click += BtnResetGame_Click;
 
             _progress = new ProgressBar();
             // Inset 1px inside a magenta-bordered panel -- a plain black bar
             // on a black form is otherwise invisible at 0%, before any fill
             // color would show.
+            int progressY = toolsY + 2 * toolBtnHeight + rowGap + 8;
             var progressBorder = new Panel();
-            progressBorder.SetBounds(12, 132 + TopShift + modShift, 532, 20);
+            progressBorder.SetBounds(RightColumnX, progressY, 532, 20);
             progressBorder.BackColor = ThemeMagenta;
 
             _progress.SetBounds(1, 1, 530, 18);
@@ -689,22 +724,24 @@ namespace KekModInstaller
             progressBorder.Controls.Add(_progress);
 
             _lblStatus = new Label();
-            _lblStatus.SetBounds(12, 160 + TopShift + modShift, 532, 20);
+            _lblStatus.SetBounds(RightColumnX, progressY + 26, 532, 20);
             _lblStatus.Font = new Font("Consolas", 9F, FontStyle.Bold);
             _lblStatus.ForeColor = ThemeGreen;
             _lblStatus.BackColor = Color.Black;
 
-            // Derived from ClientSize rather than a hand-tuned height, so the
-            // log box and the Open Install Folder button below it never
-            // overlap regardless of window height.
-            int bottomStripY = ClientSize.Height - BottomStrip;
-            int openFolderHeight = 28;
-            int openFolderY = bottomStripY - 8 - openFolderHeight;
-            int logTop = 184 + TopShift + modShift;
-            int logHeight = openFolderY - 8 - logTop;
+            // Log: full width under whichever column ends lower, and the only
+            // thing that grows when the window is resized.
+            const int logHeight = 160;
+            int logTop = Math.Max(gameModsY + gameModsHeight, _lblStatus.Bottom) + 8;
+            int bottomStripY = logTop + logHeight + 8;
+            // ClientSize, not Width/Height: the latter includes the title bar
+            // and borders, which shrinks the usable area every control is
+            // positioned against and clips the bottom row.
+            ClientSize = new Size(FormWidth, bottomStripY + BottomStrip);
+            MinimumSize = Size;
 
             _txtLog = new RetroTextBox();
-            _txtLog.SetBounds(12, logTop, 532, logHeight);
+            _txtLog.SetBounds(12, logTop, FormWidth - 24, logHeight);
             _txtLog.Multiline = true;
             _txtLog.ReadOnly = true;
             _txtLog.ScrollBars = ScrollBars.Vertical;
@@ -724,49 +761,8 @@ namespace KekModInstaller
                 _txtLog.Cursor = civEdit;
             }
 
-            // Four buttons fill this row -- the DX9/DX11 launch buttons are
-            // hidden for now (see their Controls.Add call below), so the
-            // rest stretch to fill the freed-up width instead of leaving a
-            // gap.
-            int rowGap = 4;
-            int rowWidth = _txtLog.Width;
-            int btnWidth = (rowWidth - 3 * rowGap) / 4;
-            int btnWidth1 = rowWidth - 3 * (btnWidth + rowGap); // remainder to the last button
-
-            _btnOpenFolder = new RetroButton();
-            _btnOpenFolder.Text = "OPEN DLC FOLDER";
-            _btnOpenFolder.SetBounds(12, openFolderY, btnWidth, openFolderHeight);
-            _btnOpenFolder.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
-            _btnOpenFolder.Click += BtnOpenFolder_Click;
-
-            // Scans Assets/DLC and Assets/Maps for folders this installer
-            // doesn't recognize (see ExtraModScan) -- players who've picked
-            // up a pile of half-remembered manually-installed mods over the
-            // years can review and Keep/Archive/Delete each one.
-            _btnScanExtras = new RetroButton();
-            _btnScanExtras.Text = "VERIFY MODS";
-            _btnScanExtras.SetBounds(12 + btnWidth + rowGap, openFolderY, btnWidth, openFolderHeight);
-            _btnScanExtras.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
-            _btnScanExtras.Click += BtnScanExtras_Click;
-
-            // Wipes GPU shader caches + Civ5's cached DBs -- the fix for
-            // the "black map with smearing icons" bug (see
-            // GraphicsCacheExtra.cs for the story).
-            _btnClearGfx = new RetroButton();
-            _btnClearGfx.Text = "CLEAR GFX CACHE";
-            _btnClearGfx.SetBounds(12 + 2 * (btnWidth + rowGap), openFolderY, btnWidth, openFolderHeight);
-            _btnClearGfx.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
-            _btnClearGfx.Click += BtnClearGfx_Click;
-
-            // Last resort: deletes the whole game folder so Steam downloads
-            // it again (see GameResetExtra.cs). Red, like FORCE CLOSE --
-            // the one button here that can't be undone.
-            _btnResetGame = new RetroButton();
-            _btnResetGame.Text = "REDOWNLOAD CIV";
-            _btnResetGame.ForeColor = ThemeRed;
-            _btnResetGame.SetBounds(12 + 3 * (btnWidth + rowGap), openFolderY, btnWidth1, openFolderHeight);
-            _btnResetGame.Anchor = AnchorStyles.Bottom | AnchorStyles.Left;
-            _btnResetGame.Click += BtnResetGame_Click;
+            int openFolderY = toolsY; // the hidden launch buttons below just need somewhere to sit
+            int openFolderHeight = toolBtnHeight;
 
             _btnLaunchDx9 = new RetroButton();
             _btnLaunchDx9.Text = "LAUNCH DX9";
@@ -782,7 +778,7 @@ namespace KekModInstaller
             UpdateLaunchCivButtons();
 
             _tickerViewport = new Panel();
-            _tickerViewport.SetBounds(12, bottomStripY, 498, 20);
+            _tickerViewport.SetBounds(12, bottomStripY, FormWidth - 24 - 34, 20);
             _tickerViewport.BackColor = Color.Black;
             _tickerViewport.BorderStyle = BorderStyle.FixedSingle;
             _tickerViewport.Anchor = AnchorStyles.Bottom | AnchorStyles.Left | AnchorStyles.Right;
@@ -805,7 +801,7 @@ namespace KekModInstaller
             _muted = SettingsManager.GetMuted();
 
             _btnMute = new RetroButton();
-            _btnMute.SetBounds(522, bottomStripY, 26, 22);
+            _btnMute.SetBounds(FormWidth - 38, bottomStripY, 26, 22);
             _btnMute.Anchor = AnchorStyles.Bottom | AnchorStyles.Right;
             _btnMute.Text = _muted ? "✕" : "♪"; // X : eighth note
             _btnMute.ForeColor = _muted ? ThemeRed : ThemeGreen;
