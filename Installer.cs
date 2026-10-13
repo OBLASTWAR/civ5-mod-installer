@@ -3245,10 +3245,11 @@ namespace KekModInstaller
         public CheckResult(bool ok, string message) { Ok = ok; Message = message; }
     }
 
-    // Reached via MainForm's "VERIFY MODS" button. Two sections: every check
-    // this installer knows how to run (see MainForm.RunAllChecks -- Civ5
-    // running, conflicting mods, Tournament Mod/EUI XITS, missing bonus
-    // maps, EUI version match, update available), then whatever
+    // Reached via MainForm's "VERIFY MODS" button. Two sections: the checks
+    // that failed out of every one this installer knows how to run (see
+    // MainForm.RunAllChecks -- Civ5 running, conflicting mods, Tournament
+    // Mod/EUI XITS, missing bonus maps, EUI version match, update available;
+    // passing ones are hidden so a failure can't get lost among them), then whatever
     // ExtraModScan.Scan() found -- unrecognized folders under Assets/DLC and
     // Assets/Maps -- one row each with its own ARCHIVE/DELETE buttons on the
     // right, same layout pattern as MainForm's mod/EUI boxes: each button
@@ -3272,11 +3273,18 @@ namespace KekModInstaller
             MinimizeBox = false;
             BackColor = Color.Black;
 
-            bool allChecksOk = checks.All(c => c.Ok);
-            Panel checksBox = MainForm.MakeRetroBox("CHECKS", 12, 10, 496, 150,
+            // Only failures are listed; with none, one green line says so.
+            List<CheckResult> failed = checks.Where(c => !c.Ok).ToList();
+            if (failed.Count == 0)
+            {
+                failed.Add(new CheckResult(true, "All checks passed."));
+            }
+            bool allChecksOk = failed[0].Ok;
+            int checksHeight = 26 + failed.Count * 20;
+            Panel checksBox = MainForm.MakeRetroBox("CHECKS", 12, 10, 496, checksHeight,
                 () => allChecksOk ? MainForm.ThemeGreen : MainForm.ThemeRed);
             int checkY = 18;
-            foreach (CheckResult c in checks)
+            foreach (CheckResult c in failed)
             {
                 var lbl = new Label();
                 lbl.SetBounds(12, checkY, 472, 18);
@@ -3289,18 +3297,17 @@ namespace KekModInstaller
                 checkY += 20;
             }
 
+            int hintY = 10 + checksHeight + 10;
             var lblHint = new Label();
-            lblHint.SetBounds(12, 170, 496, 60); // 4 lines at 7.5F Consolas -- ~15px/line
-            lblHint.Text = "Folders in Assets/DLC and Assets/Maps this installer doesn't recognize:\r\n"
-                + "Leave a row alone to KEEP it.\r\n"
-                + "ARCHIVE -- zips the folder in place, then deletes the original.\r\n"
-                + "DELETE -- permanently removes the folder. No undo.";
+            lblHint.SetBounds(12, hintY, 496, 18);
+            lblHint.Text = "Folders in Assets/DLC and Assets/Maps this installer doesn't recognize:";
             lblHint.Font = new Font("Consolas", 7.5F);
             lblHint.ForeColor = MainForm.ThemeMagenta;
             lblHint.BackColor = Color.Black;
 
+            int listY = hintY + 22;
             _listPanel = new Panel();
-            _listPanel.SetBounds(12, 236, 496, 250);
+            _listPanel.SetBounds(12, listY, 496, 486 - listY);
             _listPanel.AutoScroll = true;
             _listPanel.BackColor = Color.Black;
             _listPanel.BorderStyle = BorderStyle.FixedSingle;
@@ -3338,19 +3345,12 @@ namespace KekModInstaller
             row.BackColor = Color.Black;
 
             var lblName = new Label();
-            lblName.SetBounds(0, 4, 200, 18);
+            lblName.SetBounds(0, 4, 274, 18);
             lblName.Text = "[" + (info.Location == ExtraFolderLocation.Dlc ? "DLC" : "Maps") + "] " + info.Name;
             lblName.Font = new Font("Consolas", 8.5F, FontStyle.Bold);
-            lblName.ForeColor = MainForm.ThemeGreen;
+            lblName.ForeColor = MainForm.ThemeRed;
             lblName.BackColor = Color.Black;
             lblName.AutoEllipsis = true;
-
-            var lblSize = new Label();
-            lblSize.SetBounds(204, 4, 70, 18);
-            lblSize.Text = FormatSize(info.SizeBytes);
-            lblSize.Font = new Font("Consolas", 8F);
-            lblSize.ForeColor = MainForm.ThemeDim;
-            lblSize.BackColor = Color.Black;
 
             var btnArchive = new MainForm.RetroButton();
             btnArchive.Text = "ARCHIVE";
@@ -3365,7 +3365,6 @@ namespace KekModInstaller
             btnDelete.Click += (s, e) => OnDeleteClick(info, row);
 
             row.Controls.Add(lblName);
-            row.Controls.Add(lblSize);
             row.Controls.Add(btnArchive);
             row.Controls.Add(btnDelete);
 
@@ -3440,12 +3439,6 @@ namespace KekModInstaller
                 c.Top = y;
                 y += c.Height + 4;
             }
-        }
-
-        private static string FormatSize(long bytes)
-        {
-            double mb = bytes / (1024.0 * 1024.0);
-            return mb >= 1 ? mb.ToString("0.0") + " MB" : (bytes / 1024.0).ToString("0") + " KB";
         }
     }
 

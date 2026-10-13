@@ -3754,7 +3754,8 @@ class Tui:
     def verify_dialog(self, checks, extras):
         c = self.curses
         st = {"focus": 0, "top": 0, "btns": []}
-        all_ok = all(ok for ok, _ in checks)
+        # Only failures are listed; with none, one green line says so.
+        shown = [(ok, msg) for ok, msg in checks if not ok] or [(True, "All checks passed.")]
 
         def focusables():
             out = []
@@ -3764,16 +3765,14 @@ class Tui:
 
         def draw():
             h, _w = self.scr.getmaxyx()
-            H = min(h - 2, len(checks) + max(1, len(extras)) + 11)
+            H = min(h - 2, len(shown) + max(1, len(extras)) + 10)
             y, x, W, H = self._dialog_frame("VERIFY MODS", 86, H, "mag")
-            for i, (ok, msg) in enumerate(checks):
-                self.put(y + 2 + i, x + 3, ("[OK] " if ok else "[!!] ") + msg, self.attr["mag"], maxw=W - 6)
-            yy = y + 3 + len(checks)
-            self.put(yy, x + 3, "Unrecognized folders in Assets/DLC + Assets/Maps. Leave a row alone to KEEP it.",
-                     self.attr["mag"], maxw=W - 6)
-            self.put(yy + 1, x + 3, "ARCHIVE = zip in place (undo: unzip).  DELETE = gone for good.",
-                     self.attr["dim"], maxw=W - 6)
-            list_y = yy + 2
+            for i, (ok, msg) in enumerate(shown):
+                self.put(y + 2 + i, x + 3, ("[OK] " if ok else "[!!] ") + msg,
+                         self.attr["grn" if ok else "red"], maxw=W - 6)
+            yy = y + 3 + len(shown)
+            self.put(yy, x + 3, "Unrecognized folders in Assets/DLC + Assets/Maps:", self.attr["mag"], maxw=W - 6)
+            list_y = yy + 1
             rows = max(1, H - (list_y - y) - 3)
             fl = focusables()
             cur = fl[st["focus"]] if st["focus"] < len(fl) else ("close", None)
@@ -3791,9 +3790,7 @@ class Tui:
                     break
                 e = extras[i]
                 ry = list_y + r
-                self.put(ry, x + 3, "[%s] " % e.where, self.attr["mag"])
-                self.put(ry, x + 10, e.name, self.attr["mag"], maxw=W - 52)
-                self.put(ry, x + W - 39, format_size(e.size).rjust(9), self.attr["dim"])
+                self.put(ry, x + 3, "[%s] %s" % (e.where, e.name), self.attr["red"], maxw=W - 33)
                 for kind, label, bx, col in (("archive", "ARCHIVE", x + W - 28, "mag"), ("delete", "DELETE", x + W - 15, "mag")):
                     b = Btn((kind, i), label, None, True, col)
                     self.focus = cur
