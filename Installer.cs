@@ -177,10 +177,11 @@ namespace KekModInstaller
             return v.IndexOf('.') < 0 ? v + ".0" : v;
         }
 
-        // Downloads this build's own exe (same repo path the running copy was
-        // itself published from -- "installer/KekModInstaller.exe" or
-        // "installer/KekModInstaller.Internal.exe", whichever this process
-        // is) and replaces it in place, then relaunches. A running Windows
+        // Downloads the published exe -- always "installer/CivVModInstaller.exe",
+        // NOT the running file's own name: players get it renamed (GDR's
+        // Discord upload, browsers' "(1)" suffix), and building the URL from
+        // that 404'd -- and replaces the running copy in place, whatever it's
+        // called, then relaunches. A running Windows
         // exe can't overwrite its own file (still locked/mapped), so the
         // swap happens via a short-lived helper batch script: this process
         // downloads the new exe to %TEMP%, writes a .bat that waits a couple
@@ -190,9 +191,8 @@ namespace KekModInstaller
         public static void DownloadAndApplySelfUpdate()
         {
             string exePath = Assembly.GetExecutingAssembly().Location;
-            string exeName = Path.GetFileName(exePath);
             string url = "https://raw.githubusercontent.com/" + RepoOwner + "/" + RepoName
-                + "/" + TickerBranch + "/installer/" + exeName;
+                + "/" + TickerBranch + "/installer/CivVModInstaller.exe";
 
             string newExePath = Path.Combine(Path.GetTempPath(), "kekmod_installer_update_" + Guid.NewGuid().ToString("N") + ".exe");
             using (var client = new HttpClient())

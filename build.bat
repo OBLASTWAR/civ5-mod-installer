@@ -6,12 +6,18 @@ setlocal
 :: Requires: .NET Framework 4.x (csc.exe) -- ships with Windows,
 :: no extra toolchain needed.
 ::
-:: Builds KekModInstaller.exe from the same Installer.cs (build.sh does
+:: Builds CivVModInstaller.exe from the same Installer.cs (build.sh does
 :: the same on Linux via Proton's wine-mono). CHANNEL
 :: (stable/beta) is available via Settings.
 ::
+:: Output: CivVModInstaller.exe, plus a byte-identical KekModInstaller.exe.
+:: Publish BOTH to main. Pre-2.3 installers self-update by fetching
+:: installer/<their own filename>, and copies are out there under both
+:: names (GDR's Discord upload has been CivVModInstaller.exe since 2.0;
+:: GitHub/README downloads were KekModInstaller.exe).
+::
 :: Self-update: whenever Installer.cs changes and you rebuild+publish a new
-:: KekModInstaller.exe to main, bump InstallerCore.InstallerVersion in
+:: CivVModInstaller.exe to main, bump InstallerCore.InstallerVersion in
 :: Installer.cs, installer/installer_version.txt AND VERSION in
 :: installer/linux/civ5-mod to the same new value.
 :: Running copies compare their own baked-in InstallerVersion against
@@ -54,15 +60,18 @@ if exist "%~dp0UI_bc1_xits.zip" (
 )
 
 echo.
-echo === Building KekModInstaller.exe ===
-"%CSC%" /nologo /target:winexe /platform:x64 /out:"%~dp0KekModInstaller.exe" %REFS% %RESOURCE% "%~dp0*.cs"
+echo === Building CivVModInstaller.exe ===
+"%CSC%" /nologo /target:winexe /platform:x64 /out:"%~dp0CivVModInstaller.exe" %REFS% %RESOURCE% "%~dp0*.cs"
 if %ERRORLEVEL% neq 0 (
     echo.
     echo BUILD FAILED ^(exit code %ERRORLEVEL%^)
     exit /b %ERRORLEVEL%
 )
 
+copy /y "%~dp0CivVModInstaller.exe" "%~dp0KekModInstaller.exe" >nul
+
 echo.
 echo BUILD SUCCEEDED
-echo   %~dp0KekModInstaller.exe
+echo   %~dp0CivVModInstaller.exe
+echo   %~dp0KekModInstaller.exe ^(legacy self-update alias^)
 exit /b 0
