@@ -22,8 +22,8 @@ Then run `civ5-mod`. `civ5-mod self-update` keeps it current.
   .NET Framework 4.x) builds `CivVModInstaller.exe`. Put `beat.mp3` next to
   them first; it's gitignored and gets embedded.
   Local builds report version `dev`.
-- **Releases come from Jenkins.** A push to `main` builds on the Windows build
-  VM and publishes the next stable `v2.N` (the major is in `VERSION`) with
+- **Releases come from Jenkins.** A push to `main` builds on Windows
+  and publishes the next stable `v2.N` (the major is in `VERSION`) with
   `CivVModInstaller.exe`, `civ5-mod` and `version.txt` as assets. Running
   installers pick it up from `releases/latest/download/`. A push to `release`
   publishes a beta pre-release, which updaters ignore. Pushes that only touch

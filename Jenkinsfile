@@ -1,11 +1,12 @@
 // Release CI: builds CivVModInstaller.exe on the maintainer's Windows build
-// VM and publishes GitHub releases.
+// machine and publishes GitHub releases.
 //   push to main     -> stable release vX.Y, marked Latest (X from VERSION; every stable bumps Y)
 //   push to release  -> pre-release vX.Y-betaN (Y = the next stable); updaters
 //                       ignore it, releases/latest skips pre-releases
 // Nothing is built when only non-shipping files (ticker.txt, docs) changed.
 // Builds started by branch indexing never publish.
-// To build it yourself, see build.bat / build.sh.
+// The build tooling lives in a private companion repo; you don't need any of
+// this to build the installer yourself -- see build.bat / build.sh.
 pipeline {
     agent any
     options {
@@ -16,6 +17,10 @@ pipeline {
     stages {
         stage('Build and release') {
             steps {
+                dir('.ci-build') {
+                    git url: 'https://github.com/OBLASTWAR/civ5-mod-installer-build.git',
+                        credentialsId: 'OBLASTWAR_GITHUB_LOGIN', branch: 'main'
+                }
                 script {
                     def publish = !currentBuild.getBuildCauses('jenkins.branch.BranchEventCause').isEmpty() ||
                                   !currentBuild.getBuildCauses('hudson.model.Cause$UserIdCause').isEmpty()
@@ -23,17 +28,7 @@ pipeline {
                     withCredentials([usernamePassword(credentialsId: 'OBLASTWAR_GITHUB_LOGIN',
                                          usernameVariable: 'GH_USER', passwordVariable: 'GITHUB_TOKEN'),
                                      file(credentialsId: 'civ5-installer-beat-mp3', variable: 'BEAT_MP3')]) {
-                        sh """
-                            set -eu
-                            ov="\$(mktemp -d)"
-                            trap 'rm -rf "\$ov"' EXIT
-                            cp "\$BEAT_MP3" "\$ov/beat.mp3"
-                            ci-release --repo OBLASTWAR/civ5-mod-installer --kind ${kind} \\
-                                --title 'Civ V Mod Installer' --ci-script ci/winbuild.sh \\
-                                --asset CivVModInstaller.exe --asset civ5-mod --asset version.txt \\
-                                --exclude '*.md' --exclude Jenkinsfile --exclude ticker.txt --exclude .gitignore \\
-                                --overlay "\$ov" --keep-betas 1 ${publish ? '--publish' : ''}
-                        """
+                        sh "bash .ci-build/jenkins.sh ${kind} ${publish}"
                     }
                 }
             }
