@@ -7,3 +7,6 @@ beat.mp3
 
 # Python bytecode from running linux/civ5-mod out of a checkout.
 __pycache__/
+
+# Local Claude Code notes.
+CLAUDE.md
