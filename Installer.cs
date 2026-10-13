@@ -34,6 +34,7 @@ using System.Net.Http;
 using System.Reflection;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.RegularExpressions;
 using System.Windows.Forms;
 using Microsoft.Win32;
 
@@ -162,26 +163,40 @@ namespace KekModInstaller
             }
         }
 
-        // System.Version requires at least a major.minor pair -- "1" alone
-        // fails to parse where "1.0" doesn't, so pad single-component
-        // versions before comparing. Falls back to a plain string-inequality
-        // check if either side isn't a well-formed dotted-number version, so
-        // a hand-typed installer_version.txt typo still surfaces as "some
-        // update is available" rather than silently hiding the button.
+        // Release versions as Jenkins stamps them: "2.6", or "2.6-beta1" for
+        // a pre-release (the leading "v" of a tag is tolerated).
+        private static readonly Regex ReleaseVersion = new Regex(@"^v?(\d+(?:\.\d+)*)(?:-beta(\d+))?$", RegexOptions.IgnoreCase);
+
+        // A beta sorts below its own stable (2.6-beta1 < 2.6) and above the
+        // previous stable, so a beta build doesn't offer to "update" back to
+        // the last stable. Anything else -- e.g. a local "dev" build -- falls
+        // back to "different means newer", so it always offers the release.
         public static bool IsNewerVersion(string remote, string local)
         {
-            Version remoteVersion, localVersion;
-            if (Version.TryParse(PadVersion(remote), out remoteVersion)
-                && Version.TryParse(PadVersion(local), out localVersion))
+            Match r = ReleaseVersion.Match(remote.Trim());
+            Match l = ReleaseVersion.Match(local.Trim());
+            if (!r.Success || !l.Success)
             {
-                return remoteVersion > localVersion;
+                return !string.Equals(remote, local, StringComparison.OrdinalIgnoreCase);
             }
-            return !string.Equals(remote, local, StringComparison.OrdinalIgnoreCase);
-        }
-
-        private static string PadVersion(string v)
-        {
-            return v.IndexOf('.') < 0 ? v + ".0" : v;
+            int[] rn = r.Groups[1].Value.Split('.').Select(int.Parse).ToArray();
+            int[] ln = l.Groups[1].Value.Split('.').Select(int.Parse).ToArray();
+            for (int i = 0; i < Math.Max(rn.Length, ln.Length); i++)
+            {
+                int a = i < rn.Length ? rn[i] : 0;
+                int b = i < ln.Length ? ln[i] : 0;
+                if (a != b)
+                {
+                    return a > b;
+                }
+            }
+            bool rBeta = r.Groups[2].Success;
+            bool lBeta = l.Groups[2].Success;
+            if (rBeta != lBeta)
+            {
+                return lBeta; // the stable one is newer
+            }
+            return rBeta && int.Parse(r.Groups[2].Value) > int.Parse(l.Groups[2].Value);
         }
 
         // Downloads the latest release's CivVModInstaller.exe -- always that
@@ -194,18 +209,30 @@ namespace KekModInstaller
         // downloads the new exe to %TEMP%, writes a .bat that waits a couple
         // seconds for this process to exit, copies the new exe over the old
         // one, relaunches it, then deletes itself. Caller must exit the app
-        // (Application.Exit) right after this returns.
-        public static void DownloadAndApplySelfUpdate()
+        // (Application.Exit) right after this returns. Runs on a background
+        // worker (MainForm.BtnUpdate_Click); progress gets 0-100.
+        public static void DownloadAndApplySelfUpdate(Action<int> progress)
         {
             string exePath = Assembly.GetExecutingAssembly().Location;
             string url = LatestReleaseUrl + "CivVModInstaller.exe";
 
             string newExePath = Path.Combine(Path.GetTempPath(), "kekmod_installer_update_" + Guid.NewGuid().ToString("N") + ".exe");
-            using (var client = new HttpClient())
+            // One retry: a dropped connection shouldn't mean a failed update.
+            for (int attempt = 1; ; attempt++)
             {
-                client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                byte[] data = client.GetByteArrayAsync(url).GetAwaiter().GetResult();
-                File.WriteAllBytes(newExePath, data);
+                try
+                {
+                    DownloadTo(url, newExePath, progress);
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    if (attempt >= 2 || !(ex is HttpRequestException || ex is IOException || ex is System.Threading.Tasks.TaskCanceledException))
+                    {
+                        throw;
+                    }
+                    System.Threading.Thread.Sleep(2000);
+                }
             }
 
             // "ping -n 3" instead of "timeout" -- timeout needs an attached
@@ -229,6 +256,48 @@ namespace KekModInstaller
             psi.CreateNoWindow = true;
             psi.WindowStyle = ProcessWindowStyle.Hidden;
             Process.Start(psi);
+        }
+
+        private static void DownloadTo(string url, string path, Action<int> progress)
+        {
+            using (var client = new HttpClient())
+            {
+                client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
+                using (HttpResponseMessage response = client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult())
+                {
+                    response.EnsureSuccessStatusCode();
+                    long total = response.Content.Headers.ContentLength ?? 0;
+                    using (Stream input = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
+                    using (FileStream output = File.Create(path))
+                    {
+                        var buffer = new byte[81920];
+                        long done = 0;
+                        int read;
+                        while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
+                        {
+                            output.Write(buffer, 0, read);
+                            done += read;
+                            if (total > 0)
+                            {
+                                progress((int)(done * 100 / total));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // HttpRequestException's own message is just "An error occurred
+        // while sending the request"; the useful part (DNS, TLS, connection
+        // reset...) is in the innermost exception.
+        public static string DescribeException(Exception ex)
+        {
+            Exception inner = ex;
+            while (inner.InnerException != null)
+            {
+                inner = inner.InnerException;
+            }
+            return inner == ex ? ex.Message : ex.Message + " (" + inner.Message + ")";
         }
     }
 
@@ -464,6 +533,7 @@ namespace KekModInstaller
         private BackgroundWorker _statusWorker;
         private BackgroundWorker _uninstallWorker;
         private BackgroundWorker _resetWorker;
+        private BackgroundWorker _selfUpdateWorker;
         private Timer _tickerTimer;
         private Timer _cursorTimer;
         private Timer _recheckTimer;
@@ -869,6 +939,12 @@ namespace KekModInstaller
             _resetWorker.DoWork += ResetWorker_DoWork;
             _resetWorker.ProgressChanged += Worker_ProgressChanged;
             _resetWorker.RunWorkerCompleted += ResetWorker_RunWorkerCompleted;
+
+            _selfUpdateWorker = new BackgroundWorker();
+            _selfUpdateWorker.WorkerReportsProgress = true;
+            _selfUpdateWorker.DoWork += SelfUpdateWorker_DoWork;
+            _selfUpdateWorker.ProgressChanged += Worker_ProgressChanged;
+            _selfUpdateWorker.RunWorkerCompleted += SelfUpdateWorker_RunWorkerCompleted;
 
             _statusWorker = new BackgroundWorker();
             _statusWorker.DoWork += StatusWorker_DoWork;
@@ -1539,25 +1615,47 @@ namespace KekModInstaller
         // manages to replace itself. Blocked mid-install/uninstall so the
         // helper batch script's file swap can't race a Worker still reading
         // from disk.
+        // On a background worker so the window doesn't freeze for the
+        // whole download; the progress bar shows how far it's got.
         private void BtnUpdate_Click(object sender, EventArgs e)
         {
-            if (_worker.IsBusy || _uninstallWorker.IsBusy || _resetWorker.IsBusy)
+            // Not the background status check: a click during one of those
+            // shouldn't be silently ignored.
+            if (_worker.IsBusy || _uninstallWorker.IsBusy || _resetWorker.IsBusy || _euiWorker.IsBusy
+                || _lobbyWorker.IsBusy || _mapWorker.IsBusy || _selfUpdateWorker.IsBusy)
             {
                 return;
             }
+            _btnUpdate.Enabled = false;
+            SetControlsEnabled(false);
+            _progress.Value = 0;
+            SetStatus("DOWNLOADING UPDATE v" + _latestInstallerVersion + "...");
+            _selfUpdateWorker.RunWorkerAsync();
+        }
 
-            try
+        private void SelfUpdateWorker_DoWork(object sender, DoWorkEventArgs e)
+        {
+            var worker = (BackgroundWorker)sender;
+            InstallerCore.DownloadAndApplySelfUpdate(p => worker.ReportProgress(p));
+        }
+
+        private void SelfUpdateWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
+        {
+            if (e.Error == null)
             {
-                _btnUpdate.Enabled = false;
-                SetStatus("DOWNLOADING UPDATE...");
-                InstallerCore.DownloadAndApplySelfUpdate();
-                Application.Exit();
+                Application.Exit(); // the helper batch swaps the exe and relaunches
+                return;
             }
-            catch (Exception ex)
-            {
-                _btnUpdate.Enabled = true;
-                SetStatus("UPDATE FAILED: " + ex.Message);
-            }
+            _btnUpdate.Enabled = true;
+            SetControlsEnabled(true);
+            _progress.Value = 0;
+            SetStatus("UPDATE FAILED: " + InstallerCore.DescribeException(e.Error));
+        }
+
+        private bool AnyWorkerBusy()
+        {
+            return _statusWorker.IsBusy || _worker.IsBusy || _uninstallWorker.IsBusy || _resetWorker.IsBusy
+                || _euiWorker.IsBusy || _lobbyWorker.IsBusy || _mapWorker.IsBusy || _selfUpdateWorker.IsBusy;
         }
 
         private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
@@ -1573,8 +1671,7 @@ namespace KekModInstaller
         // mid-install. The next tick catches up.
         private void RecheckTimer_Tick(object sender, EventArgs e)
         {
-            if (_statusWorker.IsBusy || _worker.IsBusy || _uninstallWorker.IsBusy || _resetWorker.IsBusy
-                || _euiWorker.IsBusy || _lobbyWorker.IsBusy || _mapWorker.IsBusy)
+            if (AnyWorkerBusy())
             {
                 return;
             }

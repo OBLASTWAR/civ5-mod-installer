@@ -167,8 +167,54 @@ def http_bytes(url, accept=None, timeout=60):
         return r.read()
 
 
-def github_api(path):
+# Every GitHub API call goes through github_api, gated by the repo's public
+# Atom feed (same as GitHubApi in GitHubModSource.cs): anonymous API calls are
+# capped at 60/hour per IP, 304s included, while github.com's releases.atom /
+# commits.atom are free. Each answer is cached with a fingerprint of the
+# matching feed and only re-fetched when the feed changes -- that's what lets
+# the TUI re-check everything every 30 seconds. Also re-fetched for 5 minutes
+# after a feed change (assets land after the release is created) and at least
+# every 30 minutes.
+_API_CACHE = {}  # path -> (data, feed fingerprint, fetched_at, feed_changed_at)
+_API_CACHE_LOCK = threading.Lock()
+API_MAX_AGE = 30 * 60
+API_SETTLE = 5 * 60
+
+
+def _feed_for(path):
+    m = re.match(r"^repos/([^/]+)/([^/]+)/(releases|contents)\b", path)
+    if not m:
+        return None
+    return "https://github.com/%s/%s/%s" % (m.group(1), m.group(2),
+                                            "releases.atom" if m.group(3) == "releases" else "commits.atom")
+
+
+def _feed_fingerprint(url):
+    try:
+        xml = http_bytes(url, timeout=15).decode("utf-8", "replace")
+    except InstallerError:
+        return None
+    entries = re.findall(r"<entry>.*?<id>(.*?)</id>.*?<updated>(.*?)</updated>", xml, re.S)
+    return "\n".join("%s|%s" % e for e in entries) or None
+
+
+def github_api(path, feed=None):
+    feed = feed or _feed_for(path)
+    with _API_CACHE_LOCK:
+        cached = _API_CACHE.get(path)
+    now = time.time()
+    fp = _feed_fingerprint(feed) if feed else None
+    changed_at = 0
+    if cached:
+        data, old_fp, fetched_at, changed_at = cached
+        if fp is not None and fp != old_fp:
+            changed_at = now
+        if (now - fetched_at < API_MAX_AGE and now - changed_at >= API_SETTLE
+                and (fp is None or fp == old_fp)):
+            return json.loads(data.decode("utf-8"))
     data = http_bytes("https://api.github.com/" + path, accept="application/vnd.github+json")
+    with _API_CACHE_LOCK:
+        _API_CACHE[path] = (data, fp if fp is not None else (cached[1] if cached else None), now, changed_at)
     return json.loads(data.decode("utf-8"))
 
 
@@ -213,11 +259,25 @@ def same_map_version(a, b):
     return bool(a and b) and a.lstrip("vV").lower() == b.lstrip("vV").lower()
 
 
+def _installer_version_key(v):
+    """"2.6" / "v2.6-beta1" -> comparable key, None if neither shape. A beta
+    sorts below its own stable (2.6-beta1 < 2.6) and above the previous one."""
+    m = re.match(r"^v?(\d+(?:\.\d+)*)(?:-beta(\d+))?$", v.strip(), re.I)
+    if not m:
+        return None
+    nums = [int(x) for x in m.group(1).split(".")]
+    while len(nums) > 1 and nums[-1] == 0:
+        nums.pop()
+    return (tuple(nums), 0 if m.group(2) else 1, int(m.group(2) or 0))
+
+
 def is_newer_version(remote, local):
-    # Plain dotted numbers compare numerically; anything else falls back to
-    # "different means newer" like InstallerCore.IsNewerVersion.
-    if re.match(r"^\d+(\.\d+)*$", remote) and re.match(r"^\d+(\.\d+)*$", local):
-        return version_key(remote) > version_key(local)
+    # Release versions (with or without -betaN) compare properly; anything
+    # else, e.g. a "dev" checkout, falls back to "different means newer",
+    # like InstallerCore.IsNewerVersion.
+    rk, lk = _installer_version_key(remote), _installer_version_key(local)
+    if rk is not None and lk is not None:
+        return rk > lk
     return remote.lower() != local.lower()
 
 
@@ -923,7 +983,10 @@ class WeeveeMapExtra:
         return "v" + max(vers, key=lambda v: [int(x) if x.isdigit() else 0 for x in v.split(".")])
 
     def _listing(self):
-        return [e for e in github_api("repositories/%d/contents/" % self.REPO_ID)
+        # Addressed by id to survive renames; the feed needs a name, and
+        # github.com redirects a renamed repo's old one.
+        return [e for e in github_api("repositories/%d/contents/" % self.REPO_ID,
+                                      feed="https://github.com/brunotho/Weevee-v11.0.16-Map/commits.atom")
                 if e.get("download_url") and e.get("type", "file") == "file" and e["name"].lower().endswith(".lua")]
 
     def _version_from(self, files):
@@ -1974,13 +2037,18 @@ def fetch_ticker():
 
 
 def fetch_latest_self():
-    """(version, script bytes) of the latest release's copy."""
-    try:
-        data = http_bytes(LATEST_RELEASE + "civ5-mod", timeout=30)
-    except InstallerError as e:
-        if "404" in str(e):
-            raise InstallerError("No Linux installer is published yet.") from None
-        raise
+    """(version, script bytes) of the latest release's copy. Retried once:
+    a dropped connection shouldn't mean a failed update."""
+    for attempt in (1, 2):
+        try:
+            data = http_bytes(LATEST_RELEASE + "civ5-mod", timeout=30)
+            break
+        except InstallerError as e:
+            if "404" in str(e):
+                raise InstallerError("No Linux installer is published yet.") from None
+            if attempt == 2:
+                raise
+            time.sleep(2)
     m = re.search(rb'^VERSION = "([^"]+)"', data, re.M)
     if not m:
         raise InstallerError("Couldn't read the version of the installer on GitHub.")
@@ -2669,6 +2737,8 @@ class Tui:
         self.focus = "mod:%s:install" % MODS[0].id
         self.buttons = []
         self.frame = 0
+        self.fetching = False
+        self.last_fetch = 0.0
 
     # ── setup ──
     def main(self, scr):
@@ -2688,6 +2758,7 @@ class Tui:
         self.boot()
         while True:
             self.pump()
+            self.maybe_recheck()
             self.draw()
             k = scr.getch()
             if k == -1:
@@ -2739,11 +2810,35 @@ class Tui:
         self.refresh_state()
         self.log("Fetching release lists...")
         self.status = "CONNECTING TO GITHUB"
-        threading.Thread(target=self._fetch_thread, daemon=True).start()
+        self.start_fetch()
         self.civ_running_dialog()
         self.startup_warnings()
 
+    RECHECK_SECONDS = 30
+
+    def start_fetch(self):
+        self.fetching = True
+        self.last_fetch = time.time()
+        threading.Thread(target=self._fetch_thread, daemon=True).start()
+
+    def maybe_recheck(self):
+        """Re-runs the startup check every RECHECK_SECONDS, so updates and
+        hand-made changes in the game folder show up without a restart.
+        Skipped while something is installing (that refreshes on its own)."""
+        if self.fetching or self.busy or time.time() - self.last_fetch < self.RECHECK_SECONDS:
+            return
+        self.start_fetch()
+
     def _fetch_thread(self):
+        # Always report back, or self.fetching would stay set and stop
+        # every later recheck.
+        try:
+            payload = self._fetch_all()
+        except Exception:
+            payload = ({}, None, None)
+        self.q.put(("fetched", payload))
+
+    def _fetch_all(self):
         rel = {}
         for mod in MODS:
             try:
@@ -2763,7 +2858,7 @@ class Tui:
                 latest = fetch_latest_self()[0]
             except Exception:
                 pass
-        self.q.put(("fetched", (rel, ticker, latest)))
+        return rel, ticker, latest
 
     # ── worker plumbing ──
     def log(self, msg):
@@ -2793,19 +2888,26 @@ class Tui:
                 self.refresh_state()
             elif kind == "fetched":
                 rel, ticker, latest = payload
+                first = not self.releases_loaded
+                self.fetching = False
+                # Anything that failed this round keeps its previous answer.
+                for key, value in self.releases.items():
+                    rel.setdefault(key, value)
                 self.releases = rel
                 self.releases_loaded = True
                 if ticker:
                     self.ticker = ticker
-                if latest and is_newer_version(latest, VERSION):
+                if latest and is_newer_version(latest, VERSION) and latest != self.latest_self:
                     self.latest_self = latest
                     self.log("Installer update available: v%s (press U)." % latest)
-                missing = [m.name for m in MODS if m.id not in rel]
-                self.log("Release lists: %d/%d loaded%s." % (len(MODS) - len(missing), len(MODS),
-                         "" if not missing else " (offline for " + ", ".join(missing) + ")"))
+                if first:
+                    missing = [m.name for m in MODS if m.id not in rel]
+                    self.log("Release lists: %d/%d loaded%s." % (len(MODS) - len(missing), len(MODS),
+                             "" if not missing else " (offline for " + ", ".join(missing) + ")"))
+                    if not self.busy:
+                        self.status = "SYSTEM READY"
                 if not self.busy:
-                    self.status = "SYSTEM READY"
-                self.refresh_state()
+                    self.refresh_state()
 
     def start_job(self, status, fn):
         self.busy = True
