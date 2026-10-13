@@ -12,6 +12,8 @@ using System.Net;
 using System.Net.Http;
 using System.Runtime.Serialization;
 using System.Runtime.Serialization.Json;
+using System.Text;
+using System.Text.RegularExpressions;
 
 namespace KekModInstaller
 {
@@ -167,58 +169,37 @@ namespace KekModInstaller
         public static List<GhRelease> FetchReleases(string owner, string repo)
         {
             string url = "https://api.github.com/repos/" + owner + "/" + repo + "/releases?per_page=50";
-            using (var client = new HttpClient())
+            byte[] body = GitHubApi.Get(url, response => new InvalidOperationException(DescribeError(response, owner, repo)));
+            var serializer = new DataContractJsonSerializer(typeof(List<GhRelease>));
+            using (var stream = new MemoryStream(body))
             {
-                client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                client.DefaultRequestHeaders.Add("Accept", "application/vnd.github+json");
-
-                HttpResponseMessage response = client.GetAsync(url).GetAwaiter().GetResult();
-                if (!response.IsSuccessStatusCode)
+                var releases = (List<GhRelease>)serializer.ReadObject(stream);
+                if (releases == null || releases.Count == 0)
                 {
-                    throw new InvalidOperationException(DescribeError(response, owner, repo));
+                    throw new InvalidOperationException(
+                        "No releases found for " + owner + "/" + repo + ". Has anything been published yet?");
                 }
-
-                byte[] body = response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
-                var serializer = new DataContractJsonSerializer(typeof(List<GhRelease>));
-                using (var stream = new MemoryStream(body))
-                {
-                    var releases = (List<GhRelease>)serializer.ReadObject(stream);
-                    if (releases == null || releases.Count == 0)
-                    {
-                        throw new InvalidOperationException(
-                            "No releases found for " + owner + "/" + repo + ". Has anything been published yet?");
-                    }
-                    return releases;
-                }
+                return releases;
             }
         }
 
         public static GhRelease FetchLatestRelease(string owner, string repo)
         {
             string url = "https://api.github.com/repos/" + owner + "/" + repo + "/releases/latest";
-            using (var client = new HttpClient())
+            byte[] body = GitHubApi.Get(url, response =>
             {
-                client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                client.DefaultRequestHeaders.Add("Accept", "application/vnd.github+json");
-
-                HttpResponseMessage response = client.GetAsync(url).GetAwaiter().GetResult();
-                if (!response.IsSuccessStatusCode)
+                if (response.StatusCode == HttpStatusCode.NotFound)
                 {
-                    if (response.StatusCode == HttpStatusCode.NotFound)
-                    {
-                        throw new InvalidOperationException(
-                            "No \"Latest\" release found for " + owner + "/" + repo
-                            + ". Every release may be marked as a prerelease or draft.");
-                    }
-                    throw new InvalidOperationException(DescribeError(response, owner, repo));
+                    return new InvalidOperationException(
+                        "No \"Latest\" release found for " + owner + "/" + repo
+                        + ". Every release may be marked as a prerelease or draft.");
                 }
-
-                byte[] body = response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
-                var serializer = new DataContractJsonSerializer(typeof(GhRelease));
-                using (var stream = new MemoryStream(body))
-                {
-                    return (GhRelease)serializer.ReadObject(stream);
-                }
+                return new InvalidOperationException(DescribeError(response, owner, repo));
+            });
+            var serializer = new DataContractJsonSerializer(typeof(GhRelease));
+            using (var stream = new MemoryStream(body))
+            {
+                return (GhRelease)serializer.ReadObject(stream);
             }
         }
 
@@ -265,6 +246,143 @@ namespace KekModInstaller
                 File.WriteAllBytes(tempPath, data);
             }
             return tempPath;
+        }
+    }
+
+    // Every GitHub REST API GET goes through here, gated by the repo's public
+    // Atom feed. Anonymous API calls are capped at 60/hour per IP -- 304s
+    // included -- while github.com's releases.atom / commits.atom pages are
+    // free, so each URL's last API answer is cached with a fingerprint of the
+    // matching feed, and the API is only asked again when the feed changes.
+    // That's what lets MainForm re-run the full status check every 30
+    // seconds. Feeds: .../releases* -> releases.atom (includes pre-releases),
+    // .../contents/* -> commits.atom (default branch); or pass one explicitly.
+    internal static class GitHubApi
+    {
+        // Re-ask the API this long after the last real answer even if the
+        // feed looks unchanged (a missed or unreadable feed can't hide an
+        // update forever)...
+        private static readonly TimeSpan MaxAge = TimeSpan.FromMinutes(30);
+        // ...and keep asking for this long after the feed changes: Jenkins
+        // creates a release before uploading its assets, and the feed
+        // doesn't change again when they land.
+        private static readonly TimeSpan SettleTime = TimeSpan.FromMinutes(5);
+
+        private static readonly Regex ReposUrl = new Regex(@"^https://api\.github\.com/repos/([^/]+)/([^/]+)/(releases|contents)\b");
+        private static readonly Regex FeedEntry = new Regex(@"<entry>.*?<id>(.*?)</id>.*?<updated>(.*?)</updated>", RegexOptions.Singleline);
+
+        private class Entry
+        {
+            public byte[] Body;
+            public string Feed;          // fingerprint when Body was fetched
+            public DateTime FetchedUtc;
+            public DateTime FeedChangedUtc;
+        }
+
+        private static readonly Dictionary<string, Entry> Cache = new Dictionary<string, Entry>();
+        private static readonly object CacheLock = new object();
+
+        // fail turns a non-success response into the exception to throw;
+        // null throws a plain HttpRequestException with the status code.
+        public static byte[] Get(string url, Func<HttpResponseMessage, Exception> fail)
+        {
+            return Get(url, fail, null);
+        }
+
+        public static byte[] Get(string url, Func<HttpResponseMessage, Exception> fail, string feedUrl)
+        {
+            if (feedUrl == null)
+            {
+                Match m = ReposUrl.Match(url);
+                if (m.Success)
+                {
+                    feedUrl = "https://github.com/" + m.Groups[1].Value + "/" + m.Groups[2].Value
+                        + (m.Groups[3].Value == "releases" ? "/releases.atom" : "/commits.atom");
+                }
+            }
+
+            Entry cached;
+            lock (CacheLock)
+            {
+                Cache.TryGetValue(url, out cached);
+            }
+
+            DateTime now = DateTime.UtcNow;
+            string feed = feedUrl == null ? null : TryFetchFeedFingerprint(feedUrl);
+            DateTime feedChangedUtc = DateTime.MinValue;
+            if (cached != null)
+            {
+                feedChangedUtc = cached.FeedChangedUtc;
+                if (feed != null && feed != cached.Feed)
+                {
+                    feedChangedUtc = now;
+                }
+                bool fresh = now - cached.FetchedUtc < MaxAge;
+                bool settled = now - feedChangedUtc >= SettleTime;
+                // Unreadable feed: trust the cache until it's MaxAge old.
+                if (fresh && settled && (feed == null || feed == cached.Feed))
+                {
+                    return cached.Body;
+                }
+            }
+
+            byte[] body = FetchApi(url, fail);
+            lock (CacheLock)
+            {
+                Cache[url] = new Entry
+                {
+                    Body = body,
+                    Feed = feed ?? (cached != null ? cached.Feed : null),
+                    FetchedUtc = now,
+                    FeedChangedUtc = feedChangedUtc,
+                };
+            }
+            return body;
+        }
+
+        // null if the feed couldn't be read or had no entries.
+        private static string TryFetchFeedFingerprint(string feedUrl)
+        {
+            try
+            {
+                using (var client = new HttpClient())
+                {
+                    client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
+                    string xml = client.GetStringAsync(feedUrl).GetAwaiter().GetResult();
+                    var sb = new StringBuilder();
+                    foreach (Match m in FeedEntry.Matches(xml))
+                    {
+                        sb.Append(m.Groups[1].Value).Append('|').Append(m.Groups[2].Value).Append('\n');
+                    }
+                    return sb.Length == 0 ? null : sb.ToString();
+                }
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        private static byte[] FetchApi(string url, Func<HttpResponseMessage, Exception> fail)
+        {
+            using (var client = new HttpClient())
+            {
+                client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
+                client.DefaultRequestHeaders.Add("Accept", "application/vnd.github+json");
+                using (HttpResponseMessage response = client.GetAsync(url).GetAwaiter().GetResult())
+                {
+                    if (!response.IsSuccessStatusCode)
+                    {
+                        if (fail != null)
+                        {
+                            throw fail(response);
+                        }
+                        throw new HttpRequestException("GitHub returned " + (int)response.StatusCode + " "
+                            + response.ReasonPhrase + " for " + url + ".");
+                    }
+                    return response.Content.ReadAsByteArrayAsync().GetAwaiter().GetResult();
+                }
+            }
         }
     }
 }

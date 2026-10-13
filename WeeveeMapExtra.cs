@@ -226,17 +226,14 @@ namespace KekModInstaller
         private static List<GhContentsEntry> FetchDirectoryListing()
         {
             string url = "https://api.github.com/repositories/" + RepoId + "/contents/";
-            using (var client = new HttpClient())
+            // The API is addressed by id to survive renames; the feed needs a
+            // name, and github.com redirects a renamed repo's old one.
+            byte[] body = GitHubApi.Get(url, null, "https://github.com/brunotho/Weevee-v11.0.16-Map/commits.atom");
+            var serializer = new DataContractJsonSerializer(typeof(List<GhContentsEntry>));
+            using (var stream = new MemoryStream(body))
             {
-                client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                client.DefaultRequestHeaders.Add("Accept", "application/vnd.github+json");
-                byte[] body = client.GetByteArrayAsync(url).GetAwaiter().GetResult();
-                var serializer = new DataContractJsonSerializer(typeof(List<GhContentsEntry>));
-                using (var stream = new MemoryStream(body))
-                {
-                    var entries = (List<GhContentsEntry>)serializer.ReadObject(stream);
-                    return entries ?? new List<GhContentsEntry>();
-                }
+                var entries = (List<GhContentsEntry>)serializer.ReadObject(stream);
+                return entries ?? new List<GhContentsEntry>();
             }
         }
 

@@ -462,6 +462,7 @@ namespace KekModInstaller
         private BackgroundWorker _resetWorker;
         private Timer _tickerTimer;
         private Timer _cursorTimer;
+        private Timer _recheckTimer;
         private ToolTip _tooltip;
         private bool _muted;
         private string _statusBase = "SYSTEM READY";
@@ -876,7 +877,15 @@ namespace KekModInstaller
             _statusWorker = new BackgroundWorker();
             _statusWorker.DoWork += StatusWorker_DoWork;
             _statusWorker.RunWorkerCompleted += StatusWorker_RunWorkerCompleted;
-            _statusWorker.RunWorkerAsync(); // fetches every mod's release list once -- see StatusWorker_DoWork
+            _statusWorker.RunWorkerAsync(); // see StatusWorker_DoWork
+
+            // Re-runs the startup check (updates + local install state) every
+            // 30s, so an UPDATE shows up, or a hand-made change in the Civ V
+            // folders is picked up, without restarting the installer.
+            _recheckTimer = new Timer();
+            _recheckTimer.Interval = 30000;
+            _recheckTimer.Tick += RecheckTimer_Tick;
+            _recheckTimer.Start();
 
             _tickerTimer = new Timer();
             _tickerTimer.Interval = 30;
@@ -1557,18 +1566,39 @@ namespace KekModInstaller
 
         private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
         {
+            _recheckTimer.Stop();
             _tickerTimer.Stop();
             _cursorTimer.Stop();
             RetroAudio.Stop();
         }
 
-        // Runs ONCE at startup: every mod's release list (the only
-        // GitHub-API-rate-limited part of this), plus the ticker and
-        // self-update check. Nothing else ever re-triggers this -- see
-        // RefreshLocalState for what runs instead when the player switches
-        // mods, toggles beta, or finishes an install/uninstall/EUI change.
+        // Skipped while anything is installing/removing: RefreshLocalState
+        // resets button enabled-states, which would re-enable buttons
+        // mid-install. The next tick catches up.
+        private void RecheckTimer_Tick(object sender, EventArgs e)
+        {
+            if (_statusWorker.IsBusy || _worker.IsBusy || _uninstallWorker.IsBusy || _resetWorker.IsBusy
+                || _euiWorker.IsBusy || _lobbyWorker.IsBusy || _mapWorker.IsBusy)
+            {
+                return;
+            }
+            _statusWorker.RunWorkerAsync();
+        }
+
+        // Runs at startup and then every 30s (RecheckTimer_Tick): every mod's
+        // release list, the ticker, self-update, lobby patch, EUI and bonus
+        // map checks. GitHub API calls go through GitHubApi's ETag cache, so
+        // an unchanged answer costs nothing against the rate limit. A check
+        // that fails keeps its previous result (StatusWorker_RunWorkerCompleted)
+        // rather than hiding an UPDATE over a network blip. RefreshLocalState
+        // is what runs on its own when the player switches mods, toggles
+        // beta, or finishes an install/uninstall/EUI change.
         private void StatusWorker_DoWork(object sender, DoWorkEventArgs e)
         {
+            // Checks that errored this round, by name -- their previous
+            // results are kept.
+            var failed = new HashSet<string>();
+
             var releasesByModId = new Dictionary<string, List<ModRelease>>();
             foreach (ModDefinition mod in ModRegistry.All)
             {
@@ -1603,6 +1633,7 @@ namespace KekModInstaller
             }
             catch (Exception)
             {
+                failed.Add("lobby");
             }
 
             // Best-effort EUI update check, installed variant only (rate
@@ -1620,6 +1651,7 @@ namespace KekModInstaller
             }
             catch (Exception)
             {
+                failed.Add("eui");
             }
 
             // Bonus maps: only the installed ones, to keep the startup
@@ -1653,40 +1685,72 @@ namespace KekModInstaller
                 }
             }
 
-            e.Result = new object[] { releasesByModId, tickerText, latestInstallerVersion, lobbyLatestTag, latestExtraVersions, euiLatestTag };
+            e.Result = new object[] { releasesByModId, tickerText, latestInstallerVersion, lobbyLatestTag, latestExtraVersions, euiLatestTag, failed };
         }
 
         private void StatusWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
         {
             if (e.Error != null)
             {
-                return; // leave the "checking..." placeholder rather than alarm the user
+                RefreshLocalState(); // network results unknown -- local state still rechecks
+                return;
             }
             var result = (object[])e.Result;
-            _releasesByModId = (Dictionary<string, List<ModRelease>>)result[0];
+            var failed = (HashSet<string>)result[6];
 
+            // A mod whose release list failed this round keeps its old one.
+            var releasesByModId = (Dictionary<string, List<ModRelease>>)result[0];
+            foreach (KeyValuePair<string, List<ModRelease>> kv in _releasesByModId)
+            {
+                if (!releasesByModId.ContainsKey(kv.Key))
+                {
+                    releasesByModId[kv.Key] = kv.Value;
+                }
+            }
+            _releasesByModId = releasesByModId;
+
+            // Only on a change: setting it restarts the scroll from the right.
             string tickerText = (string)result[1];
-            if (tickerText != null)
+            if (tickerText != null && tickerText != _lblTicker.Text)
             {
                 _lblTicker.Text = tickerText;
                 _lblTicker.Location = new Point(_tickerViewport.Width, 1); // restart the scroll cleanly
             }
 
+            // null = check failed: keep the button as it was.
             string latestInstallerVersion = (string)result[2];
-            if (latestInstallerVersion != null
-                && InstallerCore.IsNewerVersion(latestInstallerVersion, InstallerCore.GetInstallerVersion()))
+            if (latestInstallerVersion != null)
             {
-                _latestInstallerVersion = latestInstallerVersion;
-                _btnUpdate.Visible = true;
-            }
-            else
-            {
-                _btnUpdate.Visible = false;
+                if (InstallerCore.IsNewerVersion(latestInstallerVersion, InstallerCore.GetInstallerVersion()))
+                {
+                    _latestInstallerVersion = latestInstallerVersion;
+                    _btnUpdate.Visible = true;
+                }
+                else
+                {
+                    _btnUpdate.Visible = false;
+                }
             }
 
-            _lobbyLatestTag = (string)result[3];
-            _latestExtraVersionByExtraId = (Dictionary<string, string>)result[4];
-            _euiLatestTag = (string)result[5];
+            if (!failed.Contains("lobby"))
+            {
+                _lobbyLatestTag = (string)result[3];
+            }
+            // Bonus maps that failed (or aren't installed) keep their old entry;
+            // only installed ones are ever compared, see DetectInstalledState.
+            var latestExtraVersions = (Dictionary<string, string>)result[4];
+            foreach (KeyValuePair<string, string> kv in _latestExtraVersionByExtraId)
+            {
+                if (!latestExtraVersions.ContainsKey(kv.Key))
+                {
+                    latestExtraVersions[kv.Key] = kv.Value;
+                }
+            }
+            _latestExtraVersionByExtraId = latestExtraVersions;
+            if (!failed.Contains("eui"))
+            {
+                _euiLatestTag = (string)result[5];
+            }
 
             RefreshLocalState();
         }

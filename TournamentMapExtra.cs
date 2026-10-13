@@ -167,16 +167,11 @@ namespace KekModInstaller
         {
             string url = "https://api.github.com/repos/" + RepoOwner + "/" + RepoName + "/contents/" + MapsPath;
             List<GhContentsEntry> entries;
-            using (var client = new HttpClient())
+            byte[] body = GitHubApi.Get(url, null);
+            var serializer = new DataContractJsonSerializer(typeof(List<GhContentsEntry>));
+            using (var stream = new MemoryStream(body))
             {
-                client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                client.DefaultRequestHeaders.Add("Accept", "application/vnd.github+json");
-                byte[] body = client.GetByteArrayAsync(url).GetAwaiter().GetResult();
-                var serializer = new DataContractJsonSerializer(typeof(List<GhContentsEntry>));
-                using (var stream = new MemoryStream(body))
-                {
-                    entries = (List<GhContentsEntry>)serializer.ReadObject(stream);
-                }
+                entries = (List<GhContentsEntry>)serializer.ReadObject(stream);
             }
             if (entries == null)
             {
