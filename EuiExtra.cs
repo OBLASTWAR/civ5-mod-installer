@@ -119,16 +119,40 @@ namespace KekModInstaller
             return GitHubModSource.FetchLatestRelease(Owner, variant.Repo).TagName;
         }
 
-        // Downloads variant's latest release and installs it, removing any
-        // OTHER EUI folder first -- any "UI*" folder (see
+        // Every published release of variant's fork, newest first -- what
+        // its VERSION popup offers.
+        public static List<ModRelease> ListReleases(EuiVariant variant)
+        {
+            return GitHubModSource.FetchReleases(Owner, variant.Repo)
+                .Select(r => new ModRelease { Tag = r.TagName, Prerelease = r.Prerelease, Native = r })
+                .ToList();
+        }
+
+        // Downloads variant's release tagName (null: the latest) and installs
+        // it, removing any OTHER EUI folder first -- any "UI*" folder (see
         // DetectInstalledVariantId), not just the other known variant's
         // exact name, since only one is ever active at a time -- plus any
         // existing copy of this same variant. Nothing on disk changes until
         // the download has arrived and checked out.
-        public static void Install(string dlcRoot, EuiVariant variant, Action<string> log)
+        public static void Install(string dlcRoot, EuiVariant variant, string tagName, Action<string> log)
         {
-            log("Checking " + Owner + "/" + variant.Repo + " for the latest release...");
-            GhRelease release = GitHubModSource.FetchLatestRelease(Owner, variant.Repo);
+            GhRelease release;
+            if (tagName == null)
+            {
+                log("Checking " + Owner + "/" + variant.Repo + " for the latest release...");
+                release = GitHubModSource.FetchLatestRelease(Owner, variant.Repo);
+            }
+            else
+            {
+                log("Checking " + Owner + "/" + variant.Repo + " for release " + tagName + "...");
+                release = GitHubModSource.FetchReleases(Owner, variant.Repo).FirstOrDefault(
+                    r => string.Equals(r.TagName, tagName, StringComparison.OrdinalIgnoreCase));
+                if (release == null)
+                {
+                    throw new InvalidOperationException(
+                        "Release " + tagName + " no longer exists on GitHub. Pick another version.");
+                }
+            }
             string assetName = variant.FolderName + ".zip";
             GhAsset asset = release.Assets == null ? null : release.Assets.FirstOrDefault(
                 a => string.Equals(a.Name, assetName, StringComparison.OrdinalIgnoreCase));
@@ -136,7 +160,7 @@ namespace KekModInstaller
             {
                 throw new InvalidOperationException("Release " + release.TagName + " has no " + assetName + ".");
             }
-            log("Release: " + release.TagName);
+            log("Release: " + release.TagName + (tagName != null ? " [selected version]" : ""));
             log("Downloading " + asset.Name + "...");
             string tempZip = GitHubModSource.DownloadAsset(asset);
             try

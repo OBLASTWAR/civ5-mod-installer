@@ -8,7 +8,7 @@
 #   ./civ5-mod uninstall kekmod
 #   ./civ5-mod map snowve              install/update just a mod's bonus map
 #   ./civ5-mod versions kekmod         list published releases
-#   ./civ5-mod eui install [eui|xits]  / eui uninstall
+#   ./civ5-mod eui install [eui|xits] [--version TAG]  / eui uninstall
 #   ./civ5-mod lobby install | uninstall  civ5-lobby-patch (worldwide lobby list)
 #   ./civ5-mod verify                  checks + unrecognized mod folders
 #   ./civ5-mod clear-cache             shader caches + Civ V's cached DBs
@@ -1104,6 +1104,11 @@ EUI_MARKER = "kekmod-eui-version.txt"
 EUI_LATEST_KEY = "eui-latest"  # releases dict: latest tag of the installed variant's fork
 
 
+def eui_releases_key(variant):
+    """Where a variant's release list (its VERSION popup) sits in the releases dict."""
+    return "eui-releases:" + variant.id
+
+
 class EuiVariant:
     def __init__(self, id, name, folder, repo):
         self.id, self.name, self.folder, self.repo = id, name, folder, repo
@@ -1150,6 +1155,10 @@ def eui_latest_tag(variant):
     return GitHubSource(EUI_OWNER, variant.repo, False)._latest()["tag_name"]
 
 
+def eui_source(variant):
+    return GitHubSource(EUI_OWNER, variant.repo, False)
+
+
 def fetch_eui_latest(game, out):
     """Latest release tag of the INSTALLED variant's fork, into out."""
     if game is None or game.problem():
@@ -1162,14 +1171,24 @@ def fetch_eui_latest(game, out):
             pass
 
 
-def eui_install(game, variant, log, progress=lambda p: None):
-    log("Checking %s/%s for the latest release..." % (EUI_OWNER, variant.repo))
-    rel = GitHubSource(EUI_OWNER, variant.repo, False)._latest()
+def fetch_eui_releases(out):
+    """Both variants' release lists, for their VERSION popups, into out."""
+    for v in EUI_VARIANTS:
+        try:
+            out[eui_releases_key(v)] = eui_source(v).list_releases()
+        except Exception:
+            pass
+
+
+def eui_install(game, variant, tag, log, progress=lambda p: None):
+    """Installs release tag of variant's fork (None: the latest)."""
+    log("Checking %s/%s for %s..." % (EUI_OWNER, variant.repo, "release " + tag if tag else "the latest release"))
+    rel = eui_source(variant).resolve(tag, False).native
     asset_name = variant.folder + ".zip"
     asset = next((a for a in rel.get("assets") or [] if a["name"].lower() == asset_name.lower()), None)
     if asset is None:
         raise InstallerError("Release %s has no %s." % (rel["tag_name"], asset_name))
-    log("Release: " + rel["tag_name"])
+    log("Release: " + rel["tag_name"] + (" [selected version]" if tag else ""))
     log("Downloading %s..." % asset["name"])
     progress(10)
     with tempfile.TemporaryDirectory(prefix="civ5-mod-") as tmp:
@@ -2361,6 +2380,8 @@ class Cli:
         return 0 if all(ok for ok, _ in checks) else 1
 
     def cmd_versions(self):
+        if self.args.mod.lower() in ("eui", "xits", "eui_xits", "ui_bc1", "ui_bc1_xits", "eui xits"):
+            return self.eui_versions(eui_by_name(self.args.mod))
         mod = mod_by_name(self.args.mod)
         rels = mod.source.list_releases()
         beta = self.beta()
@@ -2385,6 +2406,22 @@ class Cli:
             self.out.line("  %-16s %s" % (r.tag, "  ".join(tags)))
         if mod.beta_optin and not beta:
             self.out.line(self.out.d("  (betas hidden -- add --beta or `settings --beta on`)"))
+        return 0
+
+    def eui_versions(self, v):
+        rels = eui_source(v).list_releases()
+        game = self.game(require=False)
+        current = None
+        if game and not game.problem() and eui_detect(game) == v.id:
+            current = eui_installed_tag(game, v)
+        self.out.section(v.name.upper() + " VERSIONS")
+        for i, r in enumerate(rels):
+            tags = []
+            if i == 0:
+                tags.append(self.out.m("« latest"))
+            if current and r.tag.lower() == current.lower():
+                tags.append(self.out.m("« installed"))
+            self.out.line("  %-16s %s" % (r.tag, "  ".join(tags)))
         return 0
 
     def cmd_install(self):
@@ -2427,7 +2464,7 @@ class Cli:
                 if not self.confirm("Tournament Mod and EUI XITS are not compatible. Install anyway?"):
                     return 1
             self.out.section("INSTALLING " + v.name.upper())
-            self.run_job(eui_install, game, v)
+            self.run_job(eui_install, game, v, self.args.version)
         else:
             self.out.section("REMOVING EUI")
             self.run_job(eui_remove, game)
@@ -2620,12 +2657,13 @@ def build_parser():
             s.add_argument("--beta", action="store_true", help="consider beta releases for 'latest'")
     s = sub.add_parser("map", help="install or update a mod's bonus map only")
     s.add_argument("mod", help="kekmod, tournament, lekmod or snowve")
-    s = sub.add_parser("versions", help="list a mod's releases")
+    s = sub.add_parser("versions", help="list a mod's (or eui/xits's) releases")
     s.add_argument("mod")
     s.add_argument("--beta", action="store_true", help="include betas")
     s = sub.add_parser("eui", help="install/remove EUI")
     s.add_argument("action", choices=["install", "uninstall"])
     s.add_argument("variant", nargs="?", default="eui", help="eui (default) or xits")
+    s.add_argument("--version", dest="version", metavar="TAG", help="exact release tag to install (default: latest)")
     s = sub.add_parser("lobby", help="install/remove the lobby patch (worldwide lobby list)")
     s.add_argument("action", choices=["install", "uninstall"])
     s = sub.add_parser("verify", help="run every check and list unrecognized mod folders")
@@ -2851,6 +2889,7 @@ class Tui:
             pass
         fetch_extra_latest(self.game, rel)
         fetch_eui_latest(self.game, rel)
+        fetch_eui_releases(rel)
         ticker = fetch_ticker()
         latest = None
         if not in_git_checkout():  # a checkout updates with git pull
@@ -3158,7 +3197,8 @@ class Tui:
             ok = not self.busy
             for b, cx in zip([Btn("eui:%s:install" % v.id, "UPDATE" if update else ("REINSTALL" if active else "INSTALL"),
                                   lambda v=v: self.on_eui_install(v), ok, "red" if update else col),
-                              Btn("eui:%s:uninstall" % v.id, "UNINSTALL", self.on_eui_remove, ok and active, col)],
+                              Btn("eui:%s:uninstall" % v.id, "UNINSTALL", self.on_eui_remove, ok and active, col),
+                              Btn("eui:%s:version" % v.id, "VERSION", lambda v=v: self.on_eui_version(v), ok, col)],
                              self._col_x):
                 self.button(b, ry, cx, bw, self.buttons)
         return y + n + 2
@@ -3638,7 +3678,30 @@ class Tui:
         self.status = "%s version set to %s" % (mod.name, tags[idx] or "auto")
         self.on_install(mod, tags[idx])
 
-    def on_eui_install(self, v):
+    def on_eui_version(self, v):
+        """Same as on_version for an EUI variant; nothing is remembered --
+        INSTALL/UPDATE always go back to the latest release."""
+        if self.busy:
+            return
+        rels = self.releases.get(eui_releases_key(v)) or []
+        current = (self.state.eui_tag or "").lower() if self.state.eui == v.id else ""
+        items = [("Latest (auto)", "mag")]
+        tags = [None]
+        for r in rels:
+            label = r.tag
+            if r.tag.lower() == current:
+                label += "  " + ("◄" if self.uni else "<") + " installed"
+            items.append((label, "mag"))
+            tags.append(r.tag)
+        if not rels:
+            items.append(("(release list unavailable -- offline?)", "dim"))
+        idx = self.pick(v.name.upper() + " VERSION", items, 0)
+        if idx is None or idx >= len(tags):
+            return
+        self.status = "%s version set to %s" % (v.name, tags[idx] or "auto")
+        self.on_eui_install(v, tags[idx])
+
+    def on_eui_install(self, v, tag=None):
         if self.busy or not self.need_game() or not self.civ_running_dialog():
             return
         if v.id == "eui_xits" and TOURNAMENT.id in self.state.installed and not self.confirm_tm_xits():
@@ -3647,7 +3710,7 @@ class Tui:
 
         def job(log, progress):
             log("=== INSTALLING %s ===" % v.name.upper())
-            eui_install(game, v, log, progress)
+            eui_install(game, v, tag, log, progress)
             return "DONE."
         self.start_job("INSTALLING %s..." % v.name.upper(), job)
 

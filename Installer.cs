@@ -435,9 +435,9 @@ namespace KekModInstaller
         private BackgroundWorker _mapWorker;
 
         // EUI section: same per-box-buttons treatment as the mod boxes --
-        // each EuiVariant gets its own box with INSTALL/REMOVE buttons (no
-        // VERSION button: install always takes the fork's latest release,
-        // see EuiExtra).
+        // each EuiVariant gets its own box with INSTALL/REMOVE/VERSION
+        // buttons. INSTALL takes the fork's latest release; VERSION picks
+        // one of its published releases (see EuiExtra).
         private class EuiRowControls
         {
             public Panel Box;
@@ -445,6 +445,7 @@ namespace KekModInstaller
             public Label NameLabel;
             public RetroButton InstallButton;
             public RetroButton RemoveButton;
+            public RetroButton VersionButton;
         }
         private readonly List<EuiRowControls> _euiRows = new List<EuiRowControls>();
         private string _installedEuiVariantId; // null if no EUI installed
@@ -455,6 +456,9 @@ namespace KekModInstaller
         // Newest release tag of the installed variant's fork, null until/
         // unless the status check fetched it.
         private string _euiLatestTag;
+        // Each variant's release list, keyed by EuiVariant.Id -- fetched by
+        // the status check like _releasesByModId, for the VERSION popups.
+        private Dictionary<string, List<ModRelease>> _euiReleasesByVariantId = new Dictionary<string, List<ModRelease>>();
         private BackgroundWorker _euiWorker;
 
         // NETWORK MODS section: the civ5-lobby-patch proxy steam_api.dll in
@@ -1082,9 +1086,8 @@ namespace KekModInstaller
         }
 
         // Same idea as BuildModBox, one EUI variant per box (status
-        // indicator + name, INSTALL/REMOVE buttons -- no VERSION button:
-        // this is a single bundled copy we ship ourselves, not something
-        // with published releases to choose between). Appends to _euiRows.
+        // indicator + name, INSTALL/REMOVE/VERSION buttons). Appends to
+        // _euiRows.
         private Panel BuildEuiVariantBox(EuiVariant variant, int x, int y, int width)
         {
             int boxHeight = 18 + ModRowHeight + 6;
@@ -1105,7 +1108,7 @@ namespace KekModInstaller
             const int btnW = 68;
             const int btnH = 22;
             const int btnGap = 6;
-            int btnsX = width - 12 - (btnW * 2 + btnGap);
+            int btnsX = width - 12 - (btnW * 3 + btnGap * 2);
 
             var row = new EuiRowControls();
             row.Box = box;
@@ -1127,6 +1130,14 @@ namespace KekModInstaller
             removeBtn.Click += (s, e) => OnEuiRemoveClick(variant);
             box.Controls.Add(removeBtn);
             row.RemoveButton = removeBtn;
+
+            var versionBtn = new RetroButton();
+            versionBtn.Text = "VERSION";
+            versionBtn.Font = new Font("Consolas", 7F, FontStyle.Bold);
+            versionBtn.SetBounds(btnsX + (btnW + btnGap) * 2, 16, btnW, btnH);
+            versionBtn.Click += (s, e) => OnEuiVersionClick(variant);
+            box.Controls.Add(versionBtn);
+            row.VersionButton = versionBtn;
 
             var nameLabel = new Label();
             nameLabel.SetBounds(34, 18, btnsX - 8 - 34, 20);
@@ -1528,6 +1539,7 @@ namespace KekModInstaller
                 {
                     _euiRows[i].InstallButton.Enabled = true;
                     _euiRows[i].RemoveButton.Enabled = active;
+                    _euiRows[i].VersionButton.Enabled = true;
                 }
 
                 // Same border-green/text-pink state coloring as the mod
@@ -1538,6 +1550,8 @@ namespace KekModInstaller
                 _euiRows[i].InstallButton.ForeColor = update ? ThemeRed : euiBtnText;
                 _euiRows[i].RemoveButton.BorderColor = euiBtnBorder;
                 _euiRows[i].RemoveButton.ForeColor = euiBtnText;
+                _euiRows[i].VersionButton.BorderColor = euiBtnBorder;
+                _euiRows[i].VersionButton.ForeColor = euiBtnText;
 
                 _euiRows[i].Box.Invalidate(); // re-runs the box's borderColor delegate against the (possibly new) installed variant
             }
@@ -1747,6 +1761,21 @@ namespace KekModInstaller
                 failed.Add("eui");
             }
 
+            // Both variants' release lists, for their VERSION popups. A
+            // failed one keeps its previous list, like the mods' lists.
+            var euiReleasesByVariantId = new Dictionary<string, List<ModRelease>>();
+            foreach (EuiVariant variant in EuiExtra.Variants)
+            {
+                try
+                {
+                    euiReleasesByVariantId[variant.Id] = EuiExtra.ListReleases(variant);
+                }
+                catch (Exception)
+                {
+                    // offline/rate-limited -- that VERSION popup keeps its old list
+                }
+            }
+
             // Bonus maps: only the installed ones, to keep the startup
             // GitHub API calls down (rate limit, see GitHubModSource).
             var latestExtraVersions = new Dictionary<string, string>();
@@ -1778,7 +1807,7 @@ namespace KekModInstaller
                 }
             }
 
-            e.Result = new object[] { releasesByModId, tickerText, latestInstallerVersion, lobbyLatestTag, latestExtraVersions, euiLatestTag, failed };
+            e.Result = new object[] { releasesByModId, tickerText, latestInstallerVersion, lobbyLatestTag, latestExtraVersions, euiLatestTag, failed, euiReleasesByVariantId };
         }
 
         private void StatusWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
@@ -1844,6 +1873,15 @@ namespace KekModInstaller
             {
                 _euiLatestTag = (string)result[5];
             }
+            var euiReleasesByVariantId = (Dictionary<string, List<ModRelease>>)result[7];
+            foreach (KeyValuePair<string, List<ModRelease>> kv in _euiReleasesByVariantId)
+            {
+                if (!euiReleasesByVariantId.ContainsKey(kv.Key))
+                {
+                    euiReleasesByVariantId[kv.Key] = kv.Value;
+                }
+            }
+            _euiReleasesByVariantId = euiReleasesByVariantId;
 
             RefreshLocalState();
         }
@@ -2205,7 +2243,8 @@ namespace KekModInstaller
             string currentTag;
             _selectedVersionTagByModId.TryGetValue(mod.Id, out currentTag);
 
-            using (var dlg = new VersionPickerForm(mod, releases, SettingsManager.GetShowBeta(), currentTag))
+            using (var dlg = new VersionPickerForm(mod.DisplayName, mod.Beta == BetaPolicy.OptIn, releases,
+                SettingsManager.GetShowBeta(), currentTag))
             {
                 if (dlg.ShowDialog(this) != DialogResult.OK)
                 {
@@ -2314,7 +2353,34 @@ namespace KekModInstaller
             _uninstallWorker.RunWorkerAsync(new List<ModDefinition> { mod });
         }
 
-        private void OnEuiInstallClick(EuiVariant variant)
+        // Same as OnModVersionClick for an EUI variant: the popup lists its
+        // fork's releases (cached by the status check) and picking one
+        // installs it right away. Nothing is remembered -- INSTALL/UPDATE
+        // always go back to the latest release.
+        private void OnEuiVersionClick(EuiVariant variant)
+        {
+            if (_actionInProgress)
+            {
+                return;
+            }
+
+            List<ModRelease> releases;
+            _euiReleasesByVariantId.TryGetValue(variant.Id, out releases);
+            string currentTag = variant.Id == _installedEuiVariantId ? _installedEuiTag : null;
+
+            using (var dlg = new VersionPickerForm(variant.DisplayName, false, releases,
+                SettingsManager.GetShowBeta(), currentTag))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK)
+                {
+                    return;
+                }
+                OnEuiInstallClick(variant, dlg.GetSelectedTag());
+            }
+        }
+
+        // tag null means the fork's latest release.
+        private void OnEuiInstallClick(EuiVariant variant, string tag = null)
         {
             if (_actionInProgress)
             {
@@ -2329,7 +2395,7 @@ namespace KekModInstaller
             SetControlsEnabled(false);
             _progress.Value = 0;
             SetStatus("INSTALLING " + variant.DisplayName.ToUpperInvariant() + "...");
-            _euiWorker.RunWorkerAsync(variant);
+            _euiWorker.RunWorkerAsync(Tuple.Create(variant, tag));
         }
 
         private void OnEuiRemoveClick(EuiVariant variant)
@@ -2860,7 +2926,10 @@ namespace KekModInstaller
         // its UI-file selection catches up with the new EUI state.
         private void EuiWorker_DoWork(object sender, DoWorkEventArgs e)
         {
-            var variant = (EuiVariant)e.Argument; // null means "remove whatever's there"
+            // null means "remove whatever's there"; otherwise the variant and
+            // release tag to install (null tag: the latest).
+            var request = (Tuple<EuiVariant, string>)e.Argument;
+            EuiVariant variant = request == null ? null : request.Item1;
             var worker = (BackgroundWorker)sender;
             Action<string> log = msg => worker.ReportProgress(0, msg);
 
@@ -2876,7 +2945,7 @@ namespace KekModInstaller
             }
             else
             {
-                EuiExtra.Install(dlcRoot, variant, log);
+                EuiExtra.Install(dlcRoot, variant, request.Item2, log);
             }
 
             // EUI is shared across Assets/DLC, not tied to one specific mod
@@ -2966,6 +3035,7 @@ namespace KekModInstaller
                 {
                     row.InstallButton.Enabled = false;
                     row.RemoveButton.Enabled = false;
+                    row.VersionButton.Enabled = false;
                 }
                 _lobbyInstallButton.Enabled = false;
                 _lobbyRemoveButton.Enabled = false;
@@ -3097,19 +3167,18 @@ namespace KekModInstaller
         }
     }
 
-    // Small modal dialog reached via a mod box's own VERSION button --
+    // Small modal dialog reached via a mod or EUI box's own VERSION button --
     // reuses MainForm's retro chrome (MakeRetroBox/RetroButton) so it reads
     // as part of the same theme rather than a bolted-on stock WinForms
     // dialog, the same way SettingsForm does. Lists that one mod's releases
-    // (from the cache MainForm fetched once at startup -- no network here)
-    // filtered by the current beta setting; picking one just records the
-    // tag for the next time that mod's own INSTALL button is clicked.
+    // (from the cache MainForm's status check fetched -- no network here)
+    // filtered by the current beta setting; the caller installs the pick.
     internal class VersionPickerForm : Form
     {
         private ComboBox _cmbVersion;
         private readonly List<string> _tags = new List<string>();
 
-        public VersionPickerForm(ModDefinition mod, List<ModRelease> releases, bool showBeta, string currentTag)
+        public VersionPickerForm(string name, bool betaOptIn, List<ModRelease> releases, bool showBeta, string currentTag)
         {
             Text = "CIV V MOD INSTALLER";
             ClientSize = new Size(320, 110);
@@ -3119,7 +3188,7 @@ namespace KekModInstaller
             MinimizeBox = false;
             BackColor = Color.Black;
 
-            Panel pnl = MainForm.MakeRetroBox(mod.DisplayName.ToUpperInvariant() + " VERSION", 12, 12, 296, 50);
+            Panel pnl = MainForm.MakeRetroBox(name.ToUpperInvariant() + " VERSION", 12, 12, 296, 50);
 
             _cmbVersion = new ComboBox();
             _cmbVersion.SetBounds(12, 18, 272, 22);
@@ -3128,7 +3197,7 @@ namespace KekModInstaller
             _cmbVersion.BackColor = Color.Black;
             _cmbVersion.ForeColor = MainForm.ThemeGreen;
             _cmbVersion.Font = new Font("Consolas", 9F, FontStyle.Bold);
-            _cmbVersion.Items.Add((mod.Beta == BetaPolicy.OptIn && showBeta)
+            _cmbVersion.Items.Add((betaOptIn && showBeta)
                 ? "Latest (auto -- newest, incl. beta)"
                 : "Latest (auto)");
 
@@ -3141,7 +3210,7 @@ namespace KekModInstaller
                 foreach (ModRelease rel in shown)
                 {
                     _tags.Add(rel.Tag);
-                    string suffix = mod.Beta == BetaPolicy.OptIn ? (rel.Prerelease ? "  [beta]" : "  [stable]") : "";
+                    string suffix = betaOptIn ? (rel.Prerelease ? "  [beta]" : "  [stable]") : "";
                     if (!string.IsNullOrEmpty(rel.DisplayExtra))
                     {
                         suffix = "  - " + rel.DisplayExtra + suffix;
