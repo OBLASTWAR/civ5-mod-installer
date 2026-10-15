@@ -119,11 +119,28 @@ namespace KekModInstaller
             return GitHubModSource.FetchLatestRelease(Owner, variant.Repo).TagName;
         }
 
-        // Every published release of variant's fork, newest first -- what
-        // its VERSION popup offers.
+        // Every published release of variant's fork, Latest first -- what
+        // its VERSION popup offers. GitHub lists by publish date, and an old
+        // release published later (v1.28g-original) would otherwise top it.
         public static List<ModRelease> ListReleases(EuiVariant variant)
         {
-            return GitHubModSource.FetchReleases(Owner, variant.Repo)
+            List<GhRelease> releases = GitHubModSource.FetchReleases(Owner, variant.Repo);
+            try
+            {
+                string latest = FetchLatestTag(variant);
+                int idx = releases.FindIndex(r => string.Equals(r.TagName, latest, StringComparison.OrdinalIgnoreCase));
+                if (idx > 0)
+                {
+                    GhRelease r = releases[idx];
+                    releases.RemoveAt(idx);
+                    releases.Insert(0, r);
+                }
+            }
+            catch (Exception)
+            {
+                // list order stays as GitHub gave it
+            }
+            return releases
                 .Select(r => new ModRelease { Tag = r.TagName, Prerelease = r.Prerelease, Native = r })
                 .ToList();
         }
