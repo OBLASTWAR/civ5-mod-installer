@@ -103,6 +103,11 @@ namespace KekModInstaller
                 {
                     return true; // EuiExtra's namespace -- see EuiExtra.DetectInstalledVariantId
                 }
+                if (string.Equals(name, "VPUI", StringComparison.OrdinalIgnoreCase)
+                    || string.Equals(name, "VP_MODPACK", StringComparison.OrdinalIgnoreCase))
+                {
+                    return true; // VoxPopuliExtra's folders (its UI_bc1 is covered by the "UI" prefix)
+                }
                 foreach (string stock in KnownStockDlcFolders)
                 {
                     if (string.Equals(name, stock, StringComparison.OrdinalIgnoreCase))

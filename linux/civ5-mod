@@ -9,6 +9,7 @@
 #   ./civ5-mod map snowve              install/update just a mod's bonus map
 #   ./civ5-mod versions kekmod         list published releases
 #   ./civ5-mod eui install [eui|xits] [--version TAG]  / eui uninstall
+#   ./civ5-mod vp install [--version TAG] / vp uninstall  Vox Populi + its EUI
 #   ./civ5-mod lobby install | uninstall  civ5-lobby-patch (worldwide lobby list)
 #   ./civ5-mod verify                  checks + unrecognized mod folders
 #   ./civ5-mod clear-cache             shader caches + Civ V's cached DBs
@@ -669,28 +670,33 @@ class LekmodSource:
         return rels[0]
 
     def download(self, release, dest_dir, log, progress):
-        # Same fallback chain as Lekmod's own installer: plain link, then the
-        # confirm-token cookie, then drive.usercontent.google.com with
-        # confirm=t for files past the virus-scan size limit.
         file_id = release.native["file_id"]
         size = release.native.get("size")
         log("Google Drive file: " + file_id + (" (%s)" % size if size else ""))
-        jar = http.cookiejar.CookieJar()
-        opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
-        path = os.path.join(dest_dir, "release.zip")
-        url = "https://drive.google.com/uc?export=download&id=" + file_id
-        if download_to(url, path, progress, opener) != "text/html":
+        return drive_download(file_id, dest_dir, log, progress)
+
+
+def drive_download(file_id, dest_dir, log, progress):
+    """Downloads a public Google Drive file into dest_dir/release.zip. Same
+    fallback chain as Lekmod's own installer: plain link, then the
+    confirm-token cookie, then drive.usercontent.google.com with confirm=t
+    for files past the virus-scan size limit."""
+    jar = http.cookiejar.CookieJar()
+    opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
+    path = os.path.join(dest_dir, "release.zip")
+    url = "https://drive.google.com/uc?export=download&id=" + file_id
+    if download_to(url, path, progress, opener) != "text/html":
+        return path
+    token = next((c.value for c in jar if "download_warning" in c.name.lower() or "confirm" in c.name.lower()), None)
+    if token:
+        if download_to(url + "&confirm=" + token, path, progress, opener) != "text/html":
             return path
-        token = next((c.value for c in jar if "download_warning" in c.name.lower() or "confirm" in c.name.lower()), None)
-        if token:
-            if download_to(url + "&confirm=" + token, path, progress, opener) != "text/html":
-                return path
-        log("Large file, bypassing Google Drive's virus-scan page...")
-        url = "https://drive.usercontent.google.com/download?id=%s&export=download&confirm=t" % file_id
-        if download_to(url, path, progress, opener) != "text/html":
-            return path
-        raise InstallerError("Google Drive returned a web page instead of the file. It may no longer be "
-                             "shared publicly, or its download quota is used up for today.")
+    log("Large file, bypassing Google Drive's virus-scan page...")
+    url = "https://drive.usercontent.google.com/download?id=%s&export=download&confirm=t" % file_id
+    if download_to(url, path, progress, opener) != "text/html":
+        return path
+    raise InstallerError("Google Drive returned a web page instead of the file. It may no longer be "
+                         "shared publicly, or its download quota is used up for today.")
 
 
 # ── Bonus maps ────────────────────────────────────────────────────────────────
@@ -1230,6 +1236,130 @@ def eui_remove(game, log, progress=lambda p: None):
     log("DONE: EUI removed.")
 
 
+# ── Vox Populi (VoxPopuliExtra.cs) ────────────────────────────────────────────
+# The multiplayer VP + EUI modpack from the CivFanatics "VoxPopuli Modpacks"
+# thread, one "<version>_VP-EUI.zip" per release in a public Google Drive
+# folder (there's no manifest, so the folder's embedded listing is scraped).
+# Each zip holds three sibling DLC folders for Assets/DLC: UI_bc1 (the EUI
+# build VP needs), VPUI and VP_MODPACK. None carries a version, so the
+# installed release tag is kept in a marker file inside VP_MODPACK.
+
+VP_NAME = "Vox Populi"
+VP_FOLDER_ID = "1k6rheDL2Q38oBF9je2ADw_dgVkqaG7Ey"
+VP_MARKER_DIR = "VP_MODPACK"
+VP_MARKER = "kekmod-vp-version.txt"
+VP_FOLDERS = ["UI_bc1", "VPUI", "VP_MODPACK"]
+VP_RELEASES_KEY = "vp-releases"  # releases dict: the Drive folder's release list
+VP_EUI_NOTE = "(bundled with VP)"
+
+
+def vp_releases():
+    """The Drive folder's packs, newest first."""
+    html = http_bytes("https://drive.google.com/embeddedfolderview?id=" + VP_FOLDER_ID).decode("utf-8", "replace")
+    out = {}
+    for m in re.finditer(r'id="entry-([^"]+)".*?flip-entry-title">([^<]*)<.*?<div>([^<]*)</div>', html, re.S):
+        file_id, name, date = m.group(1), m.group(2).strip(), m.group(3).strip()
+        t = re.match(r"^(\d+(?:\.\d+)*)_VP.*\.zip$", name, re.I)
+        if t and t.group(1) not in out:
+            out[t.group(1)] = Release(t.group(1), False, name[len(t.group(1)) + 1:-4] + ", " + date,
+                                      {"file_id": file_id, "name": name})
+    if not out:
+        raise InstallerError("No Vox Populi packs found in the Google Drive folder.")
+    return sorted(out.values(), key=lambda r: version_key(r.tag), reverse=True)
+
+
+def vp_resolve(tag):
+    rels = vp_releases()
+    if not tag:
+        return rels[0]
+    for r in rels:
+        if r.tag.lower() == tag.lower():
+            return r
+    raise InstallerError("Vox Populi %s isn't in the Drive folder. Pick another version." % tag)
+
+
+def vp_detect(game):
+    """None when not installed, else the installed tag ("" if unknown)."""
+    if not os.path.isdir(ci_resolve(os.path.join(game.dlc, VP_MARKER_DIR))):
+        return None
+    try:
+        with open(ci_resolve(os.path.join(game.dlc, VP_MARKER_DIR, VP_MARKER)), encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def fetch_vp_releases(out):
+    try:
+        out[VP_RELEASES_KEY] = vp_releases()
+    except Exception:
+        pass
+
+
+def vp_install(game, tag, log, progress=lambda p: None):
+    """Installs pack tag (None: the newest), replacing any installed VP and
+    whatever EUI is in Assets/DLC -- the pack brings its own."""
+    log("Checking the Vox Populi Drive folder for %s..." % ("version " + tag if tag else "the newest pack"))
+    rel = vp_resolve(tag)
+    log("Vox Populi: %s%s" % (rel.tag, " [selected version]" if tag else ""))
+    progress(5)
+    scratch = tempfile.mkdtemp(prefix=".kekmod-install-", dir=game.assets)
+    try:
+        log("Downloading %s (large, this can take a few minutes)..." % rel.native["name"])
+        zp = drive_download(rel.native["file_id"], scratch, log, lambda f: progress(5 + int(45 * f)))
+        try:
+            tops = sorted(zip_top_dirs(zp))
+        except zipfile.BadZipFile:
+            tops = []
+        if tops != sorted(VP_FOLDERS):
+            raise InstallerError("Unexpected archive layout (top level: %s)." % (", ".join(tops) or "not a zip"))
+        progress(50)
+        out = os.path.join(scratch, "x")
+        log("Extracting...")
+        extract_zip(zp, out)
+        os.unlink(zp)
+        progress(65)
+        for d in ci_dirs_with_prefix(game.dlc, "UI"):  # only one EUI may be active
+            log("Replacing " + os.path.basename(d) + " with VP's bundled EUI...")
+            remove_tree(d)
+        for name in VP_FOLDERS[1:]:
+            old = ci_resolve(os.path.join(game.dlc, name))
+            if os.path.lexists(old):
+                log("Removing existing " + os.path.basename(old) + "...")
+                remove_tree(old)
+        progress(75)
+        for name in VP_FOLDERS:
+            os.rename(os.path.join(out, name), os.path.join(game.dlc, name))
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    with open(os.path.join(game.dlc, VP_MARKER_DIR, VP_MARKER), "w", encoding="utf-8") as f:
+        f.write(rel.tag)
+    progress(90)
+    clear_civ_db_cache(game, log)
+    progress(100)
+    log("DONE: %s %s installed." % (VP_NAME, rel.tag))
+
+
+def vp_remove(game, log, progress=lambda p: None):
+    """Removes VPUI and VP_MODPACK, plus UI_bc1 when it's the pack's own EUI
+    (no EUI marker -- one installed from here is kept)."""
+    for name in VP_FOLDERS:
+        d = ci_resolve(os.path.join(game.dlc, name))
+        if not os.path.isdir(d):
+            continue
+        if name == "UI_bc1" and os.path.isfile(os.path.join(d, EUI_MARKER)):
+            continue
+        log("Removing " + os.path.basename(d) + "...")
+        try:
+            remove_tree(d)
+        except OSError as e:
+            log("%s: couldn't remove (%s)" % (os.path.basename(d), e))
+    progress(70)
+    clear_civ_db_cache(game, log)
+    progress(100)
+    log("DONE: %s removed." % VP_NAME)
+
+
 # ── Lobby patch (LobbyPatchExtra.cs) ──────────────────────────────────────────
 # civ5-lobby-patch: a proxy steam_api.dll in the game root that hooks
 # SteamMatchmaking to drop Steam's lobby distance filter, forwarding every
@@ -1720,6 +1850,8 @@ class State:
         self.eui_update = None  # newer EUI release tag, "" if the installed one has no tag, None if current
         self.lobby = None      # installed lobby patch tag ("" if unknown); None = not installed
         self.lobby_update = None  # newer lobby patch tag, if the release check found one
+        self.vp = None         # installed Vox Populi pack tag ("" if unknown); None = not installed
+        self.vp_update = None  # newest pack tag, if newer than the installed one
         if game is None or game.problem():
             return
         for mod in MODS:
@@ -1744,6 +1876,13 @@ class State:
                 self.eui_update = latest or ""
             elif latest and latest.lower() != self.eui_tag.lower():
                 self.eui_update = latest
+        self.vp = vp_detect(game)
+        vps = releases.get(VP_RELEASES_KEY)
+        if self.vp is not None and vps and vps[0].tag.lower() != self.vp.lower():
+            self.vp_update = vps[0].tag
+        if self.vp is not None and self.eui == "eui" and self.eui_tag is None:
+            # The pack's own UI_bc1: not our fork, but not outdated either.
+            self.eui_tag, self.eui_update = VP_EUI_NOTE, None
         self.lobby = lobby_detect(game)
         # releases[LOBBY_REPO] is the latest tag string, not a release list.
         latest = releases.get(LOBBY_REPO)
@@ -1827,8 +1966,15 @@ def run_checks(game, state):
         out.append((False, "%s %s is outdated -- %s is available." % (v.name, state.eui_tag, state.eui_update)))
     else:
         out.append((True, "%s %s installed." % (v.name, state.eui_tag)))
+    if state.vp is not None:
+        out.append((state.vp_update is None, "%s %s installed." % (VP_NAME, state.vp or "(unknown version)")
+                    if state.vp_update is None else "%s %s is outdated -- %s is available." % (VP_NAME, state.vp, state.vp_update)))
+        if inst:
+            out.append((False, "%s and %s are both installed -- they can't run together."
+                        % (VP_NAME, " and ".join(m.name for m in inst))))
     ups = [m.name for m in MODS if m.id in state.updates] \
         + [m.extra.name for m in MODS if m.extra and m.extra.id in state.extra_updates] \
+        + ([VP_NAME] if state.vp_update else []) \
         + ([LOBBY_NAME] if state.lobby_update else []) \
         + ([v.name] if v is not None and state.eui_update is not None else [])
     out.append((not ups, "Update available for: " + ", ".join(ups) + "." if ups else "All installed mods are up to date."))
@@ -1862,7 +2008,7 @@ def scan_extra_folders(game):
             continue
         # Stock DLC is always "DLC*" (fail safe: never offer paid content for
         # deletion); "UI*" is EUI's namespace.
-        if low.startswith(("dlc", "ui")) or low in STOCK_DLC or any(low.startswith(px) for px in mod_prefixes):
+        if low.startswith(("dlc", "ui")) or low in STOCK_DLC or low in ("vpui", "vp_modpack") or any(low.startswith(px) for px in mod_prefixes):
             continue
         found.append(ExtraFolder(p, "DLC"))
     if os.path.isdir(game.maps):
@@ -2315,6 +2461,7 @@ class Cli:
         except InstallerError:
             pass
         fetch_eui_latest(game, out)
+        fetch_vp_releases(out)
         return out
 
     def run_job(self, fn, *a):
@@ -2363,6 +2510,14 @@ class Cli:
                 if active and state.eui_update:
                     line += self.out.g("  » update: " + state.eui_update)
                 self.out.line(line)
+        self.out.section("VOX POPULI")
+        if state.vp is None:
+            self.out.line("  %s %s" % (self.out.m("○"), self.out.m(VP_NAME)))
+        else:
+            line = "  %s %s" % (self.out.g("●"), self.out.g(VP_NAME + ("  " + state.vp if state.vp else "")))
+            if state.vp_update:
+                line += self.out.g("  » update: " + state.vp_update)
+            self.out.line(line)
         self.out.section("NETWORK MODS")
         if state.lobby is None:
             self.out.line("  %s %s" % (self.out.m("○"), self.out.m(LOBBY_NAME)))
@@ -2382,6 +2537,8 @@ class Cli:
     def cmd_versions(self):
         if self.args.mod.lower() in ("eui", "xits", "eui_xits", "ui_bc1", "ui_bc1_xits", "eui xits"):
             return self.eui_versions(eui_by_name(self.args.mod))
+        if self.args.mod.lower() in ("vp", "voxpopuli", "vox populi", "vox-populi"):
+            return self.vp_versions()
         mod = mod_by_name(self.args.mod)
         rels = mod.source.list_releases()
         beta = self.beta()
@@ -2406,6 +2563,20 @@ class Cli:
             self.out.line("  %-16s %s" % (r.tag, "  ".join(tags)))
         if mod.beta_optin and not beta:
             self.out.line(self.out.d("  (betas hidden -- add --beta or `settings --beta on`)"))
+        return 0
+
+    def vp_versions(self):
+        rels = vp_releases()
+        game = self.game(require=False)
+        current = vp_detect(game) if game and not game.problem() else None
+        self.out.section("VOX POPULI VERSIONS")
+        for i, r in enumerate(rels):
+            tags = [r.extra]
+            if i == 0:
+                tags.append(self.out.m("« latest"))
+            if current and r.tag.lower() == current.lower():
+                tags.append(self.out.m("« installed"))
+            self.out.line("  %-16s %s" % (r.tag, "  ".join(tags)))
         return 0
 
     def eui_versions(self, v):
@@ -2433,8 +2604,8 @@ class Cli:
             if not self.confirm("Tournament Mod and EUI XITS are not compatible. Install anyway?"):
                 return 1
         conflicts = [m for m in state.installed_mods() if m is not mod]
-        if conflicts:
-            names = ", ".join(m.name for m in conflicts)
+        if conflicts or state.vp is not None:
+            names = ", ".join([m.name for m in conflicts] + ([VP_NAME] if state.vp is not None else []))
             if not self.confirm("Installing %s will uninstall %s first -- these mods can't run side by side. "
                                 "Continue?" % (mod.name, names)):
                 return 1
@@ -2442,6 +2613,9 @@ class Cli:
         for c in conflicts:
             self.out.section("REMOVING " + c.name.upper())
             self.run_job(uninstall_mod, game, c)
+        if state.vp is not None:
+            self.out.section("REMOVING " + VP_NAME.upper())
+            self.run_job(vp_remove, game)
         self.out.section("INSTALLING " + mod.name.upper())
         self.run_job(install_mod, game, mod, self.args.version, self.beta())
         return 0
@@ -2468,6 +2642,29 @@ class Cli:
         else:
             self.out.section("REMOVING EUI")
             self.run_job(eui_remove, game)
+        return 0
+
+    def cmd_vp(self):
+        game = self.game()
+        self.require_civ_closed()
+        if self.args.action == "install":
+            state = State(game, {}, False)
+            clash = state.installed_mods()
+            if clash and not self.confirm("Installing %s will uninstall %s first -- these mods can't run "
+                                          "side by side. Continue?" % (VP_NAME, ", ".join(m.name for m in clash))):
+                return 1
+            if state.eui and state.vp is None and not self.confirm(
+                    "%s ships its own EUI and will replace the one installed. Continue?" % VP_NAME):
+                return 1
+            self.out.banner()
+            for c in clash:
+                self.out.section("REMOVING " + c.name.upper())
+                self.run_job(uninstall_mod, game, c)
+            self.out.section("INSTALLING " + VP_NAME.upper())
+            self.run_job(vp_install, game, self.args.version)
+        else:
+            self.out.section("REMOVING " + VP_NAME.upper())
+            self.run_job(vp_remove, game)
         return 0
 
     def cmd_map(self):
@@ -2638,7 +2835,7 @@ def build_parser():
         description="KEK Mod installer for Civilization V under Steam Proton. Run with no command "
                     "for the full-screen installer.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="mods: kekmod, tournament, lekmod, snowve    eui variants: eui, xits")
+        epilog="mods: kekmod, tournament, lekmod, snowve, vp (vox populi)    eui variants: eui, xits")
     p.add_argument("--civ-dir", metavar="DIR", help="Civ V folder (.../steamapps/common/%s) for this run" % CIV_FOLDER)
     p.add_argument("--no-color", action="store_true", help="plain output")
     p.add_argument("--ascii", action="store_true", help="full-screen UI without Unicode box art")
@@ -2664,6 +2861,9 @@ def build_parser():
     s.add_argument("action", choices=["install", "uninstall"])
     s.add_argument("variant", nargs="?", default="eui", help="eui (default) or xits")
     s.add_argument("--version", dest="version", metavar="TAG", help="exact release tag to install (default: latest)")
+    s = sub.add_parser("vp", help="install/remove Vox Populi (multiplayer pack with its own EUI)")
+    s.add_argument("action", choices=["install", "uninstall"])
+    s.add_argument("--version", dest="version", metavar="TAG", help="exact pack version to install (default: newest)")
     s = sub.add_parser("lobby", help="install/remove the lobby patch (worldwide lobby list)")
     s.add_argument("action", choices=["install", "uninstall"])
     s = sub.add_parser("verify", help="run every check and list unrecognized mod folders")
@@ -2890,6 +3090,7 @@ class Tui:
         fetch_extra_latest(self.game, rel)
         fetch_eui_latest(self.game, rel)
         fetch_eui_releases(rel)
+        fetch_vp_releases(rel)
         ticker = fetch_ticker()
         latest = None
         if not in_git_checkout():  # a checkout updates with git pull
@@ -3039,8 +3240,8 @@ class Tui:
         scr.erase()
         h, w = scr.getmaxyx()
         self.buttons = []
-        if h < 27 or w < 72:
-            self.put(h // 2, max(0, (w - 34) // 2), "TERMINAL TOO SMALL -- NEED 72x27", self.attr["mag"])
+        if h < 30 or w < 72:
+            self.put(h // 2, max(0, (w - 34) // 2), "TERMINAL TOO SMALL -- NEED 72x30", self.attr["mag"])
             self.put(h // 2 + 1, max(0, (w - 20) // 2), "(now %dx%d, Q quits)" % (w, h), self.attr["dim"])
             if refresh:
                 scr.refresh()
@@ -3051,6 +3252,7 @@ class Tui:
         y = self._draw_header(x0, W, big)
         y = self._draw_mods(y, x0, W)
         y = self._draw_eui(y, x0, W)
+        y = self._draw_vp(y, x0, W)
         y = self._draw_lobby(y, x0, W)
         # progress + status
         bar_w = W - 8
@@ -3202,6 +3404,29 @@ class Tui:
                              self._col_x):
                 self.button(b, ry, cx, bw, self.buttons)
         return y + n + 2
+
+    def _draw_vp(self, y, x0, W):
+        self.box(y, x0, 3, W, "VOX POPULI", "mag")
+        bw = 13
+        st = self.state
+        ry = y + 1
+        installed = st.vp is not None
+        a = self.attr["grn"] if installed else self.attr["mag"]
+        self.put(ry, x0 + 2, self.ch("dot") if installed else self.ch("hol"), a)
+        label = VP_NAME + ("  " + st.vp if st.vp else "")
+        self.put(ry, x0 + 4, label, a, maxw=self._col_x[0] - x0 - 5)
+        if st.vp_update:
+            nx = x0 + 6 + len(label)
+            self.put(ry, nx, "%s %s available" % (self.ch("arrow"), st.vp_update), a, maxw=self._col_x[0] - nx - 1)
+        col = "grn" if installed else "mag"
+        ok = not self.busy
+        for b, cx in zip([Btn("vp:install", "UPDATE" if st.vp_update else ("REINSTALL" if installed else "INSTALL"),
+                              self.on_vp_install, ok, "red" if st.vp_update else col),
+                          Btn("vp:uninstall", "UNINSTALL", self.on_vp_remove, ok and installed, col),
+                          Btn("vp:version", "VERSION", self.on_vp_version, ok, col)],
+                         self._col_x):
+            self.button(b, ry, cx, bw, self.buttons)
+        return y + 3
 
     def _draw_lobby(self, y, x0, W):
         self.box(y, x0, 3, W, "NETWORK MODS", "mag")
@@ -3609,8 +3834,9 @@ class Tui:
         if mod is TOURNAMENT and st.eui == "eui_xits" and not self.confirm_tm_xits():
             return
         conflicts = [m for m in st.installed_mods() if m is not mod]
-        if conflicts:
-            names = ", ".join(m.name for m in conflicts)
+        drop_vp = st.vp is not None
+        if conflicts or drop_vp:
+            names = ", ".join([m.name for m in conflicts] + ([VP_NAME] if drop_vp else []))
             if self.msgbox("INSTALL " + mod.name.upper(),
                            "Installing %s will uninstall %s first -- these mods can't run side by side in "
                            "Civilization V. Continue?" % (mod.name, names),
@@ -3622,6 +3848,9 @@ class Tui:
             for cm in conflicts:
                 log("=== REMOVING %s ===" % cm.name.upper())
                 uninstall_mod(game, cm, log, progress)
+            if drop_vp:
+                log("=== REMOVING %s ===" % VP_NAME.upper())
+                vp_remove(game, log, progress)
             log("=== INSTALLING %s ===" % mod.name.upper())
             return "[INSTALLED] " + install_mod(game, mod, tag, beta, log, progress)
         self.start_job("INSTALLING %s..." % mod.name.upper(), job)
@@ -3724,6 +3953,63 @@ class Tui:
             eui_remove(game, log, progress)
             return "DONE."
         self.start_job("REMOVING EUI...", job)
+
+    def on_vp_version(self):
+        if self.busy:
+            return
+        rels = self.releases.get(VP_RELEASES_KEY) or []
+        current = (self.state.vp or "").lower()
+        items = [("Latest (auto)", "mag")]
+        tags = [None]
+        for r in rels:
+            label = "%s  %s" % (r.tag, r.extra)
+            if r.tag.lower() == current:
+                label += "  " + ("◄" if self.uni else "<") + " installed"
+            items.append((label, "mag"))
+            tags.append(r.tag)
+        if not rels:
+            items.append(("(release list unavailable -- offline?)", "dim"))
+        idx = self.pick(VP_NAME.upper() + " VERSION", items, 0)
+        if idx is None or idx >= len(tags):
+            return
+        self.status = "%s version set to %s" % (VP_NAME, tags[idx] or "auto")
+        self.on_vp_install(tags[idx])
+
+    def on_vp_install(self, tag=None):
+        if self.busy or not self.need_game() or not self.civ_running_dialog():
+            return
+        st = self.state
+        clash = st.installed_mods()
+        if clash:
+            msg = "Installing %s will uninstall %s first -- these mods can't run side by side in Civilization V. " \
+                  "Continue?" % (VP_NAME, ", ".join(m.name for m in clash))
+        elif st.eui and st.vp is None:
+            msg = "%s ships its own EUI and will replace the one installed. Continue?" % VP_NAME
+        else:
+            msg = None
+        if msg and self.msgbox("INSTALL " + VP_NAME.upper(), msg, ["CONTINUE", "CANCEL"], "mag", 1, 1) != 0:
+            return
+        game = self.game
+
+        def job(log, progress):
+            for cm in clash:
+                log("=== REMOVING %s ===" % cm.name.upper())
+                uninstall_mod(game, cm, log, progress)
+            log("=== INSTALLING %s ===" % VP_NAME.upper())
+            vp_install(game, tag, log, progress)
+            return "DONE."
+        self.start_job("INSTALLING %s..." % VP_NAME.upper(), job)
+
+    def on_vp_remove(self):
+        if self.busy or not self.need_game() or not self.civ_running_dialog():
+            return
+        game = self.game
+
+        def job(log, progress):
+            log("=== REMOVING %s ===" % VP_NAME.upper())
+            vp_remove(game, log, progress)
+            return "DONE."
+        self.start_job("REMOVING %s..." % VP_NAME.upper(), job)
 
     def on_lobby_install(self):
         if self.busy or not self.need_game() or not self.civ_running_dialog():

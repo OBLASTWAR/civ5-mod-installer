@@ -1,7 +1,7 @@
 # Civ V Mod Installer
 
 Installs and updates Civilization V multiplayer mods (KEK Mod, Tournament Mod,
-Lekmod, SnowVe), their bonus maps, EUI / EUI XITS and civ5-lobby-patch.
+Lekmod, SnowVe), their bonus maps, EUI / EUI XITS, Vox Populi (multiplayer pack with its own EUI) and civ5-lobby-patch.
 
 ## Windows
 

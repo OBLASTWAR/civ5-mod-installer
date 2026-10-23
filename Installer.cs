@@ -461,6 +461,22 @@ namespace KekModInstaller
         private Dictionary<string, List<ModRelease>> _euiReleasesByVariantId = new Dictionary<string, List<ModRelease>>();
         private BackgroundWorker _euiWorker;
 
+        // VOX POPULI section: the VP + EUI modpack (see VoxPopuliExtra.cs).
+        // One box, INSTALL/UNINSTALL/VERSION like the EUI boxes.
+        private Panel _vpBox;
+        private Label _vpIndicator;
+        private Label _vpNameLabel;
+        private RetroButton _vpInstallButton;
+        private RetroButton _vpRemoveButton;
+        private RetroButton _vpVersionButton;
+        private BackgroundWorker _vpWorker;
+        private string _vpTag;       // installed pack tag ("" if unknown), null if not installed
+        private string _vpLatestTag; // newest pack in the Drive folder, null until the status check got it
+        private List<ModRelease> _vpReleases = new List<ModRelease>();
+        // Set when a mod install has to remove Vox Populi first (it's
+        // total-conversion-style like the mods); consumed by UninstallWorker_DoWork.
+        private bool _removeVpWithUninstall;
+
         // NETWORK MODS section: the civ5-lobby-patch proxy steam_api.dll in
         // the game's root folder (see LobbyPatchExtra.cs). One box, same
         // INSTALL/UNINSTALL treatment as the EUI boxes; INSTALL becomes
@@ -728,8 +744,17 @@ namespace KekModInstaller
             Controls.Add(interfaceModsBox);
             UpdateEuiRowStyles();
 
+            // VOX POPULI -- under INTERFACE MODS, same nested-box treatment.
+            int vpY = interfaceModsY + interfaceModsHeight + 8;
+            _vpBox = BuildVoxPopuliBox(outerPadSide, outerPadTop, innerWidth);
+            int vpHeight = outerPadTop + _vpBox.Height + outerPadBottom;
+            var vpOuterBox = MakeRetroBox("VOX POPULI", RightColumnX, vpY, 532, vpHeight);
+            vpOuterBox.Controls.Add(_vpBox);
+            Controls.Add(vpOuterBox);
+            UpdateVoxPopuliRowStyles();
+
             // NETWORK MODS -- the lobby patch, same nested-box treatment.
-            int networkModsY = interfaceModsY + interfaceModsHeight + 8;
+            int networkModsY = vpY + vpHeight + 8;
             _lobbyBox = BuildLobbyPatchBox(outerPadSide, outerPadTop, innerWidth);
             int networkModsHeight = outerPadTop + _lobbyBox.Height + outerPadBottom;
             var networkModsBox = MakeRetroBox("NETWORK MODS", RightColumnX, networkModsY, 532, networkModsHeight);
@@ -925,6 +950,12 @@ namespace KekModInstaller
             _euiWorker.DoWork += EuiWorker_DoWork;
             _euiWorker.ProgressChanged += Worker_ProgressChanged;
             _euiWorker.RunWorkerCompleted += EuiWorker_RunWorkerCompleted;
+
+            _vpWorker = new BackgroundWorker();
+            _vpWorker.WorkerReportsProgress = true;
+            _vpWorker.DoWork += VpWorker_DoWork;
+            _vpWorker.ProgressChanged += Worker_ProgressChanged;
+            _vpWorker.RunWorkerCompleted += EuiWorker_RunWorkerCompleted;
 
             _lobbyWorker = new BackgroundWorker();
             _lobbyWorker.WorkerReportsProgress = true;
@@ -1153,6 +1184,97 @@ namespace KekModInstaller
             _euiRows.Add(row);
 
             return box;
+        }
+
+        // Vox Populi's box -- same layout as BuildEuiVariantBox.
+        private Panel BuildVoxPopuliBox(int x, int y, int width)
+        {
+            int boxHeight = 18 + ModRowHeight + 6;
+            var box = MakeRetroBox(VoxPopuliExtra.DisplayName.ToUpperInvariant(), x, y, width, boxHeight,
+                () => _vpTag == null ? ThemeMagenta : (IsVoxPopuliUpdateAvailable() ? ThemeRed : ThemeGreen));
+
+            _vpIndicator = new Label();
+            _vpIndicator.SetBounds(12, 16, 20, 22);
+            _vpIndicator.Font = new Font("Consolas", 11F, FontStyle.Bold);
+            _vpIndicator.TextAlign = ContentAlignment.MiddleCenter;
+            _vpIndicator.BackColor = Color.Black;
+            box.Controls.Add(_vpIndicator);
+
+            const int btnW = 68;
+            const int btnH = 22;
+            const int btnGap = 6;
+            int btnsX = width - 12 - (btnW * 3 + btnGap * 2);
+
+            _vpInstallButton = new RetroButton();
+            _vpInstallButton.Text = "INSTALL";
+            _vpInstallButton.Font = new Font("Consolas", 7F, FontStyle.Bold);
+            _vpInstallButton.SetBounds(btnsX, 16, btnW, btnH);
+            _vpInstallButton.Click += (s, e) => OnVoxPopuliInstallClick(null);
+            box.Controls.Add(_vpInstallButton);
+
+            _vpRemoveButton = new RetroButton();
+            _vpRemoveButton.Text = "UNINSTALL";
+            _vpRemoveButton.Font = new Font("Consolas", 7F, FontStyle.Bold);
+            _vpRemoveButton.SetBounds(btnsX + (btnW + btnGap), 16, btnW, btnH);
+            _vpRemoveButton.Enabled = false;
+            _vpRemoveButton.Click += (s, e) => OnVoxPopuliRemoveClick();
+            box.Controls.Add(_vpRemoveButton);
+
+            _vpVersionButton = new RetroButton();
+            _vpVersionButton.Text = "VERSION";
+            _vpVersionButton.Font = new Font("Consolas", 7F, FontStyle.Bold);
+            _vpVersionButton.SetBounds(btnsX + (btnW + btnGap) * 2, 16, btnW, btnH);
+            _vpVersionButton.Click += (s, e) => OnVoxPopuliVersionClick();
+            box.Controls.Add(_vpVersionButton);
+
+            _vpNameLabel = new Label();
+            _vpNameLabel.SetBounds(34, 18, btnsX - 8 - 34, 20);
+            _vpNameLabel.Text = VoxPopuliExtra.DisplayName;
+            _vpNameLabel.Font = new Font("Consolas", 9F, FontStyle.Bold);
+            _vpNameLabel.ForeColor = ThemeGreen;
+            _vpNameLabel.BackColor = Color.Black;
+            box.Controls.Add(_vpNameLabel);
+
+            return box;
+        }
+
+        // Newest pack in the Drive folder differs from the installed one.
+        private bool IsVoxPopuliUpdateAvailable()
+        {
+            return _vpTag != null && _vpLatestTag != null
+                && !string.Equals(_vpTag, _vpLatestTag, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private void UpdateVoxPopuliRowStyles()
+        {
+            bool installed = _vpTag != null;
+            bool update = IsVoxPopuliUpdateAvailable();
+
+            _vpIndicator.Text = installed ? "●" : "○";
+            _vpIndicator.ForeColor = !installed ? ThemeMagenta : (update ? ThemeRed : ThemeGreen);
+            _vpNameLabel.ForeColor = !installed ? ThemeMagenta : (update ? ThemeRed : ThemeGreen);
+            _vpNameLabel.Text = installed && _vpTag.Length > 0
+                ? VoxPopuliExtra.DisplayName + " (" + _vpTag + ")"
+                : VoxPopuliExtra.DisplayName;
+
+            _vpInstallButton.Text = update ? "UPDATE" : (installed ? "REINSTALL" : "INSTALL");
+            if (!_actionInProgress)
+            {
+                _vpInstallButton.Enabled = true;
+                _vpRemoveButton.Enabled = installed;
+                _vpVersionButton.Enabled = true;
+            }
+
+            Color? btnBorder = installed ? ThemeGreen : (Color?)null;
+            Color btnText = installed ? ThemeGreen : ThemeMagenta;
+            _vpInstallButton.BorderColor = update ? ThemeRed : btnBorder;
+            _vpInstallButton.ForeColor = update ? ThemeRed : btnText;
+            _vpRemoveButton.BorderColor = btnBorder;
+            _vpRemoveButton.ForeColor = btnText;
+            _vpVersionButton.BorderColor = btnBorder;
+            _vpVersionButton.ForeColor = btnText;
+
+            _vpBox.Invalidate();
         }
 
         // The lobby patch's box -- same layout as BuildEuiVariantBox.
@@ -1604,6 +1726,10 @@ namespace KekModInstaller
             {
                 return false;
             }
+            if (_installedEuiTag == VoxPopuliExtra.BundledEuiNote)
+            {
+                return false; // Vox Populi's own EUI, not ours to replace
+            }
             return _installedEuiTag == null
                 || (_euiLatestTag != null && !string.Equals(_installedEuiTag, _euiLatestTag, StringComparison.OrdinalIgnoreCase));
         }
@@ -1636,7 +1762,7 @@ namespace KekModInstaller
             // Not the background status check: a click during one of those
             // shouldn't be silently ignored.
             if (_worker.IsBusy || _uninstallWorker.IsBusy || _resetWorker.IsBusy || _euiWorker.IsBusy
-                || _lobbyWorker.IsBusy || _mapWorker.IsBusy || _selfUpdateWorker.IsBusy)
+                || _lobbyWorker.IsBusy || _mapWorker.IsBusy || _vpWorker.IsBusy || _selfUpdateWorker.IsBusy)
             {
                 return;
             }
@@ -1669,7 +1795,7 @@ namespace KekModInstaller
         private bool AnyWorkerBusy()
         {
             return _statusWorker.IsBusy || _worker.IsBusy || _uninstallWorker.IsBusy || _resetWorker.IsBusy
-                || _euiWorker.IsBusy || _lobbyWorker.IsBusy || _mapWorker.IsBusy || _selfUpdateWorker.IsBusy;
+                || _euiWorker.IsBusy || _lobbyWorker.IsBusy || _mapWorker.IsBusy || _vpWorker.IsBusy || _selfUpdateWorker.IsBusy;
         }
 
         private void MainForm_FormClosing(object sender, FormClosingEventArgs e)
@@ -1776,6 +1902,17 @@ namespace KekModInstaller
                 }
             }
 
+            // The Vox Populi Drive folder's pack list, newest first.
+            List<ModRelease> vpReleases = null;
+            try
+            {
+                vpReleases = VoxPopuliExtra.ListReleases();
+            }
+            catch (Exception)
+            {
+                failed.Add("vp");
+            }
+
             // Bonus maps: only the installed ones, to keep the startup
             // GitHub API calls down (rate limit, see GitHubModSource).
             var latestExtraVersions = new Dictionary<string, string>();
@@ -1807,7 +1944,7 @@ namespace KekModInstaller
                 }
             }
 
-            e.Result = new object[] { releasesByModId, tickerText, latestInstallerVersion, lobbyLatestTag, latestExtraVersions, euiLatestTag, failed, euiReleasesByVariantId };
+            e.Result = new object[] { releasesByModId, tickerText, latestInstallerVersion, lobbyLatestTag, latestExtraVersions, euiLatestTag, failed, euiReleasesByVariantId, vpReleases };
         }
 
         private void StatusWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
@@ -1883,6 +2020,12 @@ namespace KekModInstaller
             }
             _euiReleasesByVariantId = euiReleasesByVariantId;
 
+            if (!failed.Contains("vp"))
+            {
+                _vpReleases = (List<ModRelease>)result[8];
+                _vpLatestTag = _vpReleases.Count > 0 ? _vpReleases[0].Tag : null;
+            }
+
             RefreshLocalState();
         }
 
@@ -1898,6 +2041,7 @@ namespace KekModInstaller
             DetectInstalledState();
             UpdateModRowStyles();
             UpdateEuiRowStyles();
+            UpdateVoxPopuliRowStyles();
             UpdateLobbyRowStyles();
         }
 
@@ -1956,6 +2100,11 @@ namespace KekModInstaller
                 _installedEuiVariantId = dlcRoot == null ? null : EuiExtra.DetectInstalledVariantId(dlcRoot);
                 _installedEuiTag = _installedEuiVariantId == null ? null
                     : EuiExtra.InstalledTag(dlcRoot, EuiExtra.ById(_installedEuiVariantId));
+                _vpTag = dlcRoot == null ? null : VoxPopuliExtra.DetectInstalledTag(dlcRoot);
+                if (_vpTag != null && _installedEuiVariantId == "eui" && _installedEuiTag == null)
+                {
+                    _installedEuiTag = VoxPopuliExtra.BundledEuiNote; // the pack's own UI_bc1
+                }
 
                 string gameFolder = InstallerCore.TryGetCiv5GameFolder();
                 _lobbyState = gameFolder == null ? new LobbyPatchState() : LobbyPatch.Detect(gameFolder);
@@ -2156,6 +2305,20 @@ namespace KekModInstaller
                 }
             }
 
+            if (_vpTag != null)
+            {
+                bool vpUpdate = IsVoxPopuliUpdateAvailable();
+                results.Add(new CheckResult(!vpUpdate, vpUpdate
+                    ? VoxPopuliExtra.DisplayName + " " + _vpTag + " is outdated -- " + _vpLatestTag + " is available."
+                    : VoxPopuliExtra.DisplayName + " " + (_vpTag.Length > 0 ? _vpTag : "(unknown version)") + " installed."));
+                if (installedMods.Count > 0)
+                {
+                    results.Add(new CheckResult(false, VoxPopuliExtra.DisplayName + " and "
+                        + string.Join(" and ", installedMods.Select(m => m.DisplayName).ToArray())
+                        + " are both installed -- they can't run together."));
+                }
+            }
+
             List<string> updates = ModRegistry.All
                 .Where(m => _updateAvailableModIds.Contains(m.Id))
                 .Select(m => m.DisplayName)
@@ -2166,6 +2329,10 @@ namespace KekModInstaller
             if (IsLobbyPatchUpdateAvailable())
             {
                 updates.Add(LobbyPatch.DisplayName);
+            }
+            if (IsVoxPopuliUpdateAvailable())
+            {
+                updates.Add(VoxPopuliExtra.DisplayName);
             }
             if (IsEuiUpdateAvailable())
             {
@@ -2310,9 +2477,15 @@ namespace KekModInstaller
                 .Where(m => m.Id != mod.Id && _installedModIds.Contains(m.Id))
                 .ToList();
 
-            if (conflicting.Count > 0)
+            bool dropVp = _vpTag != null;
+            if (conflicting.Count > 0 || dropVp)
             {
-                string names = string.Join(", ", conflicting.Select(m => m.DisplayName).ToArray());
+                List<string> conflictNames = conflicting.Select(m => m.DisplayName).ToList();
+                if (dropVp)
+                {
+                    conflictNames.Add(VoxPopuliExtra.DisplayName);
+                }
+                string names = string.Join(", ", conflictNames.ToArray());
                 DialogResult confirm = MessageBox.Show(
                     this,
                     "Installing " + mod.DisplayName + " will uninstall " + names
@@ -2327,6 +2500,7 @@ namespace KekModInstaller
 
                 _pendingInstallMod = mod;
                 _pendingInstallOptions = options;
+                _removeVpWithUninstall = dropVp;
                 _txtLog.Clear();
                 SetControlsEnabled(false);
                 _progress.Value = 0;
@@ -2409,6 +2583,110 @@ namespace KekModInstaller
             _progress.Value = 0;
             SetStatus("REMOVING " + variant.DisplayName.ToUpperInvariant() + "...");
             _euiWorker.RunWorkerAsync(null);
+        }
+
+        // Same as OnEuiVersionClick for the pack list (the Drive folder);
+        // picking one installs it right away.
+        private void OnVoxPopuliVersionClick()
+        {
+            if (_actionInProgress)
+            {
+                return;
+            }
+            using (var dlg = new VersionPickerForm(VoxPopuliExtra.DisplayName, false, _vpReleases,
+                SettingsManager.GetShowBeta(), _vpTag))
+            {
+                if (dlg.ShowDialog(this) != DialogResult.OK)
+                {
+                    return;
+                }
+                OnVoxPopuliInstallClick(dlg.GetSelectedTag());
+            }
+        }
+
+        // tag null means the newest pack. Installing over a conflicting mod
+        // or an existing EUI asks first -- VP replaces both.
+        private void OnVoxPopuliInstallClick(string tag)
+        {
+            if (_actionInProgress)
+            {
+                return;
+            }
+            if (InstallerCore.IsCiv5Running())
+            {
+                MessageBox.Show(this, "Civilization V is currently running. Close the game first, then try again.",
+                    VoxPopuliExtra.DisplayName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            List<ModDefinition> conflicting = ModRegistry.All.Where(m => _installedModIds.Contains(m.Id)).ToList();
+            string warning = null;
+            if (conflicting.Count > 0)
+            {
+                warning = "Installing " + VoxPopuliExtra.DisplayName + " will uninstall "
+                    + string.Join(", ", conflicting.Select(m => m.DisplayName).ToArray())
+                    + " first -- these mods can't run side by side in Civilization V. Continue?";
+            }
+            else if (_installedEuiVariantId != null && _vpTag == null)
+            {
+                warning = VoxPopuliExtra.DisplayName + " ships its own EUI and will replace the one installed. Continue?";
+            }
+            if (warning != null && MessageBox.Show(this, warning, "Install " + VoxPopuliExtra.DisplayName,
+                MessageBoxButtons.YesNo, MessageBoxIcon.Warning) != DialogResult.Yes)
+            {
+                return;
+            }
+            _txtLog.Clear();
+            SetControlsEnabled(false);
+            _progress.Value = 0;
+            SetStatus("INSTALLING " + VoxPopuliExtra.DisplayName.ToUpperInvariant() + "...");
+            _vpWorker.RunWorkerAsync(new object[] { true, tag, conflicting });
+        }
+
+        private void OnVoxPopuliRemoveClick()
+        {
+            if (_actionInProgress)
+            {
+                return;
+            }
+            if (InstallerCore.IsCiv5Running())
+            {
+                MessageBox.Show(this, "Civilization V is currently running. Close the game first, then try again.",
+                    VoxPopuliExtra.DisplayName, MessageBoxButtons.OK, MessageBoxIcon.Information);
+                return;
+            }
+            _txtLog.Clear();
+            SetControlsEnabled(false);
+            _progress.Value = 0;
+            SetStatus("REMOVING " + VoxPopuliExtra.DisplayName.ToUpperInvariant() + "...");
+            _vpWorker.RunWorkerAsync(new object[] { false, null, new List<ModDefinition>() });
+        }
+
+        private void VpWorker_DoWork(object sender, DoWorkEventArgs e)
+        {
+            var args = (object[])e.Argument;
+            bool install = (bool)args[0];
+            var worker = (BackgroundWorker)sender;
+            int lastPercent = 0;
+            Action<string> log = msg => worker.ReportProgress(lastPercent, msg);
+            Action<int> progress = pct => { lastPercent = pct; worker.ReportProgress(pct, null); };
+
+            string dlcRoot = InstallerCore.TryGetDlcFolder();
+            if (dlcRoot == null)
+            {
+                throw new InvalidOperationException("Couldn't locate the Civilization V DLC folder.");
+            }
+            foreach (ModDefinition mod in (List<ModDefinition>)args[2])
+            {
+                InstallerCore.Uninstall(mod, log, progress);
+            }
+            if (install)
+            {
+                VoxPopuliExtra.Install(dlcRoot, (string)args[1], log);
+            }
+            else
+            {
+                VoxPopuliExtra.Remove(dlcRoot, log);
+            }
         }
 
         // Both buttons go through here. Civ5 must be closed: it holds
@@ -2888,6 +3166,15 @@ namespace KekModInstaller
             {
                 InstallerCore.Uninstall(mod, log, progress);
             }
+            if (_removeVpWithUninstall)
+            {
+                _removeVpWithUninstall = false;
+                string dlcRoot = InstallerCore.TryGetDlcFolder();
+                if (dlcRoot != null)
+                {
+                    VoxPopuliExtra.Remove(dlcRoot, log);
+                }
+            }
         }
 
         private void UninstallWorker_RunWorkerCompleted(object sender, RunWorkerCompletedEventArgs e)
@@ -3017,6 +3304,7 @@ namespace KekModInstaller
             {
                 UpdateModRowStyles();
                 UpdateEuiRowStyles();
+                UpdateVoxPopuliRowStyles();
                 UpdateLobbyRowStyles();
             }
             else
@@ -3037,6 +3325,9 @@ namespace KekModInstaller
                     row.RemoveButton.Enabled = false;
                     row.VersionButton.Enabled = false;
                 }
+                _vpInstallButton.Enabled = false;
+                _vpRemoveButton.Enabled = false;
+                _vpVersionButton.Enabled = false;
                 _lobbyInstallButton.Enabled = false;
                 _lobbyRemoveButton.Enabled = false;
             }

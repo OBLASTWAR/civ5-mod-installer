@@ -198,7 +198,7 @@ namespace KekModInstaller
         // follow the confirm-token cookie if Google set one, then fall back
         // to the drive.usercontent.google.com host with confirm=t if it
         // still comes back as an HTML interstitial instead of the file.
-        private static string DownloadFromGoogleDrive(string fileId, Action<string> log)
+        internal static string DownloadFromGoogleDrive(string fileId, Action<string> log)
         {
             var handler = new HttpClientHandler();
             handler.CookieContainer = new CookieContainer();
