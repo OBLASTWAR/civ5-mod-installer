@@ -2498,6 +2498,13 @@ class Cli:
                                                    else self.out.m(mod.extra.name))
                               + (self.out.g("  » update: " + state.extra_updates[mod.extra.id])
                                  if mod.extra.id in state.extra_updates else ""))
+        if state.vp is None:
+            self.out.line("  %s %s" % (self.out.m("○"), self.out.m(VP_NAME)))
+        else:
+            line = "  %s %s" % (self.out.g("●"), self.out.g(VP_NAME + ("  " + state.vp if state.vp else "")))
+            if state.vp_update:
+                line += self.out.g("  » update: " + state.vp_update)
+            self.out.line(line)
         self.out.section("INTERFACE MODS")
         for v in EUI_VARIANTS:
             active = state.eui == v.id
@@ -2510,14 +2517,6 @@ class Cli:
                 if active and state.eui_update:
                     line += self.out.g("  » update: " + state.eui_update)
                 self.out.line(line)
-        self.out.section("VOX POPULI")
-        if state.vp is None:
-            self.out.line("  %s %s" % (self.out.m("○"), self.out.m(VP_NAME)))
-        else:
-            line = "  %s %s" % (self.out.g("●"), self.out.g(VP_NAME + ("  " + state.vp if state.vp else "")))
-            if state.vp_update:
-                line += self.out.g("  » update: " + state.vp_update)
-            self.out.line(line)
         self.out.section("NETWORK MODS")
         if state.lobby is None:
             self.out.line("  %s %s" % (self.out.m("○"), self.out.m(LOBBY_NAME)))
@@ -3240,8 +3239,8 @@ class Tui:
         scr.erase()
         h, w = scr.getmaxyx()
         self.buttons = []
-        if h < 30 or w < 72:
-            self.put(h // 2, max(0, (w - 34) // 2), "TERMINAL TOO SMALL -- NEED 72x30", self.attr["mag"])
+        if h < 28 or w < 72:
+            self.put(h // 2, max(0, (w - 34) // 2), "TERMINAL TOO SMALL -- NEED 72x28", self.attr["mag"])
             self.put(h // 2 + 1, max(0, (w - 20) // 2), "(now %dx%d, Q quits)" % (w, h), self.attr["dim"])
             if refresh:
                 scr.refresh()
@@ -3252,7 +3251,6 @@ class Tui:
         y = self._draw_header(x0, W, big)
         y = self._draw_mods(y, x0, W)
         y = self._draw_eui(y, x0, W)
-        y = self._draw_vp(y, x0, W)
         y = self._draw_lobby(y, x0, W)
         # progress + status
         bar_w = W - 8
@@ -3333,7 +3331,7 @@ class Tui:
                 Btn("mod:%s:version" % mod.id, "VERSION", lambda: self.on_version(mod), ok, col)]
 
     def _draw_mods(self, y, x0, W):
-        rows = sum(2 if m.extra else 1 for m in MODS)
+        rows = sum(2 if m.extra else 1 for m in MODS) + 1  # + Vox Populi
         self.box(y, x0, rows + 2, W, "GAME MODS", "mag")
         bw = 13
         bx = x0 + W - 2 - (3 * bw + 2)
@@ -3376,6 +3374,27 @@ class Tui:
                     self.button(Btn("map:%s" % mod.id, "UPDATE" if upd else "INSTALL", lambda m=mod: self.on_map(m),
                                     not self.busy, "red" if upd else "grn"), ry + 1, self._col_x[2], bw, self.buttons)
             ry += 2 if mod.extra else 1
+        # Vox Populi: not a MODS entry (three unversioned folders), but it
+        # sits in this group like one.
+        installed = st.vp is not None
+        a = self.attr["grn"] if installed else self.attr["mag"]
+        self.put(ry, x0 + 2, self.ch("dot") if installed else self.ch("hol"), a)
+        name = VP_NAME.upper()
+        self.put(ry, x0 + 4, name, a)
+        nx = x0 + 4 + len(name) + 2
+        if st.vp:
+            self.put(ry, nx, st.vp, a, maxw=bx - nx - 1)
+            nx += len(st.vp) + 2
+        if st.vp_update:
+            self.put(ry, nx, "%s %s available" % (self.ch("arrow"), st.vp_update), self.attr["red"], maxw=bx - nx - 1)
+        col = "grn" if installed else "mag"
+        ok = not self.busy
+        for b, cx in zip([Btn("vp:install", "UPDATE" if st.vp_update else ("REINSTALL" if installed else "INSTALL"),
+                              self.on_vp_install, ok, "red" if st.vp_update else col),
+                          Btn("vp:uninstall", "UNINSTALL", self.on_vp_remove, ok and installed, col),
+                          Btn("vp:version", "VERSION", self.on_vp_version, ok, col)],
+                         self._col_x):
+            self.button(b, ry, cx, bw, self.buttons)
         return y + rows + 2
 
     def _draw_eui(self, y, x0, W):
@@ -3404,29 +3423,6 @@ class Tui:
                              self._col_x):
                 self.button(b, ry, cx, bw, self.buttons)
         return y + n + 2
-
-    def _draw_vp(self, y, x0, W):
-        self.box(y, x0, 3, W, "VOX POPULI", "mag")
-        bw = 13
-        st = self.state
-        ry = y + 1
-        installed = st.vp is not None
-        a = self.attr["grn"] if installed else self.attr["mag"]
-        self.put(ry, x0 + 2, self.ch("dot") if installed else self.ch("hol"), a)
-        label = VP_NAME + ("  " + st.vp if st.vp else "")
-        self.put(ry, x0 + 4, label, a, maxw=self._col_x[0] - x0 - 5)
-        if st.vp_update:
-            nx = x0 + 6 + len(label)
-            self.put(ry, nx, "%s %s available" % (self.ch("arrow"), st.vp_update), a, maxw=self._col_x[0] - nx - 1)
-        col = "grn" if installed else "mag"
-        ok = not self.busy
-        for b, cx in zip([Btn("vp:install", "UPDATE" if st.vp_update else ("REINSTALL" if installed else "INSTALL"),
-                              self.on_vp_install, ok, "red" if st.vp_update else col),
-                          Btn("vp:uninstall", "UNINSTALL", self.on_vp_remove, ok and installed, col),
-                          Btn("vp:version", "VERSION", self.on_vp_version, ok, col)],
-                         self._col_x):
-            self.button(b, ry, cx, bw, self.buttons)
-        return y + 3
 
     def _draw_lobby(self, y, x0, W):
         self.box(y, x0, 3, W, "NETWORK MODS", "mag")

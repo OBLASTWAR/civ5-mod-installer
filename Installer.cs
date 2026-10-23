@@ -461,7 +461,7 @@ namespace KekModInstaller
         private Dictionary<string, List<ModRelease>> _euiReleasesByVariantId = new Dictionary<string, List<ModRelease>>();
         private BackgroundWorker _euiWorker;
 
-        // VOX POPULI section: the VP + EUI modpack (see VoxPopuliExtra.cs).
+        // Vox Populi, in the GAME MODS group: the VP + EUI modpack (see VoxPopuliExtra.cs).
         // One box, INSTALL/UNINSTALL/VERSION like the EUI boxes.
         private Panel _vpBox;
         private Label _vpIndicator;
@@ -718,11 +718,17 @@ namespace KekModInstaller
                 modBoxes.Add(box);
                 innerY += box.Height + 8;
             }
+            // Vox Populi: not a ModRegistry entry (three unversioned folders,
+            // see VoxPopuliExtra), but it lives in this group like one.
+            _vpBox = BuildVoxPopuliBox(outerPadSide, innerY, innerWidth);
+            modBoxes.Add(_vpBox);
+            innerY += _vpBox.Height + 8;
             int gameModsHeight = innerY - 8 + outerPadBottom;
             var gameModsBox = MakeRetroBox("GAME MODS", 12, gameModsY, 532, gameModsHeight);
             foreach (Panel box in modBoxes) { gameModsBox.Controls.Add(box); }
             Controls.Add(gameModsBox);
             UpdateModRowStyles();
+            UpdateVoxPopuliRowStyles();
 
             // INTERFACE MODS -- same nested-box treatment for EUI/EUI XITS,
             // top of the right-hand column (RightColumnX).
@@ -744,17 +750,8 @@ namespace KekModInstaller
             Controls.Add(interfaceModsBox);
             UpdateEuiRowStyles();
 
-            // VOX POPULI -- under INTERFACE MODS, same nested-box treatment.
-            int vpY = interfaceModsY + interfaceModsHeight + 8;
-            _vpBox = BuildVoxPopuliBox(outerPadSide, outerPadTop, innerWidth);
-            int vpHeight = outerPadTop + _vpBox.Height + outerPadBottom;
-            var vpOuterBox = MakeRetroBox("VOX POPULI", RightColumnX, vpY, 532, vpHeight);
-            vpOuterBox.Controls.Add(_vpBox);
-            Controls.Add(vpOuterBox);
-            UpdateVoxPopuliRowStyles();
-
             // NETWORK MODS -- the lobby patch, same nested-box treatment.
-            int networkModsY = vpY + vpHeight + 8;
+            int networkModsY = interfaceModsY + interfaceModsHeight + 8;
             _lobbyBox = BuildLobbyPatchBox(outerPadSide, outerPadTop, innerWidth);
             int networkModsHeight = outerPadTop + _lobbyBox.Height + outerPadBottom;
             var networkModsBox = MakeRetroBox("NETWORK MODS", RightColumnX, networkModsY, 532, networkModsHeight);
@@ -1186,7 +1183,7 @@ namespace KekModInstaller
             return box;
         }
 
-        // Vox Populi's box -- same layout as BuildEuiVariantBox.
+        // Vox Populi's box (in GAME MODS) -- same layout as BuildEuiVariantBox.
         private Panel BuildVoxPopuliBox(int x, int y, int width)
         {
             int boxHeight = 18 + ModRowHeight + 6;
