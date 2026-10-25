@@ -290,7 +290,14 @@ namespace KekModInstaller
         // components like Fish Map Script, whose folder name doesn't change
         // between versions the way a mod's own does).
         public string VersionLabel;
+        // How the mod's last ui_check run went (see ReadUiCheckStatus).
+        public UiCheckStatus UiCheck;
     }
+
+    // What a mod's last ui_check run left in ui_check_result.txt next to its
+    // ui_check.bat (kek-mod 2.5+ writes one). Unknown for scripts that don't,
+    // so those mods keep the plain installed look.
+    internal enum UiCheckStatus { Unknown, Ok, Warnings, Failed, Incomplete }
 
     internal static partial class InstallerCore
     {
@@ -441,6 +448,9 @@ namespace KekModInstaller
             log(modLabel + ": running ui_check.bat...");
             var psi = new ProcessStartInfo();
             psi.FileName = batPath;
+            // Skips the pause kek-mod's script keeps its summary on screen
+            // with for players who double-click it.
+            psi.Arguments = "/nopause";
             psi.WorkingDirectory = extractedDir;
             psi.UseShellExecute = false;
             psi.CreateNoWindow = true;
@@ -466,12 +476,67 @@ namespace KekModInstaller
                 if (proc.ExitCode == 0)
                 {
                     log(modLabel + ": ui_check.bat finished successfully.");
+                    // kek-mod's script flags what still needs a look (two
+                    // EUIs, an EUI one folder too deep) even on success.
+                    foreach (string line in output.ToString().Split('\n'))
+                    {
+                        if (line.TrimStart().StartsWith("WARNING:", StringComparison.Ordinal))
+                        {
+                            log(modLabel + ": " + line.Trim());
+                        }
+                    }
                 }
                 else
                 {
                     log(modLabel + ": ui_check.bat failed with exit code " + proc.ExitCode + ":");
                     log(output.ToString());
                 }
+            }
+        }
+
+        // Reads ui_check_result.txt in an installed mod's folder: its
+        // "result: OK, N files, W warnings" / "result: FAILED, ..." line is
+        // written last, so a file without one means the run stopped partway.
+        // No file at all from a script that writes one means it never ran
+        // (e.g. installed by hand, no ui_check yet). Read on every local scan,
+        // so a ui_check the player reruns by hand shows up too.
+        public static UiCheckStatus ReadUiCheckStatus(string modDir)
+        {
+            try
+            {
+                string resultPath = Path.Combine(modDir, "ui_check_result.txt");
+                if (!File.Exists(resultPath))
+                {
+                    string batPath = Path.Combine(modDir, "ui_check.bat");
+                    return File.Exists(batPath) && File.ReadAllText(batPath).Contains("ui_check_result.txt")
+                        ? UiCheckStatus.Incomplete : UiCheckStatus.Unknown;
+                }
+
+                string result = null;
+                foreach (string line in File.ReadAllLines(resultPath))
+                {
+                    if (line.StartsWith("result:", StringComparison.Ordinal))
+                    {
+                        result = line;
+                    }
+                }
+                if (result == null)
+                {
+                    return UiCheckStatus.Incomplete;
+                }
+                if (result.StartsWith("result: FAILED", StringComparison.Ordinal))
+                {
+                    return UiCheckStatus.Failed;
+                }
+                return result.EndsWith(" 0 warnings", StringComparison.Ordinal) ? UiCheckStatus.Ok : UiCheckStatus.Warnings;
+            }
+            catch (IOException)
+            {
+                return UiCheckStatus.Unknown;
+            }
+            catch (UnauthorizedAccessException)
+            {
+                return UiCheckStatus.Unknown;
             }
         }
 
@@ -554,6 +619,10 @@ namespace KekModInstaller
                     d.ModId = mod.Id;
                     d.DisplayName = mod.DisplayName;
                     d.FolderNames = names;
+                    if (mod.RunsUiCheck)
+                    {
+                        d.UiCheck = ReadUiCheckStatus(Path.Combine(dlcRoot, names[0]));
+                    }
                     found.Add(d);
                 }
 

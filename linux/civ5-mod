@@ -1711,7 +1711,49 @@ class BatchScript:
                 f.write(data.replace(old, new))
 
 
+def ui_check_status(folder):
+    """How the mod's last ui_check run went, from ui_check_result.txt (kek-mod
+    2.5+ writes one): "ok", "warnings", "failed", "incomplete" (no result line,
+    or a script that writes the file but hasn't), or None when not known
+    (MainForm's ReadUiCheckStatus)."""
+    try:
+        res = ci_resolve(os.path.join(folder, "ui_check_result.txt"))
+        if not os.path.isfile(res):
+            bat = ci_resolve(os.path.join(folder, "ui_check.bat"))
+            with open(bat, "rb") as f:
+                return "incomplete" if b"ui_check_result.txt" in f.read() else None
+        result = None
+        with open(res, "rb") as f:
+            for line in f.read().decode("latin-1").splitlines():
+                if line.startswith("result:"):
+                    result = line.strip()
+        if result is None:
+            return "incomplete"
+        if result.startswith("result: FAILED"):
+            return "failed"
+        return "ok" if result.endswith(" 0 warnings") else "warnings"
+    except OSError:
+        return None
+
+
 def run_ui_check(label, folder, log):
+    # A mod that ships its own Linux port (kek-mod's ui_check.sh) gets it run
+    # as is: it verifies every copy and writes ui_check_result.txt, which the
+    # batch subset below can't.
+    sh = ci_resolve(os.path.join(folder, "ui_check.sh"))
+    if os.path.isfile(sh):
+        log(label + ": running ui_check.sh...")
+        try:
+            p = subprocess.run(["bash", sh, folder], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)
+        except (OSError, subprocess.SubprocessError) as e:
+            log("%s: ui_check.sh failed (%s)" % (label, e))
+            return
+        lines = p.stdout.decode("utf-8", "replace").splitlines()
+        for line in lines:
+            if line.lstrip().startswith(("WARNING:", "FAILED:")):
+                log("%s: %s" % (label, line.strip()))
+        log("%s: %s" % (label, lines[-1] if lines else "ui_check.sh exited with code %d" % p.returncode))
+        return
     bat = ci_resolve(os.path.join(folder, "ui_check.bat"))
     if not os.path.isfile(bat):
         log(label + ": ui_check.bat not found in the mod folder, skipping.")
@@ -1842,6 +1884,7 @@ def uninstall_mod(game, mod, log, progress):
 class State:
     def __init__(self, game, releases, show_beta):
         self.installed = {}   # mod id -> [folder names]
+        self.uicheck = {}     # mod id -> ui_check_status() of the installed folder
         self.extras = {}      # extra id -> version label ("" if unknown); absent = not installed
         self.updates = {}     # mod id -> tag auto-install would pick now
         self.extra_updates = {}  # extra id -> newer upstream version of an installed bonus map
@@ -1858,6 +1901,7 @@ class State:
             dirs = installed_folders(game, mod)
             if dirs:
                 self.installed[mod.id] = [os.path.basename(d) for d in dirs]
+                self.uicheck[mod.id] = ui_check_status(dirs[0])
                 latest = latest_release(mod, releases.get(mod.id), show_beta)
                 if latest and mod.folder_for(latest.tag).lower() != self.installed[mod.id][0].lower():
                     self.updates[mod.id] = latest.tag
@@ -1956,6 +2000,12 @@ def run_checks(game, state):
     missing = state.missing_maps()
     out.append((not missing, "; ".join("%s is missing its %s" % (m.name, m.extra.name) for m in missing) + "."
                 if missing else "No missing bonus maps."))
+    why = {"failed": "failed to copy some UI files -- close Civ V and reinstall it",
+           "warnings": "finished with warnings -- see ui_check_result.txt in its folder",
+           "incomplete": "didn't finish -- close Civ V and reinstall it"}
+    bad = ["%s's ui_check %s" % (m.name, why[state.uicheck[m.id]])
+           for m in MODS if state.uicheck.get(m.id) in why]
+    out.append((not bad, "; ".join(bad) + "." if bad else "No failed ui_check runs."))
     v = state.eui_variant()
     if v is None:
         out.append((True, "No EUI variant installed."))
@@ -2373,6 +2423,12 @@ class Out:
     def d(self, s):
         return self.c("38;5;89", s)
 
+    def r(self, s):
+        return self.c("1;38;5;203", s)
+
+    def y(self, s):
+        return self.c("1;38;5;220", s)
+
     def _emit(self, s, stream=None):
         if self.color:
             s = "\033[%sm%s\033[0m" % (self.BASE, s)
@@ -2490,6 +2546,12 @@ class Cli:
                 line += self.out.g("  " + v)
             if mod.id in state.updates:
                 line += self.out.g("  » update: " + state.updates[mod.id])
+            uc = state.uicheck.get(mod.id) if v else None
+            if uc == "failed":
+                line += self.out.r("  UI CHECK FAILED -- reinstall, see ui_check_result.txt")
+            elif uc in ("warnings", "incomplete"):
+                line += self.out.y("  UI CHECK " + ("WARNINGS -- see ui_check_result.txt" if uc == "warnings"
+                                                     else "NOT FINISHED -- reinstall"))
             self.out.line(line)
             if mod.extra:
                 ev = state.extras.get(mod.extra.id)
@@ -3010,10 +3072,12 @@ class Tui:
         self.rich = rich
         # Green is reserved for installed mods/maps/EUI; everything else is
         # magenta. "dim" is a dark magenta for decoration (shadows, empty
-        # progress, key hints). Red is only for UPDATE buttons, as on Windows.
-        G, D, M, R = (46, 89, 199, 203) if rich else (c.COLOR_GREEN, c.COLOR_MAGENTA, c.COLOR_MAGENTA, c.COLOR_RED)
+        # progress, key hints). Red is for UPDATE buttons and a failed
+        # ui_check, yellow for one with warnings or that didn't finish, as on
+        # Windows.
+        G, D, M, R, Y = (46, 89, 199, 203, 220) if rich else (c.COLOR_GREEN, c.COLOR_MAGENTA, c.COLOR_MAGENTA, c.COLOR_RED, c.COLOR_YELLOW)
         K = c.COLOR_BLACK
-        for i, (fg, bg) in enumerate([(G, K), (D, K), (M, K), (K, G), (K, M), (R, K), (K, R)], 1):
+        for i, (fg, bg) in enumerate([(G, K), (D, K), (M, K), (K, G), (K, M), (R, K), (K, R), (Y, K), (K, Y)], 1):
             c.init_pair(i, fg, bg)
         self.attr = {
             "grn": c.color_pair(1) | c.A_BOLD, "dim": c.color_pair(2) | (0 if rich else c.A_DIM),
@@ -3022,6 +3086,7 @@ class Tui:
             # disabled: same hue as the row's install state, just not bold
             "grn_off": c.color_pair(1), "mag_off": c.color_pair(3),
             "red": c.color_pair(6) | c.A_BOLD, "red_inv": c.color_pair(7) | c.A_BOLD, "red_off": c.color_pair(6),
+            "yel": c.color_pair(8) | c.A_BOLD, "yel_inv": c.color_pair(9) | c.A_BOLD, "yel_off": c.color_pair(8),
         }
         self.copper = []
         if rich and c.COLOR_PAIRS > 40:
@@ -3319,14 +3384,23 @@ class Tui:
         self.put(y, x0, self.ch("h") * W, self.attr["mag"])
         return y + 1
 
+    def _uicheck(self, mod):
+        """(color, text) for an installed mod whose ui_check failed, warned or
+        didn't finish; (None, None) otherwise (MainForm.UiCheckColor)."""
+        status = self.state.uicheck.get(mod.id) if mod.id in self.state.installed else None
+        return {"failed": ("red", "UI CHECK FAILED"), "warnings": ("yel", "UI CHECK WARNINGS"),
+                "incomplete": ("yel", "UI CHECK NOT FINISHED")}.get(status, (None, None))
+
     def _mod_buttons(self, mod):
         st = self.state
         installed = mod.id in st.installed
         update = mod.id in st.updates
         ok = not self.busy
         col = "grn" if installed else "mag"
+        # REINSTALL reruns ui_check, so it takes a failed/unfinished run's color.
+        uc = self._uicheck(mod)[0]
         return [Btn("mod:%s:install" % mod.id, "UPDATE" if update else ("REINSTALL" if installed else "INSTALL"),
-                    lambda: self.on_install(mod), ok, "red" if update else col),
+                    lambda: self.on_install(mod), ok, "red" if update else (uc or col)),
                 Btn("mod:%s:uninstall" % mod.id, "UNINSTALL", lambda: self.on_uninstall(mod), ok and installed, col),
                 Btn("mod:%s:version" % mod.id, "VERSION", lambda: self.on_version(mod), ok, col)]
 
@@ -3340,7 +3414,8 @@ class Tui:
         ry = y + 1
         for mod in MODS:
             installed = mod.id in st.installed
-            a = self.attr["grn"] if installed else self.attr["mag"]
+            uc, uc_text = self._uicheck(mod)
+            a = self.attr[uc] if uc else (self.attr["grn"] if installed else self.attr["mag"])
             self.put(ry, x0 + 2, self.ch("dot") if installed else self.ch("hol"), a)
             name = mod.name.upper()
             self.put(ry, x0 + 4, name, a)
@@ -3349,6 +3424,9 @@ class Tui:
                 v = st.mod_version(mod)
                 self.put(ry, nx, v, a, maxw=bx - nx - 1)
                 nx += len(v) + 2
+            if uc_text:
+                self.put(ry, nx, uc_text, a, maxw=bx - nx - 1)
+                nx += len(uc_text) + 2
             if mod.id in st.updates:
                 self.put(ry, nx, "%s %s available" % (self.ch("arrow"), st.updates[mod.id]), self.attr["red"], maxw=bx - nx - 1)
             for b, cx in zip(self._mod_buttons(mod), self._col_x):

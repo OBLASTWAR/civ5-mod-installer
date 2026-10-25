@@ -426,6 +426,11 @@ namespace KekModInstaller
         // right now (see IsUpdateAvailable) -- turns that mod's INSTALL
         // button into an UPDATE button, see UpdateModRowStyles.
         private readonly HashSet<string> _updateAvailableModIds = new HashSet<string>();
+        // How each installed mod's last ui_check went, from its
+        // ui_check_result.txt (DetectInstalledState). A failed or unfinished
+        // run turns that mod's box red/yellow -- nobody reads ui_check's
+        // console, so the box is where it has to show.
+        private readonly Dictionary<string, UiCheckStatus> _uiCheckByModId = new Dictionary<string, UiCheckStatus>();
         // Newest upstream version of each installed bonus component, keyed
         // by ExtraModId -- fetched once at startup (StatusWorker_DoWork),
         // same as the mod release lists.
@@ -517,6 +522,9 @@ namespace KekModInstaller
         internal static readonly Color ThemeGreen = Color.FromArgb(0, 255, 65);
         internal static readonly Color ThemeMagenta = Color.FromArgb(255, 0, 190);
         internal static readonly Color ThemeRed = Color.FromArgb(255, 60, 60);
+        // A mod whose ui_check finished with warnings or didn't finish (see
+        // UiCheckColor). Red stays for UPDATE and a failed ui_check.
+        internal static readonly Color ThemeYellow = Color.FromArgb(255, 210, 0);
         // Dim/"off" indicator color -- matches RetroButton's disabled-text
         // color so "not installed" reads consistently across the UI.
         internal static readonly Color ThemeDim = Color.FromArgb(0, 100, 40);
@@ -1024,7 +1032,8 @@ namespace KekModInstaller
             int boxHeight = 18 + (hasExtra ? 2 : 1) * ModRowHeight + 6;
 
             var box = MakeRetroBox(mod.DisplayName.ToUpperInvariant(), x, y, width, boxHeight,
-                () => _installedModIds.Contains(mod.Id) ? ThemeGreen : ThemeMagenta);
+                () => _installedModIds.Contains(mod.Id) ? (UiCheckColor(mod.Id) ?? ThemeGreen) : ThemeMagenta,
+                () => _installedModIds.Contains(mod.Id) ? UiCheckTitle(mod.Id) : null);
 
             var row = new ModRowControls();
             row.Box = box;
@@ -1340,6 +1349,13 @@ namespace KekModInstaller
         // recreate the box. Null keeps the plain always-magenta look above.
         internal static Panel MakeRetroBox(string title, int x, int y, int w, int h, Func<Color> borderColor)
         {
+            return MakeRetroBox(title, x, y, w, h, borderColor, null);
+        }
+
+        // titleSuffix, when set, is appended to the title on every repaint
+        // (e.g. "UI CHECK FAILED" on a mod's box), drawn in the border color.
+        internal static Panel MakeRetroBox(string title, int x, int y, int w, int h, Func<Color> borderColor, Func<string> titleSuffix)
+        {
             var panel = new Panel();
             panel.SetBounds(x, y, w, h);
             panel.BackColor = Color.Black;
@@ -1352,7 +1368,8 @@ namespace KekModInstaller
                 {
                     e.Graphics.DrawRectangle(pen, 0, 0, panel.Width - 1, panel.Height - 1);
                 }
-                string label = " " + title + " ";
+                string suffix = titleSuffix == null ? null : titleSuffix();
+                string label = " " + title + (string.IsNullOrEmpty(suffix) ? "" : " \u00b7 " + suffix) + " "; // ·
                 SizeF sz = e.Graphics.MeasureString(label, titleFont);
                 e.Graphics.FillRectangle(Brushes.Black, 8, 0, sz.Width, sz.Height);
                 using (var brush = new SolidBrush(color))
@@ -1532,6 +1549,75 @@ namespace KekModInstaller
         // (same install-state signal), and each button's enabled state
         // (UNINSTALL only makes sense once something's actually installed).
         // Called after construction and after every status refresh.
+        // Box/button color for a mod's ui_check result: red when files
+        // failed to copy, yellow for warnings or a run that never finished,
+        // null (plain installed green) when clean or not known.
+        private Color? UiCheckColor(string modId)
+        {
+            UiCheckStatus status;
+            if (!_uiCheckByModId.TryGetValue(modId, out status))
+            {
+                return null;
+            }
+            switch (status)
+            {
+                case UiCheckStatus.Failed: return ThemeRed;
+                case UiCheckStatus.Warnings:
+                case UiCheckStatus.Incomplete: return ThemeYellow;
+                default: return null;
+            }
+        }
+
+        // VERIFY MODS line for a mod whose ui_check failed, warned or didn't
+        // finish; null when it's clean or not known.
+        private string UiCheckProblem(ModDefinition mod)
+        {
+            UiCheckStatus status;
+            _uiCheckByModId.TryGetValue(mod.Id, out status);
+            switch (status)
+            {
+                case UiCheckStatus.Failed:
+                    return mod.DisplayName + "'s ui_check.bat failed to copy some UI files -- close Civ V and click REINSTALL";
+                case UiCheckStatus.Warnings:
+                    return mod.DisplayName + "'s ui_check.bat finished with warnings -- see ui_check_result.txt in its folder";
+                case UiCheckStatus.Incomplete:
+                    return mod.DisplayName + "'s ui_check.bat didn't finish -- close Civ V and click REINSTALL";
+                default:
+                    return null;
+            }
+        }
+
+        private string UiCheckTitle(string modId)
+        {
+            UiCheckStatus status;
+            _uiCheckByModId.TryGetValue(modId, out status);
+            switch (status)
+            {
+                case UiCheckStatus.Failed: return "UI CHECK FAILED";
+                case UiCheckStatus.Warnings: return "UI CHECK WARNINGS";
+                case UiCheckStatus.Incomplete: return "UI CHECK NOT FINISHED";
+                default: return null;
+            }
+        }
+
+        private string UiCheckTooltip(string modId)
+        {
+            UiCheckStatus status;
+            _uiCheckByModId.TryGetValue(modId, out status);
+            switch (status)
+            {
+                case UiCheckStatus.Failed:
+                    return "ui_check.bat could not copy some UI files, so parts of the interface won't work in game. "
+                        + "Close Civilization V and click REINSTALL. Details: ui_check_result.txt in the mod folder.";
+                case UiCheckStatus.Warnings:
+                    return "ui_check.bat finished with warnings (e.g. two EUI folders). See ui_check_result.txt in the mod folder.";
+                case UiCheckStatus.Incomplete:
+                    return "ui_check.bat has not finished for this install. Close Civilization V and click REINSTALL.";
+                default:
+                    return null;
+            }
+        }
+
         private void UpdateModRowStyles()
         {
             const string filled = "●"; // ●
@@ -1582,6 +1668,15 @@ namespace KekModInstaller
                 Color btnText = installed ? ThemeGreen : ThemeMagenta;
                 row.InstallButton.BorderColor = updateAvailable ? ThemeRed : btnBorder;
                 row.InstallButton.ForeColor = updateAvailable ? ThemeRed : btnText;
+                // A failed / unfinished ui_check: REINSTALL (which reruns it)
+                // takes the box's red/yellow so it reads as the fix.
+                Color? uiCheckColor = installed ? UiCheckColor(mod.Id) : null;
+                if (uiCheckColor.HasValue && !updateAvailable)
+                {
+                    row.InstallButton.BorderColor = uiCheckColor;
+                    row.InstallButton.ForeColor = uiCheckColor.Value;
+                }
+                _tooltip.SetToolTip(row.NameLabel, installed ? UiCheckTooltip(mod.Id) : null);
                 row.UninstallButton.BorderColor = btnBorder;
                 row.UninstallButton.ForeColor = btnText;
                 row.VersionButton.BorderColor = btnBorder;
@@ -2059,9 +2154,11 @@ namespace KekModInstaller
                 _installedVersionByModId.Clear();
                 _installedExtraVersionByModId.Clear();
                 _updateAvailableModIds.Clear();
+                _uiCheckByModId.Clear();
                 foreach (DetectedModInstall d in detected)
                 {
                     _installedModIds.Add(d.ModId);
+                    _uiCheckByModId[d.ModId] = d.UiCheck;
                     ModDefinition mod = ModRegistry.ById(d.ModId);
                     if (mod != null && d.FolderNames.Count > 0)
                     {
@@ -2281,6 +2378,15 @@ namespace KekModInstaller
             results.Add(missingMaps.Count > 0
                 ? new CheckResult(false, string.Join("; ", missingMaps) + ".")
                 : new CheckResult(true, "No missing bonus maps."));
+
+            List<string> uiChecks = ModRegistry.All
+                .Where(m => _installedModIds.Contains(m.Id))
+                .Select(m => UiCheckProblem(m))
+                .Where(p => p != null)
+                .ToList();
+            results.Add(uiChecks.Count > 0
+                ? new CheckResult(false, string.Join("; ", uiChecks.ToArray()) + ".")
+                : new CheckResult(true, "No failed ui_check runs."));
 
             if (_installedEuiVariantId == null)
             {
