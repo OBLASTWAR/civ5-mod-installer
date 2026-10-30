@@ -377,7 +377,11 @@ namespace KekModInstaller
                 return;
             }
 
-            string scratch = Path.Combine(Path.GetTempPath(), "modinstall_" + Guid.NewGuid().ToString("N"));
+            // Scratch inside Assets (same drive, so the final move is a
+            // rename -- Directory.Move can't cross drives, and %TEMP% is on
+            // C: when the game isn't) but outside Assets/DLC, so a
+            // half-extracted copy is never picked up by the game.
+            string scratch = Path.Combine(Directory.GetParent(dlcRoot).FullName, ".kekmod-install-" + Guid.NewGuid().ToString("N"));
             ZipFile.ExtractToDirectory(zipPath, scratch);
             try
             {
