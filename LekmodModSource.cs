@@ -58,16 +58,29 @@ namespace KekModInstaller
             return ToModRelease(entries[0]); // newest -- Lekmod has no beta channel to filter on
         }
 
+        // From Google Drive, else the mirror's copy if it's the same version.
+        // An entry that came from the mirror's manifest has no file ID.
         public string DownloadRelease(ModRelease release, InstallOptions options, Action<string> log)
         {
             var entry = (Entry)release.Native;
             if (string.IsNullOrEmpty(entry.FileId))
             {
-                throw new InvalidOperationException("Lekmod " + entry.Tag + " has no Google Drive file ID in the manifest.");
+                return Mirror.DownloadMod(MirrorId, entry.Tag, log);
             }
-            log("Google Drive file: " + entry.FileId + (string.IsNullOrEmpty(entry.Size) ? "" : " (" + entry.Size + ")"));
-            return DownloadFromGoogleDrive(entry.FileId, log);
+            return Mirror.Try(Mirror.Drive,
+                () =>
+                {
+                    log("Google Drive file: " + entry.FileId + (string.IsNullOrEmpty(entry.Size) ? "" : " (" + entry.Size + ")"));
+                    return DownloadFromGoogleDrive(entry.FileId, log);
+                },
+                () =>
+                {
+                    log("Google Drive failed -- trying " + Mirror.Host + "...");
+                    return Mirror.DownloadMod(MirrorId, entry.Tag, log);
+                });
         }
+
+        private const string MirrorId = "lekmod";
 
         private class Entry
         {
@@ -93,12 +106,31 @@ namespace KekModInstaller
             return mr;
         }
 
-        // Fetches and parses the manifest, newest tag first.
+        // Fetches and parses the manifest, newest tag first -- or, when
+        // raw.githubusercontent.com can't be reached, the mirror's latest
+        // version alone.
         private static List<Entry> FetchManifest()
+        {
+            return Mirror.Try(Mirror.Raw, FetchManifestFromGitHub, () =>
+            {
+                GhRelease m = Mirror.FetchMod(MirrorId);
+                var e = new Entry();
+                e.Tag = m.TagName;
+                e.ReleaseDate = m.ReleaseDate;
+                if (m.Assets != null && m.Assets.Count > 0 && m.Assets[0].Size > 0)
+                {
+                    e.Size = (m.Assets[0].Size / 1048576.0).ToString("0.0") + " MB";
+                }
+                return new List<Entry> { e };
+            });
+        }
+
+        private static List<Entry> FetchManifestFromGitHub()
         {
             string json;
             using (var client = new HttpClient())
             {
+                client.Timeout = Mirror.RequestTimeout;
                 client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
                 // Cache-busting query param -- same trick Lekmod's own installer
                 // uses (installer_updater.py), since raw.githubusercontent.com's
@@ -207,7 +239,9 @@ namespace KekModInstaller
             using (var client = new HttpClient(handler))
             {
                 client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                client.Timeout = TimeSpan.FromMinutes(10);
+                // Until each response's headers are in; the body has its own
+                // stall timeout (Mirror.CopyTo).
+                client.Timeout = TimeSpan.FromSeconds(60);
 
                 string url = "https://drive.google.com/uc?export=download&id=" + fileId;
                 HttpResponseMessage response = client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult();
@@ -240,11 +274,13 @@ namespace KekModInstaller
 
                 using (response)
                 {
-                    string tempPath = Path.Combine(Path.GetTempPath(), "modinstall_" + Guid.NewGuid().ToString("N") + ".zip");
-                    using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write))
+                    if (!response.IsSuccessStatusCode)
                     {
-                        response.Content.CopyToAsync(fs).GetAwaiter().GetResult();
+                        throw new InvalidOperationException("Google Drive returned " + (int)response.StatusCode + " "
+                            + response.ReasonPhrase + ".");
                     }
+                    string tempPath = Path.Combine(Path.GetTempPath(), "modinstall_" + Guid.NewGuid().ToString("N") + ".zip");
+                    Mirror.CopyTo(client, response, tempPath, null);
                     return tempPath;
                 }
             }

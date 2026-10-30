@@ -27,17 +27,24 @@ namespace KekModInstaller
         // ISO 8601, e.g. "2026-10-03T05:20:31.676Z".
         [DataMember(Name = "released_at")]
         public string ReleasedAt { get; set; }
+
+        // Built from the mirror's latest.json rather than GitLab's answer.
+        public bool FromMirror;
     }
 
     internal class GitLabModSource : IModSource
     {
         private readonly string _owner;
         private readonly string _repo;
+        // The mod's id on the mirror (Mirror.FetchMod), or null if it isn't
+        // mirrored.
+        private readonly string _mirrorId;
 
-        public GitLabModSource(string owner, string repo)
+        public GitLabModSource(string owner, string repo, string mirrorId)
         {
             _owner = owner;
             _repo = repo;
+            _mirrorId = mirrorId;
         }
 
         public List<ModRelease> ListReleases()
@@ -62,32 +69,36 @@ namespace KekModInstaller
             return ToModRelease(releases[0]); // newest -- no beta channel to filter on
         }
 
+        // From GitLab, else the mirror's copy if it's the same version. A
+        // release that came from the mirror (FetchReleases) goes straight there.
         public string DownloadRelease(ModRelease release, InstallOptions options, Action<string> log)
         {
             string tag = release.Tag;
+            if (release.Native == null)
+            {
+                return Mirror.DownloadMod(_mirrorId, tag, log);
+            }
+            if (_mirrorId == null)
+            {
+                return DownloadFromGitLab(tag, log);
+            }
+            return Mirror.Try(Mirror.GitLab, () => DownloadFromGitLab(tag, log), () =>
+            {
+                log("GitLab failed -- trying " + Mirror.Host + "...");
+                return Mirror.DownloadMod(_mirrorId, tag, log);
+            });
+        }
+
+        private string DownloadFromGitLab(string tag, Action<string> log)
+        {
             string url = "https://gitlab.com/" + _owner + "/" + _repo + "/-/archive/"
                 + Uri.EscapeDataString(tag) + "/" + _repo + "-" + Uri.EscapeDataString(tag) + ".zip";
             log("Archive: " + _repo + "-" + tag + ".zip (large, this can take a few minutes)");
 
             string tempPath = Path.Combine(Path.GetTempPath(), "modinstall_" + Guid.NewGuid().ToString("N") + ".zip");
-            using (var client = new HttpClient())
-            {
-                client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                client.Timeout = TimeSpan.FromMinutes(30);
-                using (HttpResponseMessage response = client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult())
-                {
-                    if (!response.IsSuccessStatusCode)
-                    {
-                        throw new InvalidOperationException(
-                            "GitLab returned " + (int)response.StatusCode + " " + response.ReasonPhrase
-                            + " downloading " + _repo + " " + tag + ".");
-                    }
-                    using (var fs = new FileStream(tempPath, FileMode.Create, FileAccess.Write))
-                    {
-                        response.Content.CopyToAsync(fs).GetAwaiter().GetResult();
-                    }
-                }
-            }
+            // GitLab builds the archive on request, so it may take a while
+            // to start answering; after that, Mirror's stall timeout applies.
+            Mirror.DownloadTo(url, tempPath, null, TimeSpan.FromMinutes(5));
             return tempPath;
         }
 
@@ -97,17 +108,33 @@ namespace KekModInstaller
             mr.Tag = r.TagName;
             mr.Prerelease = false;
             mr.DisplayExtra = (r.ReleasedAt != null && r.ReleasedAt.Length >= 10) ? r.ReleasedAt.Substring(0, 10) : null;
-            mr.Native = r;
+            mr.Native = r.FromMirror ? null : r;
             return mr;
         }
 
-        // GitLab returns releases newest-first (ordered by released_at).
+        // GitLab returns releases newest-first (ordered by released_at). When
+        // GitLab can't answer, the mirror's latest alone, marked by a null
+        // ModRelease.Native (see ToModRelease callers).
         private List<GlRelease> FetchReleases()
+        {
+            if (_mirrorId == null)
+            {
+                return FetchReleasesFromGitLab();
+            }
+            return Mirror.Try(Mirror.GitLab, FetchReleasesFromGitLab, () =>
+            {
+                GhRelease m = Mirror.FetchMod(_mirrorId);
+                return new List<GlRelease> { new GlRelease { TagName = m.TagName, ReleasedAt = m.ReleasedAt, FromMirror = true } };
+            });
+        }
+
+        private List<GlRelease> FetchReleasesFromGitLab()
         {
             string url = "https://gitlab.com/api/v4/projects/"
                 + Uri.EscapeDataString(_owner + "/" + _repo) + "/releases?per_page=50";
             using (var client = new HttpClient())
             {
+                client.Timeout = Mirror.RequestTimeout;
                 client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
 
                 HttpResponseMessage response = client.GetAsync(url).GetAwaiter().GetResult();

@@ -118,14 +118,10 @@ namespace KekModInstaller
                 Directory.CreateDirectory(tempDir);
                 try
                 {
-                    using (var client = new HttpClient())
+                    foreach (GhContentsEntry entry in files)
                     {
-                        client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                        foreach (GhContentsEntry entry in files)
-                        {
-                            byte[] data = client.GetByteArrayAsync(entry.DownloadUrl).GetAwaiter().GetResult();
-                            File.WriteAllBytes(Path.Combine(tempDir, entry.Name), ToCrlf(data));
-                        }
+                        byte[] data = Mirror.GetContentsFile(ListingUrl, entry);
+                        File.WriteAllBytes(Path.Combine(tempDir, entry.Name), ToCrlf(data));
                     }
                     foreach (string dir in existing)
                     {
@@ -271,16 +267,11 @@ namespace KekModInstaller
             return null;
         }
 
+        private const string ListingUrl = "https://api.github.com/repos/" + RepoOwner + "/" + RepoName + "/contents/" + DirPath;
+
         private static List<GhContentsEntry> FetchDirectoryListing()
         {
-            string url = "https://api.github.com/repos/" + RepoOwner + "/" + RepoName + "/contents/" + DirPath;
-            byte[] body = GitHubApi.Get(url, null);
-            var serializer = new DataContractJsonSerializer(typeof(List<GhContentsEntry>));
-            using (var stream = new MemoryStream(body))
-            {
-                var entries = (List<GhContentsEntry>)serializer.ReadObject(stream);
-                return entries ?? new List<GhContentsEntry>();
-            }
+            return GitHubModSource.FetchContents(ListingUrl, null);
         }
 
         private static string MapsFolder(string dlcRoot)

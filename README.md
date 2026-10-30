@@ -18,10 +18,12 @@ Then run `civ5-mod`. `civ5-mod self-update` keeps it current.
 
 ## Can't reach GitHub?
 
-`mirror.ww3.cx` keeps a copy of the latest installer, KEK Mod, Fish Map
-Script, EUI, EUI XITS and the lobby patch. Both installers switch to it on
-their own when GitHub times out, is rate-limited or stalls mid-download. To
-get the installer itself from there:
+`mirror.ww3.cx` keeps a copy of the latest version of everything the
+installer offers: the installer itself, KEK Mod, Tournament Mod, Lekmod,
+SnowVe, their bonus maps, EUI, EUI XITS, Vox Populi and the lobby patch.
+Both installers switch to it on their own when GitHub, GitLab or Google Drive
+times out, is rate-limited or stalls mid-download. To get the installer
+itself from there:
 
 - Windows: [`CivVModInstaller.exe`](https://mirror.ww3.cx/v1/OBLASTWAR/civ5-mod-installer/latest/CivVModInstaller.exe)
 - Linux:
@@ -29,9 +31,8 @@ get the installer itself from there:
   curl -fsSL https://mirror.ww3.cx/v1/OBLASTWAR/civ5-mod-installer/latest/civ5-mod | python3 - install-self
   ```
 
-The mirror only has latest releases. Older versions, betas, Tournament Mod,
-Lekmod, SnowVe, Vox Populi and the other bonus maps still need GitHub,
-GitLab or Google Drive.
+The mirror only has the latest version of each. Older versions and betas
+still need GitHub, GitLab or Google Drive.
 
 ## Building and releasing
 

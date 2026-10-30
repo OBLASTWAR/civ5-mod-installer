@@ -79,14 +79,10 @@ namespace KekModInstaller
                     Directory.CreateDirectory(tempDir);
                     try
                     {
-                        using (var client = new HttpClient())
+                        foreach (GhContentsEntry entry in files)
                         {
-                            client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                            foreach (GhContentsEntry entry in files)
-                            {
-                                byte[] data = client.GetByteArrayAsync(entry.DownloadUrl).GetAwaiter().GetResult();
-                                File.WriteAllBytes(Path.Combine(tempDir, entry.Name), data);
-                            }
+                            byte[] data = Mirror.GetContentsFile(ListingUrl, entry);
+                            File.WriteAllBytes(Path.Combine(tempDir, entry.Name), data);
                         }
                         if (Directory.Exists(targetDir))
                         {
@@ -223,18 +219,13 @@ namespace KekModInstaller
             return 0;
         }
 
+        private static readonly string ListingUrl = "https://api.github.com/repositories/" + RepoId + "/contents/";
+
         private static List<GhContentsEntry> FetchDirectoryListing()
         {
-            string url = "https://api.github.com/repositories/" + RepoId + "/contents/";
             // The API is addressed by id to survive renames; the feed needs a
             // name, and github.com redirects a renamed repo's old one.
-            byte[] body = GitHubApi.Get(url, null, "https://github.com/brunotho/Weevee-v11.0.16-Map/commits.atom");
-            var serializer = new DataContractJsonSerializer(typeof(List<GhContentsEntry>));
-            using (var stream = new MemoryStream(body))
-            {
-                var entries = (List<GhContentsEntry>)serializer.ReadObject(stream);
-                return entries ?? new List<GhContentsEntry>();
-            }
+            return GitHubModSource.FetchContents(ListingUrl, "https://github.com/brunotho/Weevee-v11.0.16-Map/commits.atom");
         }
 
         private static string MapsFolder(string dlcRoot)

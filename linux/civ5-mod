@@ -267,29 +267,41 @@ def download_to(url, dest, progress=None, opener=None, timeout=120):
         return ctype
 
 
-# ── GitHub fallback mirror ────────────────────────────────────────────────────
-# Same as Mirror.cs: for players who can't reach GitHub (ISP throttling,
-# outages, the 60/hour API limit). mirror.ww3.cx keeps the latest release of
-# each repo in MIRROR_REPOS, plus the ticker, refreshed every few minutes:
+# ── Fallback mirror ───────────────────────────────────────────────────────────
+# Same as Mirror.cs: for players who can't reach GitHub, GitLab or Google
+# Drive (ISP throttling, outages, GitHub's 60/hour API limit). mirror.ww3.cx
+# keeps the latest version of every mod offered here, plus the ticker,
+# refreshed every few minutes:
 #
 #   <base>ticker.txt
-#   <base><owner>/<repo>/latest.json      GitHub's /releases/latest, cut down
-#   <base><owner>/<repo>/<tag>/<asset>
+#   <base><owner>/<repo>/latest.json      GitHub releases (MIRROR_REPOS), cut down
+#   <base>mods/<id>/latest.json           Lekmod, SnowVe, Vox Populi, same shape
+#   <base>.../<tag>/<file>
+#   <base>api/<contents API path>/listing.json
+#   <base>api/<...>/files/<git blob sha>/<name>
+#                                         GitHub folder listings (MIRROR_CONTENTS):
+#                                         Better Pangaea, Lekmap, Weevee Map
 #
-# latest.json keeps GitHub's field names; its browser_download_url values are
-# relative to it. Everything still goes to GitHub first; mirror_try falls back
-# on any GitHub error, and a NetworkError also parks that GitHub service for
-# MIRROR_DOWN_FOR so the TUI's 30-second refresh doesn't wait out a timeout
-# every round.
+# latest.json keeps GitHub's release field names, listing.json is the contents
+# API's own answer; URLs in both are relative to the file. Everything still
+# goes to the real source first; mirror_try falls back on any error, and a
+# NetworkError also parks that service for MIRROR_DOWN_FOR so the TUI's
+# 30-second refresh doesn't wait out a timeout every round.
 
 MIRROR_BASES = ["https://mirror.ww3.cx/v1/"]
 MIRROR_REPOS = {r.lower() for r in (
     "OBLASTWAR/civ5-mod-installer", "OBLASTWAR/kek-mod", "OBLASTWAR/pangea-stratbal",
     "OBLASTWAR/enhanced-user-interface", "OBLASTWAR/enhanced-user-interface-xits",
-    "OBLASTWAR/civ5-lobby-patch")}
+    "OBLASTWAR/civ5-lobby-patch", "catscatsforever/Civ5-Patch")}
+# api.github.com paths (no trailing slash) of the mirrored folder listings.
+MIRROR_CONTENTS = {p.lower() for p in (
+    "repos/ImmoSS/Civ5-Patch/contents/Maps",          # Better Pangaea
+    "repos/EnormousApplePie/Lekmod/contents/Lekmap",  # Lekmap
+    "repositories/1354734621/contents")}              # Weevee Map
 # Parked separately: in Russia api.github.com often works while
 # raw.githubusercontent.com or the release download CDN doesn't.
 MIRROR_API, MIRROR_RAW, MIRROR_DOWNLOADS = "api", "raw", "downloads"
+MIRROR_DRIVE, MIRROR_GITLAB = "drive", "gitlab"   # Lekmod + Vox Populi, SnowVe
 MIRROR_DOWN_FOR = 10 * 60
 MIRROR_JSON_MAX_AGE = 60
 MIRROR_STALL = 30
@@ -354,9 +366,31 @@ def mirror_latest(owner, repo):
     """The mirror's copy of owner/repo's latest release, asset URLs absolute."""
     if not mirror_covers(owner, repo):
         raise InstallerError("%s/%s isn't mirrored." % (owner, repo))
+    return _mirror_manifest("%s/%s" % (owner, repo))
 
+
+def mirror_mod(mod_id):
+    """The mirror's latest version of a non-GitHub mod: "lekmod", "snowve" or
+    "voxpopuli"."""
+    return _mirror_manifest("mods/" + mod_id)
+
+
+def mirror_download_mod(mod_id, tag, dest_dir, log=None, progress=None):
+    """The mirror's copy of mod_id's version tag, into dest_dir/release.zip.
+    Fails if the mirror's latest is a different version."""
+    rel = mirror_mod(mod_id)
+    if rel["tag_name"].lower() != tag.lower():
+        raise InstallerError("The mirror only has %s %s, not %s." % (mod_id, rel["tag_name"], tag))
+    if not rel.get("assets"):
+        raise InstallerError("The mirror's %s %s has no files." % (mod_id, tag))
+    path = os.path.join(dest_dir, "release.zip")
+    mirror_download(rel["assets"][0], path, log, progress)
+    return path
+
+
+def _mirror_manifest(rel_dir):
     def fetch(base):
-        url = "%s%s/%s/latest.json" % (base, owner, repo)
+        url = "%s%s/latest.json" % (base, rel_dir)
         with _mirror_lock:
             hit = _mirror_json.get(url)
         if hit and time.time() - hit[0] < MIRROR_JSON_MAX_AGE:
@@ -375,6 +409,56 @@ def mirror_latest(owner, repo):
 def mirror_text(path):
     """A file at the top of the mirror, e.g. "ticker.txt"."""
     return _from_each_mirror(lambda base: http_bytes(base + path, timeout=20).decode("utf-8", "replace"))
+
+
+def _contents_path(path):
+    p = path.strip("/")
+    return p if p.lower() in MIRROR_CONTENTS else None
+
+
+def github_contents(path, feed=None):
+    """A GitHub contents API folder listing (the bonus maps that live loose in
+    a repo), from the mirror when GitHub can't answer and it's mirrored."""
+    mp = _contents_path(path)
+    if mp is None:
+        return github_api(path, feed=feed)
+
+    def from_mirror():
+        def fetch(base):
+            url = "%sapi/%s/listing.json" % (base, mp)
+            entries = json.loads(http_bytes(url, timeout=20).decode("utf-8"))
+            for e in entries:
+                e["download_url"] = urllib.parse.urljoin(url, e["download_url"])
+            return entries
+        return _from_each_mirror(fetch)
+    return mirror_try(MIRROR_API, lambda: github_api(path, feed=feed), from_mirror)
+
+
+def _check_blob_sha(entry, data):
+    """Git's blob hash: sha1(b"blob <length>\\0" + content)."""
+    sha = entry.get("sha")
+    if sha and hashlib.sha1(b"blob %d\0" % len(data) + data).hexdigest() != sha.lower():
+        raise InstallerError("%s failed its checksum (download corrupted)." % entry["name"])
+
+
+def github_contents_file(path, entry, dest):
+    """Writes one file of path's folder listing to dest: from GitHub, then the
+    mirror (by its git blob sha), checking that sha either way."""
+    url = entry["download_url"]
+    mp = _contents_path(path)
+
+    def fetch(src):
+        data = http_bytes(src, timeout=MIRROR_STALL)
+        _check_blob_sha(entry, data)
+        return data
+    if mp is None or not entry.get("sha") or not url.startswith("https://raw.githubusercontent.com/"):
+        data = fetch(url)
+    else:
+        name = urllib.parse.quote(entry["name"])
+        data = mirror_try(MIRROR_RAW, lambda: fetch(url), lambda: _from_each_mirror(
+            lambda base: fetch("%sapi/%s/files/%s/%s" % (base, mp, entry["sha"], name))))
+    with open(dest, "wb") as f:
+        f.write(data)
 
 
 def _check_digest(asset, data_or_path):
@@ -802,12 +886,21 @@ class GitLabSource:
     """GitLab Releases with no assets, installed from each tag's source
     archive, top-level folder "<repo>-<tag>" (GitLabModSource.cs)."""
 
-    def __init__(self, owner, repo):
-        self.owner, self.repo = owner, repo
+    def __init__(self, owner, repo, mirror_id=None):
+        self.owner, self.repo, self.mirror_id = owner, repo, mirror_id
 
     def _fetch(self):
+        """Newest first. When GitLab can't answer, the mirror's latest alone,
+        marked "from_mirror"."""
+        if not self.mirror_id:
+            return self._fetch_gitlab()
+        return mirror_try(MIRROR_GITLAB, self._fetch_gitlab,
+                          lambda: [dict(mirror_mod(self.mirror_id), from_mirror=True)])
+
+    def _fetch_gitlab(self):
         path = urllib.parse.quote(self.owner + "/" + self.repo, safe="")
-        rels = json.loads(http_bytes("https://gitlab.com/api/v4/projects/%s/releases?per_page=50" % path).decode("utf-8"))
+        rels = json.loads(http_bytes("https://gitlab.com/api/v4/projects/%s/releases?per_page=50" % path,
+                                     timeout=20).decode("utf-8"))
         if not rels:
             raise InstallerError("No releases found for %s/%s." % (self.owner, self.repo))
         return rels  # newest first (by released_at)
@@ -829,6 +922,18 @@ class GitLabSource:
         return self._to_release(rels[0])
 
     def download(self, release, dest_dir, log, progress):
+        """From GitLab, else the mirror's copy if it's the same version."""
+        if release.native.get("from_mirror"):
+            return mirror_download_mod(self.mirror_id, release.tag, dest_dir, log, progress)
+        if not self.mirror_id:
+            return self._download_gitlab(release, dest_dir, log, progress)
+
+        def from_mirror():
+            log("GitLab failed -- trying %s..." % urllib.parse.urlparse(MIRROR_BASES[0]).hostname)
+            return mirror_download_mod(self.mirror_id, release.tag, dest_dir, log, progress)
+        return mirror_try(MIRROR_GITLAB, lambda: self._download_gitlab(release, dest_dir, log, progress), from_mirror)
+
+    def _download_gitlab(self, release, dest_dir, log, progress):
         t = urllib.parse.quote(release.tag, safe="")
         url = "https://gitlab.com/%s/%s/-/archive/%s/%s-%s.zip" % (self.owner, self.repo, t, self.repo, t)
         log("Archive: %s-%s.zip (large, this can take a few minutes)" % (self.repo, release.tag))
@@ -843,9 +948,22 @@ class LekmodSource:
     MANIFEST = "https://raw.githubusercontent.com/EnormousApplePie/Lekmod/main/LekmodInstaller/github_setup/versions.json"
     supports_beta = False
 
+    MIRROR_ID = "lekmod"
+
     def _manifest(self):
+        """Newest first. When raw.githubusercontent.com can't be reached, the
+        mirror's latest alone (no file_id)."""
+        def from_mirror():
+            m = mirror_mod(self.MIRROR_ID)
+            size = (m.get("assets") or [{}])[0].get("size")
+            native = {"release_date": m.get("release_date"), "size": "%.1f MB" % (size / 1048576) if size else None}
+            extra = ", ".join(x for x in (native["release_date"], native["size"]) if x) or None
+            return [Release(m["tag_name"], False, extra, native)]
+        return mirror_try(MIRROR_RAW, self._manifest_github, from_mirror)
+
+    def _manifest_github(self):
         # Cache-buster: raw.githubusercontent.com can serve a stale copy for minutes.
-        data = json.loads(http_bytes(self.MANIFEST + "?t=%d" % int(time.time())).decode("utf-8"))
+        data = json.loads(http_bytes(self.MANIFEST + "?t=%d" % int(time.time()), timeout=20).decode("utf-8"))
         out = []
         for tag, entry in data.items():
             if isinstance(entry, dict) and entry.get("file_id"):
@@ -869,10 +987,20 @@ class LekmodSource:
         return rels[0]
 
     def download(self, release, dest_dir, log, progress):
-        file_id = release.native["file_id"]
+        """From Google Drive, else the mirror's copy if it's the same version."""
+        file_id = release.native.get("file_id")
+        if not file_id:
+            return mirror_download_mod(self.MIRROR_ID, release.tag, dest_dir, log, progress)
         size = release.native.get("size")
-        log("Google Drive file: " + file_id + (" (%s)" % size if size else ""))
-        return drive_download(file_id, dest_dir, log, progress)
+
+        def from_drive():
+            log("Google Drive file: " + file_id + (" (%s)" % size if size else ""))
+            return drive_download(file_id, dest_dir, log, progress)
+
+        def from_mirror():
+            log("Google Drive failed -- trying %s..." % urllib.parse.urlparse(MIRROR_BASES[0]).hostname)
+            return mirror_download_mod(self.MIRROR_ID, release.tag, dest_dir, log, progress)
+        return mirror_try(MIRROR_DRIVE, from_drive, from_mirror)
 
 
 def drive_download(file_id, dest_dir, log, progress):
@@ -884,15 +1012,15 @@ def drive_download(file_id, dest_dir, log, progress):
     opener = urllib.request.build_opener(urllib.request.HTTPCookieProcessor(jar))
     path = os.path.join(dest_dir, "release.zip")
     url = "https://drive.google.com/uc?export=download&id=" + file_id
-    if download_to(url, path, progress, opener) != "text/html":
+    if download_to(url, path, progress, opener, timeout=60) != "text/html":
         return path
     token = next((c.value for c in jar if "download_warning" in c.name.lower() or "confirm" in c.name.lower()), None)
     if token:
-        if download_to(url + "&confirm=" + token, path, progress, opener) != "text/html":
+        if download_to(url + "&confirm=" + token, path, progress, opener, timeout=60) != "text/html":
             return path
     log("Large file, bypassing Google Drive's virus-scan page...")
     url = "https://drive.usercontent.google.com/download?id=%s&export=download&confirm=t" % file_id
-    if download_to(url, path, progress, opener) != "text/html":
+    if download_to(url, path, progress, opener, timeout=60) != "text/html":
         return path
     raise InstallerError("Google Drive returned a web page instead of the file. It may no longer be "
                          "shared publicly, or its download quota is used up for today.")
@@ -964,6 +1092,7 @@ class BetterPangaeaExtra:
     id = "betterpangaea"
     name = "Better Pangaea"
     pattern = re.compile(r"^Better_Pangaea_V(.+)\.lua$", re.I)
+    LISTING = "repos/ImmoSS/Civ5-Patch/contents/Maps"
 
     def _locals(self, game):
         try:
@@ -977,7 +1106,7 @@ class BetterPangaeaExtra:
 
     def _upstream(self):
         best = None
-        for e in github_api("repos/ImmoSS/Civ5-Patch/contents/Maps"):
+        for e in github_contents(self.LISTING):
             m = self.pattern.match(e.get("name") or "")
             if m and (best is None or version_key(m.group(1)) > version_key(best[1])):
                 best = (e, m.group(1))
@@ -1005,7 +1134,7 @@ class BetterPangaeaExtra:
             else:
                 log("Installing " + name + "...")
                 os.makedirs(game.maps, exist_ok=True)
-                download_to(best[0]["download_url"], os.path.join(game.maps, name))
+                github_contents_file(self.LISTING, best[0], os.path.join(game.maps, name))
                 log(name + " installed.")
             for f in self._locals(game):
                 if os.path.basename(f).lower() != name.lower():
@@ -1027,6 +1156,7 @@ class LekmapExtra:
     id = "lekmap"
     name = "Lekmap"
     folder = "Lekmap"
+    LISTING = "repos/EnormousApplePie/Lekmod/contents/Lekmap"
 
     # Installed as Maps/"Lekmap v6.3" etc., exactly like the Lekmap zip's own
     # folder (LekmapExtra.cs): Civ identifies the lobby's map by full path, so
@@ -1059,7 +1189,7 @@ class LekmapExtra:
 
     @staticmethod
     def _listing():
-        return [e for e in github_api("repos/EnormousApplePie/Lekmod/contents/Lekmap")
+        return [e for e in github_contents(LekmapExtra.LISTING)
                 if e.get("download_url") and e.get("type", "file") == "file"]
 
     def _installed_version(self, d):
@@ -1131,7 +1261,7 @@ class LekmapExtra:
             try:
                 for e in files:
                     path = os.path.join(tmp, os.path.basename(e["name"]))
-                    download_to(e["download_url"], path)
+                    github_contents_file(self.LISTING, e, path)
                     self._to_crlf(path)
                 for d in existing:
                     remove_tree(d)  # older version or folder name
@@ -1187,8 +1317,8 @@ class WeeveeMapExtra:
     def _listing(self):
         # Addressed by id to survive renames; the feed needs a name, and
         # github.com redirects a renamed repo's old one.
-        return [e for e in github_api("repositories/%d/contents/" % self.REPO_ID,
-                                      feed="https://github.com/brunotho/Weevee-v11.0.16-Map/commits.atom")
+        return [e for e in github_contents("repositories/%d/contents/" % self.REPO_ID,
+                                           feed="https://github.com/brunotho/Weevee-v11.0.16-Map/commits.atom")
                 if e.get("download_url") and e.get("type", "file") == "file" and e["name"].lower().endswith(".lua")]
 
     def _version_from(self, files):
@@ -1216,7 +1346,8 @@ class WeeveeMapExtra:
                 tmp = tempfile.mkdtemp(prefix=".kekmod-", dir=game.maps)
                 try:
                     for e in files:
-                        download_to(e["download_url"], os.path.join(tmp, os.path.basename(e["name"])))
+                        github_contents_file("repositories/%d/contents/" % self.REPO_ID, e,
+                                             os.path.join(tmp, os.path.basename(e["name"])))
                     current = os.path.join(game.maps, "Weevee-v%s-Map-main" % ver)
                     if os.path.lexists(current):
                         remove_tree(current)  # same name, wrong contents
@@ -1275,7 +1406,7 @@ MODS = [
            LekmodSource(), "LEKMOD", False, LekmapExtra()),
     # GitLab source archive; its "snowve-<tag>" folder is used as-is (see ModCore.cs).
     ModDef("snowve", "SnowVe", ["snow"], "snowve-",
-           GitLabSource("megawac1", "snowve"), None, False, WeeveeMapExtra()),
+           GitLabSource("megawac1", "snowve", "snowve"), None, False, WeeveeMapExtra()),
 ]
 TOURNAMENT = MODS[1]
 
@@ -1447,10 +1578,21 @@ VP_MARKER = "kekmod-vp-version.txt"
 VP_FOLDERS = ["UI_bc1", "VPUI", "VP_MODPACK"]
 VP_RELEASES_KEY = "vp-releases"  # releases dict: the Drive folder's release list
 VP_EUI_NOTE = "(bundled with VP)"
+VP_MIRROR_ID = "voxpopuli"
 
 
 def vp_releases():
-    """The Drive folder's packs, newest first."""
+    """The Drive folder's packs, newest first -- or, when Drive can't be
+    reached, the mirror's newest pack alone (no file_id)."""
+    def from_mirror():
+        m = mirror_mod(VP_MIRROR_ID)
+        name = (m.get("assets") or [{}])[0].get("name") or m["tag_name"] + "_VP-EUI.zip"
+        host = urllib.parse.urlparse(MIRROR_BASES[0]).hostname
+        return [Release(m["tag_name"], False, "from " + host, {"file_id": None, "name": name})]
+    return mirror_try(MIRROR_DRIVE, _vp_drive_releases, from_mirror)
+
+
+def _vp_drive_releases():
     html = http_bytes("https://drive.google.com/embeddedfolderview?id=" + VP_FOLDER_ID).decode("utf-8", "replace")
     out = {}
     for m in re.finditer(r'id="entry-([^"]+)".*?flip-entry-title">([^<]*)<.*?<div>([^<]*)</div>', html, re.S):
@@ -1502,7 +1644,14 @@ def vp_install(game, tag, log, progress=lambda p: None):
     scratch = tempfile.mkdtemp(prefix=".kekmod-install-", dir=game.assets)
     try:
         log("Downloading %s (large, this can take a few minutes)..." % rel.native["name"])
-        zp = drive_download(rel.native["file_id"], scratch, log, lambda f: progress(5 + int(45 * f)))
+        prog = lambda f: progress(5 + int(45 * f))
+        if not rel.native.get("file_id"):
+            zp = mirror_download_mod(VP_MIRROR_ID, rel.tag, scratch, log, prog)
+        else:
+            def from_mirror():
+                log("Google Drive failed -- trying %s..." % urllib.parse.urlparse(MIRROR_BASES[0]).hostname)
+                return mirror_download_mod(VP_MIRROR_ID, rel.tag, scratch, log, prog)
+            zp = mirror_try(MIRROR_DRIVE, lambda: drive_download(rel.native["file_id"], scratch, log, prog), from_mirror)
         try:
             tops = sorted(zip_top_dirs(zp))
         except zipfile.BadZipFile:

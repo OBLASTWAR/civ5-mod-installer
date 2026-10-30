@@ -1,21 +1,27 @@
-// Mirror.cs -- fallback for players who can't reach GitHub (ISP throttling,
-// GitHub outages, the 60/hour API rate limit). mirror.ww3.cx keeps a copy of
-// the latest release of each repo in Repos, plus the ticker, refreshed every
-// few minutes from GitHub (the sync job lives in the private build repo):
+// Mirror.cs -- fallback for players who can't reach GitHub, GitLab or Google
+// Drive (ISP throttling, outages, GitHub's 60/hour API rate limit).
+// mirror.ww3.cx keeps a copy of the latest version of every mod the
+// installer offers, plus the ticker, refreshed every few minutes (the sync
+// job lives in the private build repo):
 //
 //   <base>ticker.txt
-//   <base><owner>/<repo>/latest.json      GitHub's /releases/latest, cut down
-//   <base><owner>/<repo>/<tag>/<asset>
+//   <base><owner>/<repo>/latest.json      GitHub releases (Repos): /releases/latest, cut down
+//   <base>mods/<id>/latest.json           Lekmod, SnowVe, Vox Populi, same shape
+//   <base>.../<tag>/<file>
+//   <base>api/<contents API path>/listing.json
+//   <base>api/<...>/files/<git blob sha>/<name>
+//                                         GitHub folder listings (ContentsPaths):
+//                                         Better Pangaea, Lekmap, Weevee Map
 //
-// latest.json uses GitHub's own field names, so it parses straight into
-// GhRelease; its browser_download_url values are relative to latest.json.
-// Only the latest release is there, so a VERSION pick of anything older
-// still needs GitHub.
+// latest.json uses GitHub's release field names, so it parses straight into
+// GhRelease; listing.json is the contents API's own answer. URLs in both are
+// relative to the file. Only the latest version is there, so a VERSION pick
+// of anything older still needs the real source.
 //
-// Everything still goes to GitHub first. Try() falls back on any GitHub
+// Everything still goes to the real source first. Try() falls back on any
 // error, and a network-level one (timeout, refused, reset, DNS) also parks
-// that GitHub service for DownFor, so the 30-second status loop goes
-// straight to the mirror instead of waiting out a timeout every round.
+// that service for DownFor, so the 30-second status loop goes straight to
+// the mirror instead of waiting out a timeout every round.
 
 using System;
 using System.Collections.Generic;
@@ -45,14 +51,26 @@ namespace KekModInstaller
             "OBLASTWAR/enhanced-user-interface",
             "OBLASTWAR/enhanced-user-interface-xits",
             "OBLASTWAR/civ5-lobby-patch",
+            "catscatsforever/Civ5-Patch", // Tournament Mod
         };
 
-        // GitHub services, parked separately: in Russia api.github.com often
-        // works while raw.githubusercontent.com or the release download CDN
-        // doesn't.
+        // api.github.com paths (no trailing slash) of the mirrored folder listings.
+        private static readonly HashSet<string> ContentsPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+        {
+            "repos/ImmoSS/Civ5-Patch/contents/Maps",          // Better Pangaea
+            "repos/EnormousApplePie/Lekmod/contents/Lekmap",  // Lekmap
+            "repositories/1354734621/contents",               // Weevee Map
+        };
+
+        // Services, parked separately: in Russia api.github.com often works
+        // while raw.githubusercontent.com or the release download CDN doesn't.
         public const string Api = "api";          // api.github.com + github.com's atom feeds
         public const string Raw = "raw";          // raw.githubusercontent.com
         public const string Downloads = "downloads"; // release assets (github.com -> CDN redirect)
+        public const string Drive = "drive";      // Google Drive (Lekmod, Vox Populi)
+        public const string GitLab = "gitlab";    // gitlab.com (SnowVe)
+
+        private const string ApiPrefix = "https://api.github.com/";
 
         private static readonly TimeSpan DownFor = TimeSpan.FromMinutes(10);
         private static readonly Dictionary<string, DateTime> DownUntil = new Dictionary<string, DateTime>();
@@ -175,9 +193,47 @@ namespace KekModInstaller
             {
                 throw new InvalidOperationException(owner + "/" + repo + " isn't mirrored.");
             }
+            return FetchManifest(owner + "/" + repo);
+        }
+
+        // The mirror's latest version of a non-GitHub mod: "lekmod",
+        // "snowve" or "voxpopuli".
+        public static GhRelease FetchMod(string id)
+        {
+            return FetchManifest("mods/" + id);
+        }
+
+        // Downloads the mirror's copy of mod id's version tag to a temp file
+        // (ext: ".zip"). Fails if the mirror's latest is a different version.
+        public static string DownloadMod(string id, string tag, Action<string> log)
+        {
+            GhRelease release = FetchMod(id);
+            if (!string.Equals(release.TagName, tag, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("The mirror only has " + id + " " + release.TagName + ", not " + tag + ".");
+            }
+            if (release.Assets == null || release.Assets.Count == 0)
+            {
+                throw new InvalidOperationException("The mirror's " + id + " " + tag + " has no files.");
+            }
+            string tempPath = Path.Combine(Path.GetTempPath(), "modinstall_" + Guid.NewGuid().ToString("N") + ".zip");
+            try
+            {
+                Download(release.Assets[0], tempPath, null, log);
+            }
+            catch (Exception)
+            {
+                try { File.Delete(tempPath); } catch (Exception) { }
+                throw;
+            }
+            return tempPath;
+        }
+
+        private static GhRelease FetchManifest(string dir)
+        {
             return FromEachBase(b =>
             {
-                string url = b + owner + "/" + repo + "/latest.json";
+                string url = b + dir + "/latest.json";
                 lock (Lock)
                 {
                     KeyValuePair<DateTime, GhRelease> hit;
@@ -212,6 +268,102 @@ namespace KekModInstaller
         public static string FetchText(string path)
         {
             return FromEachBase(b => Encoding.UTF8.GetString(GetBytes(b + path)));
+        }
+
+        // apiUrl's path below api.github.com if it's a mirrored folder
+        // listing, else null.
+        private static string ContentsPath(string apiUrl)
+        {
+            if (apiUrl == null || !apiUrl.StartsWith(ApiPrefix, StringComparison.OrdinalIgnoreCase))
+            {
+                return null;
+            }
+            string path = apiUrl.Substring(ApiPrefix.Length).TrimEnd('/');
+            return ContentsPaths.Contains(path) ? path : null;
+        }
+
+        public static bool CoversContents(string apiUrl)
+        {
+            return ContentsPath(apiUrl) != null;
+        }
+
+        // The mirror's copy of a GitHub contents API folder listing,
+        // download URLs made absolute.
+        public static List<GhContentsEntry> FetchContents(string apiUrl)
+        {
+            string path = ContentsPath(apiUrl);
+            if (path == null)
+            {
+                throw new InvalidOperationException(apiUrl + " isn't mirrored.");
+            }
+            return FromEachBase(b =>
+            {
+                string url = b + "api/" + path + "/listing.json";
+                List<GhContentsEntry> entries;
+                var serializer = new DataContractJsonSerializer(typeof(List<GhContentsEntry>));
+                using (var stream = new MemoryStream(GetBytes(url)))
+                {
+                    entries = (List<GhContentsEntry>)serializer.ReadObject(stream);
+                }
+                if (entries == null)
+                {
+                    throw new InvalidDataException("Unreadable " + url);
+                }
+                foreach (GhContentsEntry e in entries)
+                {
+                    e.DownloadUrl = new Uri(new Uri(url), e.DownloadUrl).AbsoluteUri;
+                }
+                return entries;
+            });
+        }
+
+        // One file of a folder listing from apiUrl: from GitHub, then the
+        // mirror (by the file's git blob sha), checking that sha either way.
+        public static byte[] GetContentsFile(string apiUrl, GhContentsEntry entry)
+        {
+            string path = ContentsPath(apiUrl);
+            bool fromGitHub = entry.DownloadUrl != null
+                && entry.DownloadUrl.StartsWith("https://raw.githubusercontent.com/", StringComparison.OrdinalIgnoreCase);
+            if (!fromGitHub || path == null || string.IsNullOrEmpty(entry.Sha))
+            {
+                byte[] direct = GetBytes(entry.DownloadUrl);
+                VerifyBlobSha(entry, direct);
+                return direct;
+            }
+            return Try(Raw,
+                () =>
+                {
+                    byte[] data = GetBytes(entry.DownloadUrl);
+                    VerifyBlobSha(entry, data);
+                    return data;
+                },
+                () => FromEachBase(b =>
+                {
+                    byte[] data = GetBytes(b + "api/" + path + "/files/" + entry.Sha + "/" + Uri.EscapeDataString(entry.Name));
+                    VerifyBlobSha(entry, data);
+                    return data;
+                }));
+        }
+
+        // Git's blob hash: sha1("blob <length>\0" + content).
+        private static void VerifyBlobSha(GhContentsEntry entry, byte[] data)
+        {
+            if (string.IsNullOrEmpty(entry.Sha))
+            {
+                return;
+            }
+            byte[] header = Encoding.ASCII.GetBytes("blob " + data.Length + "\0");
+            string got;
+            using (var sha = SHA1.Create())
+            {
+                sha.TransformBlock(header, 0, header.Length, null, 0);
+                sha.TransformFinalBlock(data, 0, data.Length);
+                got = string.Concat(sha.Hash.Select(x => x.ToString("x2")));
+            }
+            if (!string.Equals(got, entry.Sha, StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidDataException(entry.Name + " failed its checksum (download corrupted).");
+            }
         }
 
         private static T FromEachBase<T>(Func<string, T> fetch)
@@ -344,47 +496,71 @@ namespace KekModInstaller
         // a stall or a short body, not just a dropped connection.
         public static void DownloadTo(string url, string path, Action<int> progress)
         {
+            DownloadTo(url, path, progress, RequestTimeout);
+        }
+
+        // headersTimeout: how long the server may take to start answering
+        // (GitLab builds its archives on request).
+        public static void DownloadTo(string url, string path, Action<int> progress, TimeSpan headersTimeout)
+        {
             using (var client = new HttpClient())
             {
-                client.Timeout = RequestTimeout; // until the headers are in
+                client.Timeout = headersTimeout;
                 client.DefaultRequestHeaders.Add("User-Agent", UserAgent);
                 using (HttpResponseMessage response = client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult())
                 {
                     ThrowIfFailed(response, url);
-                    long total = response.Content.Headers.ContentLength ?? 0;
-                    using (Stream input = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
-                    using (FileStream output = File.Create(path))
+                    CopyTo(client, response, path, progress);
+                }
+            }
+        }
+
+        // Writes response's body to path, failing after StallTimeout without
+        // a byte or on a body shorter than its Content-Length. Deletes the
+        // partial file on failure.
+        public static void CopyTo(HttpClient client, HttpResponseMessage response, string path, Action<int> progress)
+        {
+            string host = response.RequestMessage != null ? response.RequestMessage.RequestUri.Host : "the server";
+            long total = response.Content.Headers.ContentLength ?? 0;
+            try
+            {
+                using (Stream input = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
+                using (FileStream output = File.Create(path))
+                {
+                    var buffer = new byte[81920];
+                    long done = 0;
+                    while (true)
                     {
-                        var buffer = new byte[81920];
-                        long done = 0;
-                        while (true)
+                        Task<int> read = input.ReadAsync(buffer, 0, buffer.Length);
+                        if (Task.WaitAny(new Task[] { read }, StallTimeout) < 0)
                         {
-                            Task<int> read = input.ReadAsync(buffer, 0, buffer.Length);
-                            if (Task.WaitAny(new Task[] { read }, StallTimeout) < 0)
-                            {
-                                client.CancelPendingRequests();
-                                throw new TimeoutException("Download from " + new Uri(url).Host + " stalled (no data for "
-                                    + (int)StallTimeout.TotalSeconds + "s).");
-                            }
-                            int n = read.GetAwaiter().GetResult();
-                            if (n == 0)
-                            {
-                                break;
-                            }
-                            output.Write(buffer, 0, n);
-                            done += n;
-                            if (progress != null && total > 0)
-                            {
-                                progress((int)(done * 100 / total));
-                            }
+                            client.CancelPendingRequests();
+                            throw new TimeoutException("Download from " + host + " stalled (no data for "
+                                + (int)StallTimeout.TotalSeconds + "s).");
                         }
-                        if (total > 0 && done != total)
+                        int n = read.GetAwaiter().GetResult();
+                        if (n == 0)
                         {
-                            throw new IOException("Download from " + new Uri(url).Host + " was cut off ("
-                                + done + " of " + total + " bytes).");
+                            break;
+                        }
+                        output.Write(buffer, 0, n);
+                        done += n;
+                        if (progress != null && total > 0)
+                        {
+                            progress((int)(done * 100 / total));
                         }
                     }
+                    if (total > 0 && done != total)
+                    {
+                        throw new IOException("Download from " + host + " was cut off ("
+                            + done + " of " + total + " bytes).");
+                    }
                 }
+            }
+            catch (Exception)
+            {
+                try { File.Delete(path); } catch (Exception) { }
+                throw;
             }
         }
 

@@ -36,12 +36,30 @@ namespace KekModInstaller
             public string FileName;
         }
 
-        // Every pack in the Drive folder, newest first.
+        private const string MirrorId = "voxpopuli";
+
+        // Every pack in the Drive folder, newest first -- or, when Drive
+        // can't be reached, the mirror's newest pack alone (no file ID).
         public static List<ModRelease> ListReleases()
+        {
+            return Mirror.Try(Mirror.Drive, ListDriveReleases, () =>
+            {
+                GhRelease m = Mirror.FetchMod(MirrorId);
+                string name = m.Assets != null && m.Assets.Count > 0 ? m.Assets[0].Name : m.TagName + "_VP-EUI.zip";
+                var mr = new ModRelease();
+                mr.Tag = m.TagName;
+                mr.DisplayExtra = "from " + Mirror.Host;
+                mr.Native = new Pack { FileId = null, FileName = name };
+                return new List<ModRelease> { mr };
+            });
+        }
+
+        private static List<ModRelease> ListDriveReleases()
         {
             string html;
             using (var client = new HttpClient())
             {
+                client.Timeout = Mirror.RequestTimeout;
                 client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
                 html = client.GetStringAsync("https://drive.google.com/embeddedfolderview?id=" + FolderId)
                     .GetAwaiter().GetResult();
@@ -129,7 +147,15 @@ namespace KekModInstaller
             // rename) but outside Assets/DLC, so a half-extracted copy is
             // never picked up by the game.
             string scratch = Path.Combine(Directory.GetParent(dlcRoot).FullName, ".kekmod-install-" + Guid.NewGuid().ToString("N"));
-            string tempZip = LekmodModSource.DownloadFromGoogleDrive(pack.FileId, log);
+            string tempZip = pack.FileId == null
+                ? Mirror.DownloadMod(MirrorId, release.Tag, log)
+                : Mirror.Try(Mirror.Drive,
+                    () => LekmodModSource.DownloadFromGoogleDrive(pack.FileId, log),
+                    () =>
+                    {
+                        log("Google Drive failed -- trying " + Mirror.Host + "...");
+                        return Mirror.DownloadMod(MirrorId, release.Tag, log);
+                    });
             try
             {
                 using (ZipArchive archive = ZipFile.OpenRead(tempZip))

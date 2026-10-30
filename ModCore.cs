@@ -240,7 +240,7 @@ namespace KekModInstaller
             Id = "snowve",
             DisplayName = "SnowVe",
             InstalledFolderGlob = "snowve-*",
-            Source = new GitLabModSource("megawac1", "snowve"),
+            Source = new GitLabModSource("megawac1", "snowve", "snowve"),
             MakeFolderName = tag => "snowve-" + tag, // tag "8.1.0" -> "snowve-8.1.0"
             ZipTopLevelIsFinalFolderName = true,
             ZipSourceDirPrefix = null,

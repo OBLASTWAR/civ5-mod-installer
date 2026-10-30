@@ -35,6 +35,11 @@ namespace KekModInstaller
         // payload that omits it, which is fine everywhere else that ignores it.
         [DataMember(Name = "type")]
         public string Type { get; set; }
+
+        // Git blob sha of the file -- how the mirror stores it, and how
+        // Mirror.GetContentsFile checks a download.
+        [DataMember(Name = "sha")]
+        public string Sha { get; set; }
     }
 
     internal static class TournamentMapExtra
@@ -70,13 +75,9 @@ namespace KekModInstaller
                 else
                 {
                     log("Installing " + latest.Name + "...");
-                    using (var client = new HttpClient())
-                    {
-                        client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                        byte[] data = client.GetByteArrayAsync(latest.DownloadUrl).GetAwaiter().GetResult();
-                        Directory.CreateDirectory(mapsFolder);
-                        File.WriteAllBytes(Path.Combine(mapsFolder, latest.Name), data);
-                    }
+                    byte[] data = Mirror.GetContentsFile(ListingUrl, latest);
+                    Directory.CreateDirectory(mapsFolder);
+                    File.WriteAllBytes(Path.Combine(mapsFolder, latest.Name), data);
                     log(latest.Name + " installed.");
                 }
 
@@ -163,20 +164,11 @@ namespace KekModInstaller
         // returns whichever Better_Pangaea_V*.lua entry parses to the
         // highest version -- there's no Releases API for a loose file, so
         // "latest" has to be derived from the directory listing itself.
+        private const string ListingUrl = "https://api.github.com/repos/" + RepoOwner + "/" + RepoName + "/contents/" + MapsPath;
+
         private static GhContentsEntry FindLatestUpstream()
         {
-            string url = "https://api.github.com/repos/" + RepoOwner + "/" + RepoName + "/contents/" + MapsPath;
-            List<GhContentsEntry> entries;
-            byte[] body = GitHubApi.Get(url, null);
-            var serializer = new DataContractJsonSerializer(typeof(List<GhContentsEntry>));
-            using (var stream = new MemoryStream(body))
-            {
-                entries = (List<GhContentsEntry>)serializer.ReadObject(stream);
-            }
-            if (entries == null)
-            {
-                return null;
-            }
+            List<GhContentsEntry> entries = GitHubModSource.FetchContents(ListingUrl, null);
 
             GhContentsEntry best = null;
             int[] bestVersion = null;

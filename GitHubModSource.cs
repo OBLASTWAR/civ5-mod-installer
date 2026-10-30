@@ -29,6 +29,9 @@ namespace KekModInstaller
         // "sha256:<hex>"; null on assets uploaded before GitHub added it.
         [DataMember(Name = "digest")]
         public string Digest { get; set; }
+
+        [DataMember(Name = "size")]
+        public long Size { get; set; }
     }
 
     [DataContract]
@@ -42,6 +45,14 @@ namespace KekModInstaller
 
         [DataMember(Name = "assets")]
         public List<GhAsset> Assets { get; set; }
+
+        // Only in the mirror's latest.json for non-GitHub mods (Mirror.FetchMod):
+        // Lekmod's manifest date, SnowVe's GitLab release time.
+        [DataMember(Name = "release_date")]
+        public string ReleaseDate { get; set; }
+
+        [DataMember(Name = "released_at")]
+        public string ReleasedAt { get; set; }
     }
 
     internal class GitHubModSource : IModSource
@@ -192,6 +203,27 @@ namespace KekModInstaller
             return Mirror.Try(Mirror.Api,
                 () => FetchLatestReleaseFromGitHub(owner, repo),
                 () => Mirror.FetchLatest(owner, repo));
+        }
+
+        // A GitHub contents API folder listing (the bonus maps that live loose
+        // in a repo), from the mirror when GitHub can't answer and it's
+        // mirrored. feedUrl as for GitHubApi.Get (null: derived from url).
+        public static List<GhContentsEntry> FetchContents(string url, string feedUrl)
+        {
+            Func<List<GhContentsEntry>> fromGitHub = () =>
+            {
+                byte[] body = GitHubApi.Get(url, null, feedUrl);
+                var serializer = new DataContractJsonSerializer(typeof(List<GhContentsEntry>));
+                using (var stream = new MemoryStream(body))
+                {
+                    return (List<GhContentsEntry>)serializer.ReadObject(stream) ?? new List<GhContentsEntry>();
+                }
+            };
+            if (!Mirror.CoversContents(url))
+            {
+                return fromGitHub();
+            }
+            return Mirror.Try(Mirror.Api, fromGitHub, () => Mirror.FetchContents(url));
         }
 
         private static List<GhRelease> FetchReleasesFromGitHub(string owner, string repo)
