@@ -55,7 +55,7 @@ namespace KekModInstaller
                 }
 
                 log("Installing " + FolderName + " " + release.TagName + "...");
-                string zipPath = GitHubModSource.DownloadAsset(asset);
+                string zipPath = GitHubModSource.DownloadAsset(asset, log);
                 if (Directory.Exists(targetDir))
                 {
                     Directory.Delete(targetDir, true); // older version

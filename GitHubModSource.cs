@@ -25,6 +25,10 @@ namespace KekModInstaller
 
         [DataMember(Name = "browser_download_url")]
         public string BrowserDownloadUrl { get; set; }
+
+        // "sha256:<hex>"; null on assets uploaded before GitHub added it.
+        [DataMember(Name = "digest")]
+        public string Digest { get; set; }
     }
 
     [DataContract]
@@ -142,7 +146,7 @@ namespace KekModInstaller
             var ghRelease = (GhRelease)release.Native;
             GhAsset asset = _assetPicker(ghRelease, options);
             log("Asset: " + asset.Name);
-            return DownloadAsset(asset);
+            return DownloadAsset(asset, log);
         }
 
         private static ModRelease ToModRelease(GhRelease r)
@@ -166,7 +170,31 @@ namespace KekModInstaller
             return release.Assets[0];
         }
 
+        // Mirrored repos (see Mirror) fall back to the mirror's latest
+        // release, as a one-entry list, when GitHub can't answer.
         public static List<GhRelease> FetchReleases(string owner, string repo)
+        {
+            if (!Mirror.Covers(owner, repo))
+            {
+                return FetchReleasesFromGitHub(owner, repo);
+            }
+            return Mirror.Try(Mirror.Api,
+                () => FetchReleasesFromGitHub(owner, repo),
+                () => new List<GhRelease> { Mirror.FetchLatest(owner, repo) });
+        }
+
+        public static GhRelease FetchLatestRelease(string owner, string repo)
+        {
+            if (!Mirror.Covers(owner, repo))
+            {
+                return FetchLatestReleaseFromGitHub(owner, repo);
+            }
+            return Mirror.Try(Mirror.Api,
+                () => FetchLatestReleaseFromGitHub(owner, repo),
+                () => Mirror.FetchLatest(owner, repo));
+        }
+
+        private static List<GhRelease> FetchReleasesFromGitHub(string owner, string repo)
         {
             string url = "https://api.github.com/repos/" + owner + "/" + repo + "/releases?per_page=50";
             byte[] body = GitHubApi.Get(url, response => new InvalidOperationException(DescribeError(response, owner, repo)));
@@ -183,7 +211,7 @@ namespace KekModInstaller
             }
         }
 
-        public static GhRelease FetchLatestRelease(string owner, string repo)
+        private static GhRelease FetchLatestReleaseFromGitHub(string owner, string repo)
         {
             string url = "https://api.github.com/repos/" + owner + "/" + repo + "/releases/latest";
             byte[] body = GitHubApi.Get(url, response =>
@@ -236,14 +264,19 @@ namespace KekModInstaller
                 + " for " + owner + "/" + repo + ".";
         }
 
-        public static string DownloadAsset(GhAsset asset)
+        // Downloads asset to a temp file, falling back to the mirror (see
+        // Mirror.Download); log (may be null) hears about a fallback.
+        public static string DownloadAsset(GhAsset asset, Action<string> log)
         {
             string tempPath = Path.Combine(Path.GetTempPath(), "modinstall_" + Guid.NewGuid().ToString("N") + ".zip");
-            using (var client = new HttpClient())
+            try
             {
-                client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                byte[] data = client.GetByteArrayAsync(asset.BrowserDownloadUrl).GetAwaiter().GetResult();
-                File.WriteAllBytes(tempPath, data);
+                Mirror.Download(asset, tempPath, null, log);
+            }
+            catch (Exception)
+            {
+                try { File.Delete(tempPath); } catch (Exception) { }
+                throw;
             }
             return tempPath;
         }
@@ -347,6 +380,7 @@ namespace KekModInstaller
             {
                 using (var client = new HttpClient())
                 {
+                    client.Timeout = Mirror.RequestTimeout;
                     client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
                     string xml = client.GetStringAsync(feedUrl).GetAwaiter().GetResult();
                     var sb = new StringBuilder();
@@ -357,8 +391,14 @@ namespace KekModInstaller
                     return sb.Length == 0 ? null : sb.ToString();
                 }
             }
-            catch (Exception)
+            catch (Exception ex)
             {
+                // github.com unreachable: send mirrored repos straight to the
+                // mirror (Mirror.Try) instead of timing out here every round.
+                if (Mirror.IsNetworkFailure(ex))
+                {
+                    Mirror.MarkDown(Mirror.Api);
+                }
                 return null;
             }
         }
@@ -367,6 +407,7 @@ namespace KekModInstaller
         {
             using (var client = new HttpClient())
             {
+                client.Timeout = Mirror.RequestTimeout;
                 client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
                 client.DefaultRequestHeaders.Add("Accept", "application/vnd.github+json");
                 using (HttpResponseMessage response = client.GetAsync(url).GetAwaiter().GetResult())

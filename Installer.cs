@@ -113,13 +113,11 @@ namespace KekModInstaller
                 + "/" + TickerBranch + "/ticker.txt";
             try
             {
-                using (var client = new HttpClient())
-                {
-                    client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                    string text = client.GetStringAsync(url).GetAwaiter().GetResult();
-                    text = text.Trim();
-                    return text.Length == 0 ? null : text;
-                }
+                string text = Mirror.Try(Mirror.Raw,
+                    () => Encoding.UTF8.GetString(Mirror.GetBytes(url)),
+                    () => Mirror.FetchText("ticker.txt"));
+                text = text.Trim();
+                return text.Length == 0 ? null : text;
             }
             catch (Exception)
             {
@@ -149,13 +147,11 @@ namespace KekModInstaller
             string url = LatestReleaseUrl + "version.txt";
             try
             {
-                using (var client = new HttpClient())
-                {
-                    client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                    string text = client.GetStringAsync(url).GetAwaiter().GetResult();
-                    text = text.Trim();
-                    return text.Length == 0 ? null : text;
-                }
+                string text = Mirror.Try(Mirror.Downloads,
+                    () => Encoding.UTF8.GetString(Mirror.GetBytes(url)),
+                    () => Encoding.UTF8.GetString(Mirror.GetBytes(MirrorAsset("version.txt").BrowserDownloadUrl)));
+                text = text.Trim();
+                return text.Length == 0 ? null : text;
             }
             catch (Exception)
             {
@@ -222,7 +218,9 @@ namespace KekModInstaller
             {
                 try
                 {
-                    DownloadTo(url, newExePath, progress);
+                    Mirror.Try(Mirror.Downloads,
+                        () => { Mirror.DownloadTo(url, newExePath, progress); return true; },
+                        () => { Mirror.Download(MirrorAsset("CivVModInstaller.exe"), newExePath, progress, null); return true; });
                     break;
                 }
                 catch (Exception ex)
@@ -258,33 +256,19 @@ namespace KekModInstaller
             Process.Start(psi);
         }
 
-        private static void DownloadTo(string url, string path, Action<int> progress)
+        // One of the latest installer release's assets, from the mirror --
+        // the fallback when GitHub's releases/latest/download/ can't be
+        // reached.
+        private static GhAsset MirrorAsset(string name)
         {
-            using (var client = new HttpClient())
+            GhRelease release = Mirror.FetchLatest(RepoOwner, RepoName);
+            GhAsset asset = release.Assets == null ? null : release.Assets.FirstOrDefault(
+                a => string.Equals(a.Name, name, StringComparison.OrdinalIgnoreCase));
+            if (asset == null)
             {
-                client.DefaultRequestHeaders.Add("User-Agent", "KekModInstaller");
-                using (HttpResponseMessage response = client.GetAsync(url, HttpCompletionOption.ResponseHeadersRead).GetAwaiter().GetResult())
-                {
-                    response.EnsureSuccessStatusCode();
-                    long total = response.Content.Headers.ContentLength ?? 0;
-                    using (Stream input = response.Content.ReadAsStreamAsync().GetAwaiter().GetResult())
-                    using (FileStream output = File.Create(path))
-                    {
-                        var buffer = new byte[81920];
-                        long done = 0;
-                        int read;
-                        while ((read = input.Read(buffer, 0, buffer.Length)) > 0)
-                        {
-                            output.Write(buffer, 0, read);
-                            done += read;
-                            if (total > 0)
-                            {
-                                progress((int)(done * 100 / total));
-                            }
-                        }
-                    }
-                }
+                throw new InvalidOperationException("The mirror's " + release.TagName + " has no " + name + ".");
             }
+            return asset;
         }
 
         // HttpRequestException's own message is just "An error occurred

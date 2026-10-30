@@ -22,6 +22,8 @@
 #
 # Players install it with one line; afterwards it's just `civ5-mod`:
 #   curl -fsSL https://github.com/OBLASTWAR/civ5-mod-installer/releases/latest/download/civ5-mod | python3 - install-self
+# or, when GitHub can't be reached, the same from the mirror (see mirror_try):
+#   curl -fsSL https://mirror.ww3.cx/v1/OBLASTWAR/civ5-mod-installer/latest/civ5-mod | python3 - install-self
 #
 # Mirrors the Windows *.cs feature for feature: four mutually exclusive mods,
 # each with its bonus map (Fish Map Script / Better Pangaea / Lekmap / Weevee Map), the two
@@ -45,6 +47,8 @@
 # Set GITHUB_TOKEN to lift GitHub's 60 requests/hour anonymous limit.
 
 import argparse
+import hashlib
+import http.client
 import http.cookiejar
 import json
 import locale
@@ -96,6 +100,11 @@ USER_AGENT = "Civ5ModInstaller-Linux/" + VERSION
 
 class InstallerError(Exception):
     """A failure with a message meant for the player, shown as-is."""
+
+
+class NetworkError(InstallerError):
+    """Couldn't talk to the server at all (timeout, refused, reset, DNS), as
+    opposed to an HTTP error answer -- only these park GitHub (mirror_try)."""
 
 
 # ── Settings ──────────────────────────────────────────────────────────────────
@@ -160,12 +169,19 @@ def http_open(url, accept=None, opener=None, timeout=60):
         raise InstallerError(_describe_http_error(e, url)) from None
     except (urllib.error.URLError, OSError) as e:
         reason = getattr(e, "reason", e)
-        raise InstallerError("Couldn't reach %s (%s)." % (urllib.parse.urlparse(url).hostname, reason)) from None
+        raise NetworkError("Couldn't reach %s (%s)." % (urllib.parse.urlparse(url).hostname, reason)) from None
+
+
+def _read_failed(url, e):
+    return NetworkError("Download from %s was cut off (%s)." % (urllib.parse.urlparse(url).hostname, e or "stalled"))
 
 
 def http_bytes(url, accept=None, timeout=60):
     with http_open(url, accept, timeout=timeout) as r:
-        return r.read()
+        try:
+            return r.read()
+        except (OSError, http.client.HTTPException) as e:
+            raise _read_failed(url, e) from None
 
 
 # Every GitHub API call goes through github_api, gated by the repo's public
@@ -193,6 +209,11 @@ def _feed_for(path):
 def _feed_fingerprint(url):
     try:
         xml = http_bytes(url, timeout=15).decode("utf-8", "replace")
+    except NetworkError:
+        # github.com unreachable: send mirrored repos straight to the mirror
+        # instead of timing out here every round.
+        mirror_mark_down(MIRROR_API)
+        return None
     except InstallerError:
         return None
     entries = re.findall(r"<entry>.*?<id>(.*?)</id>.*?<updated>(.*?)</updated>", xml, re.S)
@@ -213,16 +234,17 @@ def github_api(path, feed=None):
         if (now - fetched_at < API_MAX_AGE and now - changed_at >= API_SETTLE
                 and (fp is None or fp == old_fp)):
             return json.loads(data.decode("utf-8"))
-    data = http_bytes("https://api.github.com/" + path, accept="application/vnd.github+json")
+    data = http_bytes("https://api.github.com/" + path, accept="application/vnd.github+json", timeout=20)
     with _API_CACHE_LOCK:
         _API_CACHE[path] = (data, fp if fp is not None else (cached[1] if cached else None), now, changed_at)
     return json.loads(data.decode("utf-8"))
 
 
-def download_to(url, dest, progress=None, opener=None):
+def download_to(url, dest, progress=None, opener=None, timeout=120):
     """Streams url into dest. Returns the response's media type; for a
-    text/html response nothing is written (Google Drive's interstitial)."""
-    with http_open(url, opener=opener, timeout=120) as r:
+    text/html response nothing is written (Google Drive's interstitial).
+    timeout is per read, so it's also the stall timeout."""
+    with http_open(url, opener=opener, timeout=timeout) as r:
         ctype = r.headers.get_content_type()
         if ctype == "text/html":
             return ctype
@@ -230,14 +252,177 @@ def download_to(url, dest, progress=None, opener=None):
         done = 0
         with open(dest, "wb") as out:
             while True:
-                chunk = r.read(1 << 16)
+                try:
+                    chunk = r.read(1 << 16)
+                except (OSError, http.client.HTTPException) as e:
+                    raise _read_failed(url, e) from None
                 if not chunk:
                     break
                 out.write(chunk)
                 done += len(chunk)
                 if progress and total:
                     progress(min(1.0, done / total))
+        if total and done != total:
+            raise _read_failed(url, "%d of %d bytes" % (done, total))
         return ctype
+
+
+# ── GitHub fallback mirror ────────────────────────────────────────────────────
+# Same as Mirror.cs: for players who can't reach GitHub (ISP throttling,
+# outages, the 60/hour API limit). mirror.ww3.cx keeps the latest release of
+# each repo in MIRROR_REPOS, plus the ticker, refreshed every few minutes:
+#
+#   <base>ticker.txt
+#   <base><owner>/<repo>/latest.json      GitHub's /releases/latest, cut down
+#   <base><owner>/<repo>/<tag>/<asset>
+#
+# latest.json keeps GitHub's field names; its browser_download_url values are
+# relative to it. Everything still goes to GitHub first; mirror_try falls back
+# on any GitHub error, and a NetworkError also parks that GitHub service for
+# MIRROR_DOWN_FOR so the TUI's 30-second refresh doesn't wait out a timeout
+# every round.
+
+MIRROR_BASES = ["https://mirror.ww3.cx/v1/"]
+MIRROR_REPOS = {r.lower() for r in (
+    "OBLASTWAR/civ5-mod-installer", "OBLASTWAR/kek-mod", "OBLASTWAR/pangea-stratbal",
+    "OBLASTWAR/enhanced-user-interface", "OBLASTWAR/enhanced-user-interface-xits",
+    "OBLASTWAR/civ5-lobby-patch")}
+# Parked separately: in Russia api.github.com often works while
+# raw.githubusercontent.com or the release download CDN doesn't.
+MIRROR_API, MIRROR_RAW, MIRROR_DOWNLOADS = "api", "raw", "downloads"
+MIRROR_DOWN_FOR = 10 * 60
+MIRROR_JSON_MAX_AGE = 60
+MIRROR_STALL = 30
+_mirror_down = {}   # service -> parked until (time.time())
+_mirror_json = {}   # latest.json url -> (fetched_at, release dict)
+_mirror_lock = threading.Lock()
+_GITHUB_ASSET_URL = re.compile(r"^https://github\.com/([^/]+)/([^/]+)/releases/download/([^/]+)/([^/?#]+)$", re.I)
+
+
+def mirror_covers(owner, repo):
+    return ("%s/%s" % (owner, repo)).lower() in MIRROR_REPOS
+
+
+def mirror_is_down(service):
+    with _mirror_lock:
+        return time.time() < _mirror_down.get(service, 0)
+
+
+def mirror_mark_down(service):
+    with _mirror_lock:
+        _mirror_down[service] = time.time() + MIRROR_DOWN_FOR
+
+
+def _mirror_mark_up(service):
+    with _mirror_lock:
+        _mirror_down.pop(service, None)
+
+
+def mirror_try(service, from_github, from_mirror):
+    """from_github(), or from_mirror() if GitHub fails. Re-raises GitHub's
+    error if the mirror fails too."""
+    github_error = None
+    if not mirror_is_down(service):
+        try:
+            return from_github()
+        except Exception as e:
+            github_error = e
+            if isinstance(e, NetworkError):
+                mirror_mark_down(service)
+    try:
+        return from_mirror()
+    except Exception:
+        if github_error is None:
+            # GitHub was parked and the mirror's out too: ask GitHub anyway.
+            result = from_github()
+            _mirror_mark_up(service)
+            return result
+        raise github_error from None
+
+
+def _from_each_mirror(fetch):
+    last = None
+    for base in MIRROR_BASES:
+        try:
+            return fetch(base)
+        except Exception as e:
+            last = e
+    raise last
+
+
+def mirror_latest(owner, repo):
+    """The mirror's copy of owner/repo's latest release, asset URLs absolute."""
+    if not mirror_covers(owner, repo):
+        raise InstallerError("%s/%s isn't mirrored." % (owner, repo))
+
+    def fetch(base):
+        url = "%s%s/%s/latest.json" % (base, owner, repo)
+        with _mirror_lock:
+            hit = _mirror_json.get(url)
+        if hit and time.time() - hit[0] < MIRROR_JSON_MAX_AGE:
+            return hit[1]
+        rel = json.loads(http_bytes(url, timeout=20).decode("utf-8"))
+        if not rel.get("tag_name"):
+            raise InstallerError("Unreadable " + url)
+        for a in rel.get("assets") or []:
+            a["browser_download_url"] = urllib.parse.urljoin(url, a["browser_download_url"])
+        with _mirror_lock:
+            _mirror_json[url] = (time.time(), rel)
+        return rel
+    return _from_each_mirror(fetch)
+
+
+def mirror_text(path):
+    """A file at the top of the mirror, e.g. "ticker.txt"."""
+    return _from_each_mirror(lambda base: http_bytes(base + path, timeout=20).decode("utf-8", "replace"))
+
+
+def _check_digest(asset, data_or_path):
+    """Raises if the download doesn't match the sha256 GitHub published
+    (assets from before 2025 have none)."""
+    digest = (asset.get("digest") or "").lower()
+    if not digest.startswith("sha256:"):
+        return
+    h = hashlib.sha256()
+    if isinstance(data_or_path, bytes):
+        h.update(data_or_path)
+    else:
+        with open(data_or_path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    if h.hexdigest() != digest[len("sha256:"):]:
+        raise InstallerError("%s failed its checksum (download corrupted)." % asset["name"])
+
+
+def mirror_download(asset, dest, log=None, progress=None):
+    """Downloads a release asset to dest: from GitHub, then the mirror (the
+    other way round while GitHub downloads are parked), checking its sha256.
+    log (may be None) hears about a fallback."""
+    url = asset["browser_download_url"]
+    m = _GITHUB_ASSET_URL.match(url)
+    sources = [url]
+    if m and mirror_covers(m.group(1), m.group(2)):
+        sources += ["%s%s/%s/%s/%s" % ((b,) + m.groups()) for b in MIRROR_BASES]
+        if mirror_is_down(MIRROR_DOWNLOADS):
+            sources = sources[1:] + sources[:1]
+    last = None
+    for src in sources:
+        is_github = m is not None and src == url
+        if not is_github and log:
+            host = urllib.parse.urlparse(src).hostname
+            log("GitHub download failed (%s) -- trying %s..." % (last, host) if last
+                else "Downloading from %s..." % host)
+        try:
+            download_to(src, dest, progress, timeout=MIRROR_STALL)
+            _check_digest(asset, dest)
+            if is_github:
+                _mirror_mark_up(MIRROR_DOWNLOADS)
+            return
+        except InstallerError as e:
+            if is_github and isinstance(e, NetworkError):
+                mirror_mark_down(MIRROR_DOWNLOADS)
+            last = e
+    raise last
 
 
 # ── Versions ──────────────────────────────────────────────────────────────────
@@ -542,15 +727,29 @@ class GitHubSource:
     def __init__(self, owner, repo, supports_beta):
         self.owner, self.repo, self.supports_beta = owner, repo, supports_beta
 
+    # Mirrored repos fall back to the mirror's latest release (a one-entry
+    # list for _fetch) when GitHub can't answer.
     def _fetch(self):
+        if not mirror_covers(self.owner, self.repo):
+            return self._fetch_github()
+        return mirror_try(MIRROR_API, self._fetch_github, lambda: [mirror_latest(self.owner, self.repo)])
+
+    def _latest(self):
+        if not mirror_covers(self.owner, self.repo):
+            return self._latest_github()
+        return mirror_try(MIRROR_API, self._latest_github, lambda: mirror_latest(self.owner, self.repo))
+
+    def _fetch_github(self):
         rels = github_api("repos/%s/%s/releases?per_page=50" % (self.owner, self.repo))
         if not rels:
             raise InstallerError("No releases found for %s/%s." % (self.owner, self.repo))
         return rels
 
-    def _latest(self):
+    def _latest_github(self):
         try:
             return github_api("repos/%s/%s/releases/latest" % (self.owner, self.repo))
+        except NetworkError:
+            raise
         except InstallerError as e:
             if "404" in str(e):
                 raise InstallerError('No "Latest" release found for %s/%s.' % (self.owner, self.repo)) from None
@@ -595,7 +794,7 @@ class GitHubSource:
         asset = assets[0]
         log("Asset: " + asset["name"])
         path = os.path.join(dest_dir, "release.zip")
-        download_to(asset["browser_download_url"], path, progress)
+        mirror_download(asset, path, log, progress)
         return path
 
 
@@ -723,10 +922,7 @@ class FishMapExtra:
 
     @staticmethod
     def _newest():
-        rels = github_api("repos/OBLASTWAR/pangea-stratbal/releases?per_page=50")
-        if not rels:
-            raise InstallerError("no releases found")
-        return rels[0]
+        return GitHubSource("OBLASTWAR", "pangea-stratbal", True)._fetch()[0]
 
     def latest(self):
         return self._newest()["tag_name"]
@@ -745,7 +941,7 @@ class FishMapExtra:
             log("Installing %s %s..." % (self.name, rel["tag_name"]))
             with tempfile.TemporaryDirectory(prefix="kekmod-") as tmp:
                 zp = os.path.join(tmp, "fish.zip")
-                download_to(rel["assets"][0]["browser_download_url"], zp)
+                mirror_download(rel["assets"][0], zp, log)
                 if os.path.isdir(d):
                     remove_tree(d)  # older version
                 os.makedirs(game.maps, exist_ok=True)
@@ -1199,7 +1395,7 @@ def eui_install(game, variant, tag, log, progress=lambda p: None):
     progress(10)
     with tempfile.TemporaryDirectory(prefix="civ5-mod-") as tmp:
         zp = os.path.join(tmp, asset_name)
-        download_to(asset["browser_download_url"], zp, lambda f: progress(10 + int(30 * f)))
+        mirror_download(asset, zp, log, lambda f: progress(10 + int(30 * f)))
         try:
             ok = zip_top_dirs(zp) == [variant.folder]
         except zipfile.BadZipFile:
@@ -1416,7 +1612,7 @@ def lobby_install(game, log, progress=lambda p: None):
     progress(10)
     with tempfile.TemporaryDirectory(prefix="civ5-mod-") as tmp:
         dl = os.path.join(tmp, LOBBY_ASSET)
-        download_to(asset["browser_download_url"], dl, lambda f: progress(10 + int(60 * f)))
+        mirror_download(asset, dl, log, lambda f: progress(10 + int(60 * f)))
         with open(dl, "rb") as f:
             if f.read(2) != b"MZ":
                 raise InstallerError("Downloaded %s isn't a Windows DLL." % asset["name"])
@@ -2245,7 +2441,9 @@ def redownload_game(game, log, progress):
 
 def fetch_ticker():
     try:
-        text = http_bytes(RAW_MAIN + "/ticker.txt", timeout=15).decode("utf-8", "replace").strip()
+        text = mirror_try(MIRROR_RAW,
+                          lambda: http_bytes(RAW_MAIN + "/ticker.txt", timeout=15).decode("utf-8", "replace"),
+                          lambda: mirror_text("ticker.txt")).strip()
         return " ".join(text.split()) or None
     except InstallerError:
         return None
@@ -2254,9 +2452,18 @@ def fetch_ticker():
 def fetch_latest_self():
     """(version, script bytes) of the latest release's copy. Retried once:
     a dropped connection shouldn't mean a failed update."""
+    def from_mirror():
+        rel = mirror_latest(REPO_OWNER, REPO_NAME)
+        asset = next((a for a in rel.get("assets") or [] if a["name"] == "civ5-mod"), None)
+        if asset is None:
+            raise InstallerError("The mirror's %s has no civ5-mod." % rel["tag_name"])
+        data = http_bytes(asset["browser_download_url"], timeout=30)
+        _check_digest(asset, data)
+        return data
+
     for attempt in (1, 2):
         try:
-            data = http_bytes(LATEST_RELEASE + "civ5-mod", timeout=30)
+            data = mirror_try(MIRROR_DOWNLOADS, lambda: http_bytes(LATEST_RELEASE + "civ5-mod", timeout=30), from_mirror)
             break
         except InstallerError as e:
             if "404" in str(e):

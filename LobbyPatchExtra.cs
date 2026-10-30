@@ -83,7 +83,7 @@ namespace KekModInstaller
             }
             log("Release: " + release.TagName);
             log("Downloading " + asset.Name + "...");
-            string temp = GitHubModSource.DownloadAsset(asset);
+            string temp = GitHubModSource.DownloadAsset(asset, log);
             try
             {
                 byte[] dll = File.ReadAllBytes(temp);

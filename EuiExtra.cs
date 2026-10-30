@@ -179,7 +179,7 @@ namespace KekModInstaller
             }
             log("Release: " + release.TagName + (tagName != null ? " [selected version]" : ""));
             log("Downloading " + asset.Name + "...");
-            string tempZip = GitHubModSource.DownloadAsset(asset);
+            string tempZip = GitHubModSource.DownloadAsset(asset, log);
             try
             {
                 using (ZipArchive archive = ZipFile.OpenRead(tempZip))
