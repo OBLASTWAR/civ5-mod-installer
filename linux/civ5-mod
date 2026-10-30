@@ -3213,11 +3213,15 @@ class Tui:
                 if not self.busy:
                     self.refresh_state()
 
-    def start_job(self, status, fn):
+    def start_job(self, status, fn, clear_log=True):
         self.busy = True
         self.progress = 0
         self.status = status
-        self.log_lines.append("")
+        if clear_log:  # like Windows: each install/remove starts with an empty log
+            del self.log_lines[:]
+            self.log_scroll = 0
+        else:
+            self.log_lines.append("")
 
         def run():
             try:
@@ -4160,7 +4164,7 @@ class Tui:
         def job(log, progress):
             log("=== REDOWNLOAD CIV ===")
             return "GAME FILES DELETED." if redownload_game(game, log, progress) else "DELETE INCOMPLETE -- SEE LOG"
-        self.start_job("DELETING GAME FILES...", job)
+        self.start_job("DELETING GAME FILES...", job, clear_log=False)
 
     def on_verify(self):
         if self.busy:
