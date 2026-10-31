@@ -596,6 +596,9 @@ namespace KekModInstaller
             // the layout below); the size it opens at is also the minimum.
             FormBorderStyle = FormBorderStyle.Sizable;
             BackColor = Color.Black;
+            // Title bar / taskbar get the same icon build.bat bakes into the exe.
+            try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); }
+            catch (Exception) { }
 
             _tooltip = new ToolTip();
 

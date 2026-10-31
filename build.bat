@@ -42,7 +42,7 @@ if exist "%~dp0beat.mp3" (
 
 echo.
 echo === Building CivVModInstaller.exe ===
-"%CSC%" /nologo /target:winexe /platform:x64 /out:"%~dp0CivVModInstaller.exe" %REFS% %RESOURCE% "%~dp0*.cs"
+"%CSC%" /nologo /target:winexe /platform:x64 /win32icon:"%~dp0icon.ico" /out:"%~dp0CivVModInstaller.exe" %REFS% %RESOURCE% "%~dp0*.cs"
 if %ERRORLEVEL% neq 0 (
     echo.
     echo BUILD FAILED ^(exit code %ERRORLEVEL%^)

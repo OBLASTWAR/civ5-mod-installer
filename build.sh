@@ -81,7 +81,7 @@ mkdir -p "$WINEPREFIX"
 # Same reference set as build.bat. System.Xml is listed explicitly because
 # -noconfig skips csc.rsp, which is where Windows csc picks it up.
 ARGS=(-nologo -noconfig -nostdlib -target:winexe -platform:x64
-      "-out:Z:$OUT.tmp" "-lib:Z:$REFS"
+      "-win32icon:Z:$HERE/icon.ico" "-out:Z:$OUT.tmp" "-lib:Z:$REFS"
       -r:mscorlib.dll -r:System.dll -r:System.Core.dll -r:System.Xml.dll -r:System.Net.Http.dll
       -r:System.Runtime.Serialization.dll -r:System.IO.Compression.dll
       -r:System.IO.Compression.FileSystem.dll -r:Microsoft.CSharp.dll
