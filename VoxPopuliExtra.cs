@@ -143,10 +143,7 @@ namespace KekModInstaller
             log("Vox Populi: " + release.Tag + (tagName != null ? " [selected version]" : ""));
             log("Downloading " + pack.FileName + " (large, this can take a few minutes)...");
 
-            // Scratch inside Assets (same drive, so the final move is a
-            // rename) but outside Assets/DLC, so a half-extracted copy is
-            // never picked up by the game.
-            string scratch = Path.Combine(Directory.GetParent(dlcRoot).FullName, ".kekmod-install-" + Guid.NewGuid().ToString("N"));
+            string scratch = InstallerCore.MakeScratchDir(dlcRoot);
             string tempZip = pack.FileId == null
                 ? Mirror.DownloadMod(MirrorId, release.Tag, log)
                 : Mirror.Try(Mirror.Drive,

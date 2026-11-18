@@ -377,11 +377,7 @@ namespace KekModInstaller
                 return;
             }
 
-            // Scratch inside Assets (same drive, so the final move is a
-            // rename -- Directory.Move can't cross drives, and %TEMP% is on
-            // C: when the game isn't) but outside Assets/DLC, so a
-            // half-extracted copy is never picked up by the game.
-            string scratch = Path.Combine(Directory.GetParent(dlcRoot).FullName, ".kekmod-install-" + Guid.NewGuid().ToString("N"));
+            string scratch = MakeScratchDir(dlcRoot);
             ZipFile.ExtractToDirectory(zipPath, scratch);
             try
             {
@@ -396,6 +392,19 @@ namespace KekModInstaller
             {
                 try { Directory.Delete(scratch, true); } catch (Exception) { } // best-effort cleanup
             }
+        }
+
+        // Scratch folder inside Assets (same drive, so the final move is a
+        // rename -- Directory.Move can't cross drives, and %TEMP% is on C:
+        // when the game isn't) but outside Assets/DLC, so a half-extracted
+        // copy is never picked up by the game. Kept short: the game's
+        // default Steam path is already ~80 characters to Assets\, and
+        // Lekmod has files 144 characters deep inside its zip, so a long
+        // scratch name pushes them past Windows' 260-character MAX_PATH
+        // during extraction even though they'd fit in Assets\DLC.
+        internal static string MakeScratchDir(string dlcRoot)
+        {
+            return Path.Combine(Directory.GetParent(dlcRoot).FullName, ".kek" + Guid.NewGuid().ToString("N").Substring(0, 8));
         }
 
         private static string FindDirStartingWith(string root, string prefix)
